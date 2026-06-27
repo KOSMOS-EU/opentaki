@@ -323,7 +323,7 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if protocol == "v1" {
+	if protocol == "v2" {
 		// Resolve routing from config
 		spaceType := r.Header.Get("X-Taki-Space-Type")
 		routedFeatures, bleveContent := s.cfg.resolveRoute(ct, spaceType)
@@ -884,7 +884,42 @@ func (s *Server) extractSpreadsheet(data []byte) (string, string) {
 }
 
 func (s *Server) extractPresentation(data []byte) (string, string) {
-	return s.convertViaPandoc(data, "pptx")
+	// Pandoc can't handle PPT/PPTX well → libreoffice→PDF→pdftotext
+	tmp, err := os.CreateTemp("", "taki-pres-*")
+	if err != nil {
+		return "", "error"
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Write(data)
+	tmp.Close()
+
+	tmpDir, _ := os.MkdirTemp("", "taki-pres-conv-*")
+	defer os.RemoveAll(tmpDir)
+
+	// Convert to PDF first (preserves all slide content)
+	cmd := exec.Command("libreoffice", "--headless",
+		"--convert-to", "pdf", "--outdir", tmpDir, tmp.Name())
+	if err := cmd.Run(); err != nil {
+		return s.convertViaLibreOffice(tmp.Name())
+	}
+
+	base := strings.TrimSuffix(filepath.Base(tmp.Name()), filepath.Ext(tmp.Name()))
+	pdfPath := filepath.Join(tmpDir, base+".pdf")
+	pdfData, err := os.ReadFile(pdfPath)
+	if err != nil {
+		return s.convertViaLibreOffice(tmp.Name())
+	}
+
+	text := s.pdftotext(pdfData)
+	if text != "" {
+		return text, "libreoffice_pdf"
+	}
+	// Scan-slides: LLM OCR
+	llmText := s.llmOCR(pdfData)
+	if llmText != "" {
+		return llmText, "libreoffice_pdf_ocr"
+	}
+	return "[presentation extraction failed]", "error"
 }
 
 func (s *Server) convertViaPandoc(data []byte, ext string) (string, string) {
