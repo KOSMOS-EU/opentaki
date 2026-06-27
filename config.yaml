@@ -1,0 +1,18 @@
+# open_taki config
+listen: ":9998"
+
+# LLM Backend (microllm or direct vLLM)
+llm:
+  api_base: "http://localhost:8012/v1"
+  model: "local"
+  max_tokens: 4096
+
+# PDF to image conversion
+pdf:
+  dpi: 150
+  max_pages: 20
+
+# pdftotext fallback: if pdftotext extracts enough text, skip LLM
+fallback:
+  min_chars: 200          # minimum chars to consider pdftotext result valid
+  min_chars_per_page: 50  # per page threshold
