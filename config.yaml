@@ -1,24 +1,84 @@
 # open_taki config
 listen: ":9998"
 
-# LLM Backend (microllm or direct vLLM) — for PDF OCR + image description
+# LLM Backend (microllm or direct vLLM)
 llm:
   api_base: "http://localhost:8012/v1"
   model: "local"
   max_tokens: 4096
 
-# Whisper Backend — for audio/video transcription
-# Leave api_base empty to disable audio support
+# Whisper Backend
 whisper:
-  api_base: "http://localhost:8019/v1"  # OpenAI-compatible Whisper API
+  api_base: "http://localhost:8019/v1"
   model: "whisper-large-v3"
 
-# PDF to image conversion
+# Embedding Backend
+embedding:
+  api_base: "http://localhost:8019/v1"
+  model: "nomic-ai/nomic-embed-text-v1.5"
+
+# Vector DB
+vector:
+  url: "http://localhost:6333"
+  collection: "documents"
+
+# PDF
 pdf:
   dpi: 150
   max_pages: 20
 
-# pdftotext fallback: if pdftotext extracts enough text, skip LLM
+# pdftotext fallback
 fallback:
-  min_chars: 200          # minimum chars to consider pdftotext result valid
-  min_chars_per_page: 50  # per page threshold
+  min_chars: 200
+  min_chars_per_page: 50
+
+# ── Routing ───────────────────────────────────────────────────
+#
+# Principle:
+#   * → vectordb (everything gets embedded with source reference)
+#   meta → always extracted
+#   bleve → selective, per mime/space/type rules
+#
+# 'bleve_rules' controls what goes into the fulltext keyword index.
+# Everything else is vector-only (semantic search via embedding).
+#
+# The caller (OpenCloud) can pass:
+#   X-Taki-Source-Ref: <space-id>/<file-path>   → stored in vector as reference
+#   X-Taki-Space-Type: personal|project|...      → used for rule matching
+
+routing:
+  # Default: everything → vector (with embedding + source ref)
+  vector: always
+
+  # Bleve rules: what additionally goes into keyword index
+  # match by mime glob AND/OR space type
+  bleve_rules:
+    # Office documents in any space → bleve
+    - match:
+        mime: ["application/pdf", "application/msword", "application/vnd.openxmlformats-*", "application/rtf"]
+      features: [meta, entities, summary]
+
+    # Spreadsheets → bleve (tabular data good for keyword search)
+    - match:
+        mime: ["application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml*"]
+      features: [meta]
+
+    # Email → bleve
+    - match:
+        mime: ["message/*"]
+      features: [meta, entities]
+
+    # Text/HTML/Code → bleve
+    - match:
+        mime: ["text/*"]
+      features: []
+
+    # Project spaces: everything goes to bleve (important data)
+    - match:
+        space_type: ["project"]
+        mime: ["*"]
+      features: [meta, entities, summary]
+
+    # Images → NOT in bleve (descriptions are noisy)
+    # Audio/Video → NOT in bleve (transcripts are noisy)
+    # These are vector-only by default (no bleve_rule match)

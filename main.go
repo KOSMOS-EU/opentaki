@@ -36,7 +36,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 type Config struct {
 	Listen string `yaml:"listen"`
@@ -49,6 +49,14 @@ type Config struct {
 		APIBase string `yaml:"api_base"`
 		Model   string `yaml:"model"`
 	} `yaml:"whisper"`
+	Embedding struct {
+		APIBase string `yaml:"api_base"`
+		Model   string `yaml:"model"`
+	} `yaml:"embedding"`
+	Vector struct {
+		URL        string `yaml:"url"`
+		Collection string `yaml:"collection"`
+	} `yaml:"vector"`
 	PDF struct {
 		DPI      int `yaml:"dpi"`
 		MaxPages int `yaml:"max_pages"`
@@ -57,6 +65,78 @@ type Config struct {
 		MinChars        int `yaml:"min_chars"`
 		MinCharsPerPage int `yaml:"min_chars_per_page"`
 	} `yaml:"fallback"`
+	Routing RoutingConfig `yaml:"routing"`
+}
+
+// ── Routing ──────────────────────────────────────────────────
+//
+// Principle:  * → vectordb (always),  bleve → selective per rules
+
+type RoutingConfig struct {
+	Vector     string       `yaml:"vector"`      // "always" or ""
+	BleveRules []BleveRule  `yaml:"bleve_rules"`
+}
+
+type BleveRule struct {
+	Match    BleveMatch `yaml:"match"`
+	Features []string   `yaml:"features"`
+}
+
+type BleveMatch struct {
+	Mime      []string `yaml:"mime"`
+	SpaceType []string `yaml:"space_type"`
+}
+
+// resolveRoute determines features and targets for a given content type + space type.
+// Returns: features to extract, whether content goes to bleve, always vector.
+func (cfg *Config) resolveRoute(contentType, spaceType string) (features map[string]bool, bleveContent bool) {
+	features = map[string]bool{}
+	bleveContent = false
+
+	ct := strings.ToLower(contentType)
+	st := strings.ToLower(spaceType)
+
+	for _, rule := range cfg.Routing.BleveRules {
+		if rule.matches(ct, st) {
+			for _, f := range rule.Features {
+				features[f] = true
+			}
+			bleveContent = true
+			return
+		}
+	}
+	return
+}
+
+func (r *BleveRule) matches(ct, spaceType string) bool {
+	mimeOK := len(r.Match.Mime) == 0
+	for _, pattern := range r.Match.Mime {
+		pattern = strings.ToLower(pattern)
+		if pattern == "*" {
+			mimeOK = true
+			break
+		}
+		if strings.HasSuffix(pattern, "*") {
+			if strings.HasPrefix(ct, strings.TrimSuffix(pattern, "*")) {
+				mimeOK = true
+				break
+			}
+		}
+		if strings.Contains(ct, pattern) {
+			mimeOK = true
+			break
+		}
+	}
+
+	spaceOK := len(r.Match.SpaceType) == 0
+	for _, st := range r.Match.SpaceType {
+		if strings.ToLower(st) == spaceType {
+			spaceOK = true
+			break
+		}
+	}
+
+	return mimeOK && spaceOK
 }
 
 type Server struct {
@@ -114,6 +194,9 @@ type takiResponse struct {
 	// Taki method info
 	Method string `json:"X-TAKI:method"`
 
+	// Routing decision (tells caller where to store what)
+	Routing *takiRouting `json:"X-TAKI:routing,omitempty"`
+
 	// Extended fields (only if X-Taki-Protocol: v1)
 	Meta     *takiMeta     `json:"X-TAKI:meta,omitempty"`
 	Entities []takiEntity  `json:"X-TAKI:entities,omitempty"`
@@ -121,6 +204,17 @@ type takiResponse struct {
 	Embed    []float64     `json:"X-TAKI:embedding,omitempty"`
 	Audio    *takiAudio    `json:"X-TAKI:audio,omitempty"`
 	Transcr  string        `json:"X-TAKI:transcription,omitempty"`
+}
+
+type takiRouting struct {
+	// Where to store content: bleve, vector, both, none
+	ContentTarget string `json:"content_target"`
+	// Meta always goes to bleve index
+	MetaTarget    string `json:"meta_target"`
+	// Embedding always goes to vector (with source reference)
+	VectorTarget  string `json:"vector_target"`
+	// Source reference for vector DB lookback
+	SourceRef     string `json:"source_ref,omitempty"`
 }
 
 type takiMeta struct {
@@ -230,27 +324,52 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if protocol == "v1" {
-		// Extended Taki response
+		// Resolve routing from config
+		spaceType := r.Header.Get("X-Taki-Space-Type")
+		routedFeatures, bleveContent := s.cfg.resolveRoute(ct, spaceType)
+
+		// Header overrides config features
+		if len(features) > 0 {
+			routedFeatures = features
+		}
+
+		// Invariants: meta always, embedding always
+		routedFeatures["meta"] = true
+		routedFeatures["embedding"] = true
+
+		contentTarget := "vector"
+		if bleveContent {
+			contentTarget = "both"
+		}
+
 		resp := takiResponse{
 			Content:     text,
 			ContentType: ct,
 			Method:      method,
+			Routing: &takiRouting{
+				ContentTarget: contentTarget,
+				MetaTarget:    "bleve",
+				VectorTarget:  "vector",
+				SourceRef:     r.Header.Get("X-Taki-Source-Ref"),
+			},
 		}
 
-		// Generate requested features via LLM
-		if features["meta"] || features["entities"] || features["summary"] {
-			s.enrichWithLLM(&resp, text, ct, features)
+		// LLM enrichment
+		if routedFeatures["meta"] || routedFeatures["entities"] || routedFeatures["summary"] {
+			s.enrichWithLLM(&resp, text, ct, routedFeatures)
 		}
 
-		if features["transcription"] && (strings.HasPrefix(ct, "audio/") || strings.HasPrefix(ct, "video/")) {
-			resp.Transcr = text // already transcribed
+		if routedFeatures["transcription"] && (strings.HasPrefix(ct, "audio/") || strings.HasPrefix(ct, "video/")) {
+			resp.Transcr = text
 		}
 
-		if features["embedding"] {
+		if routedFeatures["embedding"] {
 			resp.Embed = s.getEmbedding(text)
 		}
 
-		// Wrap in array for go-tika compatibility (MetaRecursive returns []map)
+		log.Printf("  routing: content→%s bleve=%v space=%s features=%v",
+			contentTarget, bleveContent, spaceType, routedFeatures)
+
 		json.NewEncoder(w).Encode([]takiResponse{resp})
 	} else {
 		// Classic Tika MetaRecursive response
@@ -368,22 +487,26 @@ func (s *Server) getEmbedding(text string) []float64 {
 		return nil
 	}
 
-	// Truncate for embedding model
 	if len(text) > 4000 {
 		text = text[:4000]
 	}
 
+	model := s.cfg.Embedding.Model
+	if model == "" {
+		model = "nomic-ai/nomic-embed-text-v1.5"
+	}
+
 	payload := map[string]interface{}{
-		"model": "nomic-ai/nomic-embed-text-v1.5",
+		"model": model,
 		"input": text,
 	}
 	jsonData, _ := json.Marshal(payload)
 
-	url := strings.TrimRight(s.cfg.LLM.APIBase, "/")
-	// Use embedding endpoint on same base (microllm can route)
-	// Replace /chat/completions path with /embeddings
-	url = strings.TrimSuffix(url, "/chat/completions")
-	url = strings.TrimRight(url, "/") + "/embeddings"
+	apiBase := s.cfg.Embedding.APIBase
+	if apiBase == "" {
+		apiBase = s.cfg.LLM.APIBase
+	}
+	url := strings.TrimRight(apiBase, "/") + "/embeddings"
 
 	resp, err := s.client.Post(url, "application/json", bytes.NewReader(jsonData))
 	if err != nil {
