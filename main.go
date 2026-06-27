@@ -532,40 +532,115 @@ func (s *Server) extract(body []byte, ct string) (string, string) {
 	ct = strings.ToLower(ct)
 
 	switch {
+	// ── PDF ──
 	case strings.Contains(ct, "pdf"):
 		return s.extractPDF(body)
+
+	// ── Images ──
 	case strings.HasPrefix(ct, "image/"):
 		return s.extractImage(body, ct)
+
+	// ── Audio ──
 	case strings.HasPrefix(ct, "audio/"):
 		return s.extractAudio(body, ct)
+
+	// ── Video ──
 	case strings.HasPrefix(ct, "video/"):
 		return s.extractVideo(body, ct)
+
+	// ── Word processing (DOCX, DOC, ODT, RTF, WordPerfect, Pages) ──
 	case strings.Contains(ct, "wordprocessingml"),
 		strings.Contains(ct, "msword"),
 		strings.Contains(ct, "opendocument.text"),
-		strings.Contains(ct, "rtf"):
+		strings.Contains(ct, "rtf"),
+		strings.Contains(ct, "wordperfect"),
+		strings.Contains(ct, "apple.pages"):
 		return s.extractOfficeDoc(body)
+
+	// ── Spreadsheets (XLSX, XLS, ODS, Numbers) ──
 	case strings.Contains(ct, "spreadsheetml"),
 		strings.Contains(ct, "ms-excel"),
-		strings.Contains(ct, "opendocument.spreadsheet"):
+		strings.Contains(ct, "opendocument.spreadsheet"),
+		strings.Contains(ct, "apple.numbers"):
 		return s.extractSpreadsheet(body)
+
+	// ── Presentations (PPTX, PPT, ODP, Keynote) ──
 	case strings.Contains(ct, "presentationml"),
 		strings.Contains(ct, "ms-powerpoint"),
-		strings.Contains(ct, "opendocument.presentation"):
+		strings.Contains(ct, "opendocument.presentation"),
+		strings.Contains(ct, "apple.keynote"):
 		return s.extractPresentation(body)
+
+	// ── EPUB ──
+	case strings.Contains(ct, "epub"):
+		return s.extractEpub(body)
+
+	// ── Email (EML, RFC822) ──
 	case strings.Contains(ct, "rfc822"),
 		strings.Contains(ct, "message/"):
 		return s.extractEmail(body)
+
+	// ── Outlook MSG ──
+	case strings.Contains(ct, "ms-outlook"),
+		strings.Contains(ct, "x-tnef"),
+		strings.Contains(ct, "ms-tnef"):
+		return s.extractMSG(body)
+
+	// ── Outlook PST (mailbox archive) ──
+	case strings.Contains(ct, "outlook-pst"):
+		return "[PST mailbox — too large for single extraction]", "skipped"
+
+	// ── HTML / XHTML ──
 	case strings.Contains(ct, "text/html"),
 		strings.Contains(ct, "xhtml"):
 		return s.extractHTML(body)
+
+	// ── XML / SVG ──
+	case strings.Contains(ct, "application/xml"),
+		strings.Contains(ct, "text/xml"),
+		strings.Contains(ct, "image/svg"):
+		return s.extractXML(body)
+
+	// ── RSS / Atom feeds ──
+	case strings.Contains(ct, "rss+xml"),
+		strings.Contains(ct, "atom+xml"):
+		return s.extractXML(body)
+
+	// ── Compressed single files (gzip, bz2, xz, zstd) ──
+	case strings.Contains(ct, "gzip"),
+		strings.Contains(ct, "x-bzip"),
+		strings.Contains(ct, "x-xz"),
+		strings.Contains(ct, "zstd"),
+		strings.Contains(ct, "x-compress"):
+		return s.extractCompressed(body, ct)
+
+	// ── Archives (ZIP, 7z, TAR, RAR, JAR) ──
 	case strings.Contains(ct, "zip"),
 		strings.Contains(ct, "x-tar"),
 		strings.Contains(ct, "x-7z"),
-		strings.Contains(ct, "x-rar"):
+		strings.Contains(ct, "x-rar"),
+		strings.Contains(ct, "java-archive"):
 		return s.extractArchive(body, ct)
+
+	// ── CAD (DWG) — render to image, then LLM Vision ──
+	case strings.Contains(ct, "dwg"),
+		strings.Contains(ct, "dgn"),
+		strings.Contains(ct, "vnd.visio"):
+		return s.extractCAD(body, ct)
+
+	// ── Source code ──
+	case strings.Contains(ct, "x-java-source"),
+		strings.Contains(ct, "x-c++src"),
+		strings.Contains(ct, "x-python"),
+		strings.Contains(ct, "javascript"),
+		strings.Contains(ct, "x-groovy"):
+		return string(body), "passthrough"
+
+	// ── Plain text / CSV / TSV / Markdown ──
 	case strings.Contains(ct, "text/"):
 		return string(body), "passthrough"
+
+	// ── Fallback: magic bytes ──
 	default:
 		return s.extractByMagic(body)
 	}
@@ -909,6 +984,190 @@ func (s *Server) extractHTML(data []byte) (string, string) {
 	return strings.TrimSpace(out.String()), "pandoc"
 }
 
+// ── EPUB ─────────────────────────────────────────────────────
+
+func (s *Server) extractEpub(data []byte) (string, string) {
+	// EPUB is a ZIP with XHTML — pandoc handles it natively
+	tmp, err := os.CreateTemp("", "taki-*.epub")
+	if err != nil {
+		return "", "error"
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Write(data)
+	tmp.Close()
+
+	cmd := exec.Command("pandoc", "--from=epub", "--to=plain", "--wrap=none", tmp.Name())
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		// Fallback: unzip and extract HTML files
+		return s.extractArchive(data, "application/zip")
+	}
+	text := strings.TrimSpace(out.String())
+	if text != "" {
+		return text, "pandoc_epub"
+	}
+	return s.extractArchive(data, "application/zip")
+}
+
+// ── Outlook MSG ──────────────────────────────────────────────
+
+func (s *Server) extractMSG(data []byte) (string, string) {
+	// MSG is OLE2 compound format — extract printable strings
+	var parts []string
+	var current []byte
+	for _, b := range data {
+		if b >= 0x20 && b < 0x7f || b == '\n' || b == '\r' || b == '\t' {
+			current = append(current, b)
+		} else {
+			if len(current) > 20 {
+				parts = append(parts, string(current))
+			}
+			current = current[:0]
+		}
+	}
+	if len(current) > 20 {
+		parts = append(parts, string(current))
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n"), "msg_strings"
+	}
+	return "[MSG not readable]", "error"
+}
+
+// ── XML / SVG ────────────────────────────────────────────────
+
+func (s *Server) extractXML(data []byte) (string, string) {
+	// Try pandoc for structured XML
+	cmd := exec.Command("pandoc", "--from=html", "--to=plain", "--wrap=none")
+	cmd.Stdin = bytes.NewReader(data)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
+		return strings.TrimSpace(out.String()), "pandoc_xml"
+	}
+	// Fallback: strip tags manually
+	text := stripXMLTags(string(data))
+	if text != "" {
+		return text, "xml_strip"
+	}
+	return string(data), "raw"
+}
+
+func stripXMLTags(s string) string {
+	var result strings.Builder
+	inTag := false
+	for _, r := range s {
+		if r == '<' {
+			inTag = true
+			continue
+		}
+		if r == '>' {
+			inTag = false
+			result.WriteRune(' ')
+			continue
+		}
+		if !inTag {
+			result.WriteRune(r)
+		}
+	}
+	// Collapse whitespace
+	text := result.String()
+	for strings.Contains(text, "  ") {
+		text = strings.ReplaceAll(text, "  ", " ")
+	}
+	return strings.TrimSpace(text)
+}
+
+// ── Compressed single files ──────────────────────────────────
+
+func (s *Server) extractCompressed(data []byte, ct string) (string, string) {
+	tmpDir, _ := os.MkdirTemp("", "taki-decompress-*")
+	defer os.RemoveAll(tmpDir)
+
+	compFile := filepath.Join(tmpDir, "compressed")
+	outFile := filepath.Join(tmpDir, "decompressed")
+	os.WriteFile(compFile, data, 0644)
+
+	var cmd *exec.Cmd
+	switch {
+	case strings.Contains(ct, "gzip"):
+		cmd = exec.Command("sh", "-c", fmt.Sprintf("gunzip -c %s > %s", compFile, outFile))
+	case strings.Contains(ct, "x-bzip"):
+		cmd = exec.Command("sh", "-c", fmt.Sprintf("bzcat %s > %s", compFile, outFile))
+	case strings.Contains(ct, "x-xz"):
+		cmd = exec.Command("sh", "-c", fmt.Sprintf("xzcat %s > %s", compFile, outFile))
+	case strings.Contains(ct, "zstd"):
+		cmd = exec.Command("sh", "-c", fmt.Sprintf("zstdcat %s > %s", compFile, outFile))
+	default:
+		return "[unsupported compression]", "error"
+	}
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Sprintf("[decompression failed: %v]", err), "error"
+	}
+
+	decompressed, err := os.ReadFile(outFile)
+	if err != nil {
+		return "[read decompressed failed]", "error"
+	}
+
+	// Detect inner content type and extract recursively
+	innerCT := http.DetectContentType(decompressed)
+	text, method := s.extract(decompressed, innerCT)
+	return text, "decompress+" + method
+}
+
+// ── CAD (DWG/DGN/Visio) — experimental ──────────────────────
+
+func (s *Server) extractCAD(data []byte, ct string) (string, string) {
+	// Try to convert to image via libreoffice (works for Visio/VSD)
+	tmp, err := os.CreateTemp("", "taki-cad-*")
+	if err != nil {
+		return "[CAD temp error]", "error"
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Write(data)
+	tmp.Close()
+
+	tmpDir, _ := os.MkdirTemp("", "taki-cad-conv-*")
+	defer os.RemoveAll(tmpDir)
+
+	// Try libreoffice conversion to PNG
+	cmd := exec.Command("libreoffice", "--headless", "--convert-to", "png",
+		"--outdir", tmpDir, tmp.Name())
+	if err := cmd.Run(); err == nil {
+		pngs, _ := filepath.Glob(filepath.Join(tmpDir, "*.png"))
+		if len(pngs) > 0 {
+			// Send rendered image to LLM Vision
+			text := s.llmDescribe(pngs[0],
+				"Describe this technical drawing or diagram. "+
+					"Extract any text, labels, dimensions, and structural information.")
+			if text != "" {
+				return text, "cad_vision"
+			}
+		}
+	}
+
+	// Fallback: extract strings from binary
+	var parts []string
+	var current []byte
+	for _, b := range data {
+		if b >= 0x20 && b < 0x7f {
+			current = append(current, b)
+		} else {
+			if len(current) > 10 {
+				parts = append(parts, string(current))
+			}
+			current = current[:0]
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n"), "cad_strings"
+	}
+	return "[CAD format not extractable]", "skipped"
+}
+
 // ── Archives ─────────────────────────────────────────────────
 
 func (s *Server) extractArchive(data []byte, ct string) (string, string) {
@@ -968,16 +1227,76 @@ func (s *Server) extractArchive(data []byte, ct string) (string, string) {
 // ── Magic byte detection ─────────────────────────────────────
 
 func (s *Server) extractByMagic(body []byte) (string, string) {
-	if len(body) > 4 && string(body[:4]) == "%PDF" {
+	if len(body) < 4 {
+		if utf8.Valid(body) {
+			return string(body), "passthrough"
+		}
+		return "[too small]", "error"
+	}
+
+	magic := string(body[:4])
+
+	switch {
+	case magic == "%PDF":
 		return s.extractPDF(body)
-	}
-	if len(body) > 2 && body[0] == 0x50 && body[1] == 0x4B {
+	case body[0] == 0x50 && body[1] == 0x4B: // PK = ZIP (also DOCX, XLSX, EPUB, JAR)
+		// Check if it's an Office document
+		if bytes.Contains(body[:min(len(body), 2000)], []byte("word/")) {
+			return s.extractOfficeDoc(body)
+		}
+		if bytes.Contains(body[:min(len(body), 2000)], []byte("xl/")) {
+			return s.extractSpreadsheet(body)
+		}
+		if bytes.Contains(body[:min(len(body), 2000)], []byte("ppt/")) {
+			return s.extractPresentation(body)
+		}
+		if bytes.Contains(body[:min(len(body), 2000)], []byte("EPUB")) {
+			return s.extractEpub(body)
+		}
 		return s.extractArchive(body, "application/zip")
+	case magic == "Rar!":
+		return s.extractArchive(body, "application/x-rar-compressed")
+	case magic[:2] == "\x1f\x8b": // gzip
+		return s.extractCompressed(body, "application/gzip")
+	case magic == "\xfd7zX": // xz
+		return s.extractCompressed(body, "application/x-xz")
+	case body[0] == 0xD0 && body[1] == 0xCF: // OLE2 (DOC, XLS, PPT, MSG)
+		// Try as office document first, then MSG
+		text, method := s.extractOfficeDoc(body)
+		if text != "" && method != "error" {
+			return text, method
+		}
+		return s.extractMSG(body)
+	case magic[:3] == "ID3" || (body[0] == 0xFF && body[1]&0xE0 == 0xE0): // MP3
+		return s.extractAudio(body, "audio/mpeg")
+	case magic == "fLaC": // FLAC
+		return s.extractAudio(body, "audio/flac")
+	case magic == "OggS": // OGG
+		return s.extractAudio(body, "audio/ogg")
+	case magic == "RIFF": // WAV/AVI
+		if len(body) > 11 && string(body[8:12]) == "WAVE" {
+			return s.extractAudio(body, "audio/wav")
+		}
+		return s.extractVideo(body, "video/avi")
+	case magic[:3] == "\xff\xd8\xff": // JPEG
+		return s.extractImage(body, "image/jpeg")
+	case magic == "\x89PNG": // PNG
+		return s.extractImage(body, "image/png")
+	case magic[:3] == "GIF": // GIF
+		return s.extractImage(body, "image/gif")
 	}
+
 	if utf8.Valid(body) {
 		return string(body), "passthrough"
 	}
 	return "[unknown format]", "error"
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ── LLM helpers ──────────────────────────────────────────────
