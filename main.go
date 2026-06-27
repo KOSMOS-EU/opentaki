@@ -1,20 +1,18 @@
 // open_taki — lightweight Tika replacement with LLM-powered extraction
 //
-// Drop-in replacement for Apache Tika's text extraction endpoint.
-// Supports PDF, Office, images, audio, HTML, email, and archives.
+// Drop-in replacement for Apache Tika with protocol extension.
 //
-// Extraction methods:
-//   - PDF: pdftotext fast-path, LLM Vision OCR fallback
-//   - Images: LLM Vision (content description, not just EXIF)
-//   - Audio: Whisper transcription (via OpenAI-compatible API)
-//   - Office: pandoc/libreoffice conversion
-//   - Archives: external tools (unzip, 7z, unrar) + recursive extraction
-//   - Email: built-in RFC822 parser
+// Endpoints:
+//   PUT /tika/text       → plain text extraction (Tika-compatible)
+//   PUT /rmeta/text      → metadata + content (Tika MetaRecursive compatible)
+//   GET /tika            → health check
+//   GET /version         → version info
 //
-// Tika-compatible API:
-//   PUT /tika/text     → extract text from document body
-//   GET /tika          → health check
-//   GET /version       → version info
+// Protocol extension (X-Taki-Protocol: v1):
+//   Request headers:
+//     X-Taki-Protocol: v1
+//     X-Taki-Features: meta,entities,summary,embedding,transcription
+//   Response: structured JSON with requested features
 package main
 
 import (
@@ -38,7 +36,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 type Config struct {
 	Listen string `yaml:"listen"`
@@ -97,17 +95,58 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
-// Whisper transcription response
 type whisperResponse struct {
 	Text string `json:"text"`
 }
 
-// Tika-compatible JSON response
-type tikaResponse struct {
-	Content string `json:"X-TIKA:content"`
-	Type    string `json:"Content-Type"`
-	Method  string `json:"X-TAKI:method"`
+// ── Response types ───────────────────────────────────────────
+
+// Classic Tika MetaRecursive response (array of metadata maps)
+// Used by go-tika library: PUT /rmeta/text
+type tikaMetaResponse []map[string]interface{}
+
+// Extended Taki v1 response
+type takiResponse struct {
+	// Tika-compatible fields
+	Content     string `json:"X-TIKA:content"`
+	ContentType string `json:"Content-Type"`
+
+	// Taki method info
+	Method string `json:"X-TAKI:method"`
+
+	// Extended fields (only if X-Taki-Protocol: v1)
+	Meta     *takiMeta     `json:"X-TAKI:meta,omitempty"`
+	Entities []takiEntity  `json:"X-TAKI:entities,omitempty"`
+	Summary  string        `json:"X-TAKI:summary,omitempty"`
+	Embed    []float64     `json:"X-TAKI:embedding,omitempty"`
+	Audio    *takiAudio    `json:"X-TAKI:audio,omitempty"`
+	Transcr  string        `json:"X-TAKI:transcription,omitempty"`
 }
+
+type takiMeta struct {
+	Title    string `json:"title,omitempty"`
+	Author   string `json:"author,omitempty"`
+	Created  string `json:"created,omitempty"`
+	Language string `json:"language,omitempty"`
+	Pages    int    `json:"pages,omitempty"`
+	DocType  string `json:"doc_type,omitempty"`
+}
+
+type takiEntity struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type takiAudio struct {
+	Title    string  `json:"title,omitempty"`
+	Artist   string  `json:"artist,omitempty"`
+	Album    string  `json:"album,omitempty"`
+	Genre    string  `json:"genre,omitempty"`
+	Duration float64 `json:"duration,omitempty"`
+	Year     int     `json:"year,omitempty"`
+}
+
+// ── Config ───────────────────────────────────────────────────
 
 func loadConfig(path string) Config {
 	var cfg Config
@@ -142,98 +181,268 @@ func NewServer(cfg Config) *Server {
 	}
 }
 
-// ── Main handler ─────────────────────────────────────────────
+// ── Main handlers ────────────────────────────────────────────
 
+// handleTikaText handles PUT /tika/text — plain text extraction
 func (s *Server) handleTikaText(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "PUT only", http.StatusMethodNotAllowed)
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 200*1024*1024)) // 200MB max
+	body, err := io.ReadAll(io.LimitReader(r.Body, 200*1024*1024))
 	if err != nil {
 		http.Error(w, "read error", http.StatusBadRequest)
 		return
 	}
 
 	ct := r.Header.Get("Content-Type")
-	accept := r.Header.Get("Accept")
+	text, method := s.extract(body, ct)
+	log.Printf("/tika/text: %d chars via %s (%s)", len(text), method, ct)
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(text))
+}
+
+// handleRmetaText handles PUT /rmeta/text — Tika MetaRecursive compatible
+// This is what OpenCloud's go-tika library actually calls.
+// Without X-Taki-Protocol: returns classic Tika metadata array
+// With X-Taki-Protocol: v1: returns extended structured response
+func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "PUT only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 200*1024*1024))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+
+	ct := r.Header.Get("Content-Type")
+	protocol := r.Header.Get("X-Taki-Protocol")
+	features := parseFeatures(r.Header.Get("X-Taki-Features"))
 
 	text, method := s.extract(body, ct)
+	log.Printf("/rmeta/text: %d chars via %s (%s) proto=%s", len(text), method, ct, protocol)
 
-	log.Printf("extracted %d chars via %s (%s)", len(text), method, ct)
+	w.Header().Set("Content-Type", "application/json")
 
-	if strings.Contains(accept, "application/json") {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(tikaResponse{
-			Content: text,
-			Type:    ct,
-			Method:  method,
-		})
+	if protocol == "v1" {
+		// Extended Taki response
+		resp := takiResponse{
+			Content:     text,
+			ContentType: ct,
+			Method:      method,
+		}
+
+		// Generate requested features via LLM
+		if features["meta"] || features["entities"] || features["summary"] {
+			s.enrichWithLLM(&resp, text, ct, features)
+		}
+
+		if features["transcription"] && (strings.HasPrefix(ct, "audio/") || strings.HasPrefix(ct, "video/")) {
+			resp.Transcr = text // already transcribed
+		}
+
+		if features["embedding"] {
+			resp.Embed = s.getEmbedding(text)
+		}
+
+		// Wrap in array for go-tika compatibility (MetaRecursive returns []map)
+		json.NewEncoder(w).Encode([]takiResponse{resp})
 	} else {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte(text))
+		// Classic Tika MetaRecursive response
+		meta := map[string]interface{}{
+			"X-TIKA:content": text,
+			"Content-Type":   ct,
+			"X-TAKI:method":  method,
+		}
+
+		// Add basic Tika-compatible metadata for images
+		if strings.HasPrefix(ct, "image/") {
+			// Tika returns tiff:ImageWidth etc — we could parse from image
+			// but for now just pass content
+		}
+
+		json.NewEncoder(w).Encode(tikaMetaResponse{meta})
 	}
 }
+
+func parseFeatures(header string) map[string]bool {
+	features := map[string]bool{}
+	if header == "" {
+		return features
+	}
+	for _, f := range strings.Split(header, ",") {
+		features[strings.TrimSpace(f)] = true
+	}
+	return features
+}
+
+// enrichWithLLM asks the LLM to extract structured metadata from content
+func (s *Server) enrichWithLLM(resp *takiResponse, content, ct string, features map[string]bool) {
+	if content == "" || len(content) < 50 {
+		return
+	}
+
+	// Truncate for LLM context
+	truncated := content
+	if len(truncated) > 8000 {
+		truncated = truncated[:8000]
+	}
+
+	var prompt strings.Builder
+	prompt.WriteString("Analyze this document content and return a JSON object with the following fields:\n")
+
+	if features["meta"] {
+		prompt.WriteString(`"meta": {"title": "...", "author": "...", "created": "YYYY-MM-DD or empty", "language": "de/en/...", "doc_type": "contract/invoice/letter/report/photo/other"}` + "\n")
+	}
+	if features["entities"] {
+		prompt.WriteString(`"entities": [{"type": "person/org/location/date/id/amount", "value": "..."}] (max 20 entities)` + "\n")
+	}
+	if features["summary"] {
+		prompt.WriteString(`"summary": "1-2 sentence summary in the document's language"` + "\n")
+	}
+
+	prompt.WriteString("\nDocument content:\n")
+	prompt.WriteString(truncated)
+	prompt.WriteString("\n\nReturn ONLY valid JSON, no explanation.")
+
+	llmResp := s.llmChat(prompt.String())
+	if llmResp == "" {
+		return
+	}
+
+	// Parse LLM JSON response
+	// Find the JSON object in the response
+	jsonStr := extractJSON(llmResp)
+	if jsonStr == "" {
+		return
+	}
+
+	var parsed struct {
+		Meta     *takiMeta    `json:"meta"`
+		Entities []takiEntity `json:"entities"`
+		Summary  string       `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		log.Printf("LLM JSON parse error: %v", err)
+		return
+	}
+
+	if features["meta"] && parsed.Meta != nil {
+		resp.Meta = parsed.Meta
+	}
+	if features["entities"] {
+		resp.Entities = parsed.Entities
+	}
+	if features["summary"] {
+		resp.Summary = parsed.Summary
+	}
+}
+
+func extractJSON(s string) string {
+	// Find first { and last }
+	start := strings.Index(s, "{")
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	for i := start; i < len(s); i++ {
+		if s[i] == '{' {
+			depth++
+		} else if s[i] == '}' {
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Server) getEmbedding(text string) []float64 {
+	if text == "" || len(text) < 10 {
+		return nil
+	}
+
+	// Truncate for embedding model
+	if len(text) > 4000 {
+		text = text[:4000]
+	}
+
+	payload := map[string]interface{}{
+		"model": "nomic-ai/nomic-embed-text-v1.5",
+		"input": text,
+	}
+	jsonData, _ := json.Marshal(payload)
+
+	url := strings.TrimRight(s.cfg.LLM.APIBase, "/")
+	// Use embedding endpoint on same base (microllm can route)
+	// Replace /chat/completions path with /embeddings
+	url = strings.TrimSuffix(url, "/chat/completions")
+	url = strings.TrimRight(url, "/") + "/embeddings"
+
+	resp, err := s.client.Post(url, "application/json", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var embResp struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+		} `json:"data"`
+	}
+	json.NewDecoder(resp.Body).Decode(&embResp)
+	if len(embResp.Data) > 0 {
+		return embResp.Data[0].Embedding
+	}
+	return nil
+}
+
+// ── Content extraction ───────────────────────────────────────
 
 func (s *Server) extract(body []byte, ct string) (string, string) {
 	ct = strings.ToLower(ct)
 
 	switch {
-	// PDF
 	case strings.Contains(ct, "pdf"):
 		return s.extractPDF(body)
-
-	// Images → LLM Vision
 	case strings.HasPrefix(ct, "image/"):
 		return s.extractImage(body, ct)
-
-	// Audio → Whisper
 	case strings.HasPrefix(ct, "audio/"):
 		return s.extractAudio(body, ct)
-
-	// Video → extract audio track → Whisper
 	case strings.HasPrefix(ct, "video/"):
 		return s.extractVideo(body, ct)
-
-	// Office documents
 	case strings.Contains(ct, "wordprocessingml"),
 		strings.Contains(ct, "msword"),
 		strings.Contains(ct, "opendocument.text"),
 		strings.Contains(ct, "rtf"):
 		return s.extractOfficeDoc(body)
-
 	case strings.Contains(ct, "spreadsheetml"),
 		strings.Contains(ct, "ms-excel"),
 		strings.Contains(ct, "opendocument.spreadsheet"):
 		return s.extractSpreadsheet(body)
-
 	case strings.Contains(ct, "presentationml"),
 		strings.Contains(ct, "ms-powerpoint"),
 		strings.Contains(ct, "opendocument.presentation"):
 		return s.extractPresentation(body)
-
-	// Email
 	case strings.Contains(ct, "rfc822"),
 		strings.Contains(ct, "message/"):
 		return s.extractEmail(body)
-
-	// HTML
 	case strings.Contains(ct, "text/html"),
 		strings.Contains(ct, "xhtml"):
 		return s.extractHTML(body)
-
-	// Archives
 	case strings.Contains(ct, "zip"),
 		strings.Contains(ct, "x-tar"),
 		strings.Contains(ct, "x-7z"),
 		strings.Contains(ct, "x-rar"):
 		return s.extractArchive(body, ct)
-
-	// Plain text
 	case strings.Contains(ct, "text/"):
 		return string(body), "passthrough"
-
 	default:
 		return s.extractByMagic(body)
 	}
@@ -246,16 +455,13 @@ func (s *Server) extractPDF(data []byte) (string, string) {
 	if s.isGoodText(text, data) {
 		return text, "pdftotext"
 	}
-
 	llmText := s.llmOCR(data)
 	if llmText != "" {
 		return llmText, "llm_ocr"
 	}
-
 	if text != "" {
 		return text, "pdftotext_partial"
 	}
-
 	return "[extraction failed]", "error"
 }
 
@@ -325,29 +531,24 @@ func (s *Server) llmOCR(data []byte) string {
 // ── Image extraction (LLM Vision) ───────────────────────────
 
 func (s *Server) extractImage(data []byte, ct string) (string, string) {
-	// Determine image format for data URL
 	mediaType := "image/png"
-	if strings.Contains(ct, "jpeg") || strings.Contains(ct, "jpg") {
-		mediaType = "image/jpeg"
-	} else if strings.Contains(ct, "webp") {
-		mediaType = "image/webp"
-	} else if strings.Contains(ct, "gif") {
-		mediaType = "image/gif"
-	} else if strings.Contains(ct, "tiff") {
-		mediaType = "image/tiff"
-	} else if strings.Contains(ct, "bmp") {
-		mediaType = "image/bmp"
+	for _, t := range []string{"jpeg", "jpg", "webp", "gif", "tiff", "bmp"} {
+		if strings.Contains(ct, t) {
+			if t == "jpg" {
+				mediaType = "image/jpeg"
+			} else {
+				mediaType = "image/" + t
+			}
+			break
+		}
 	}
 
 	b64 := base64.StdEncoding.EncodeToString(data)
-	dataURL := "data:" + mediaType + ";base64," + b64
-
-	prompt := "Describe this image in detail. " +
-		"If it contains text, extract all text. " +
-		"If it's a document, form, or scan, extract all structured content. " +
-		"If it's a photo, describe what you see including objects, people, settings, and any visible text or signs."
-
-	text := s.llmVision(dataURL, prompt)
+	text := s.llmVision("data:"+mediaType+";base64,"+b64,
+		"Describe this image in detail. "+
+			"If it contains text, extract all text. "+
+			"If it's a document or scan, extract all structured content. "+
+			"If it's a photo, describe what you see.")
 	if text != "" {
 		return text, "llm_vision"
 	}
@@ -358,18 +559,15 @@ func (s *Server) extractImage(data []byte, ct string) (string, string) {
 
 func (s *Server) extractAudio(data []byte, ct string) (string, string) {
 	if s.cfg.Whisper.APIBase == "" {
-		return "[audio transcription not configured - set whisper.api_base]", "skipped"
+		return "[audio transcription not configured]", "skipped"
 	}
 
 	ext := ".wav"
-	if strings.Contains(ct, "mp3") || strings.Contains(ct, "mpeg") {
-		ext = ".mp3"
-	} else if strings.Contains(ct, "ogg") {
-		ext = ".ogg"
-	} else if strings.Contains(ct, "flac") {
-		ext = ".flac"
-	} else if strings.Contains(ct, "m4a") || strings.Contains(ct, "mp4") {
-		ext = ".m4a"
+	for _, pair := range [][2]string{{"mp3", ".mp3"}, {"mpeg", ".mp3"}, {"ogg", ".ogg"}, {"flac", ".flac"}, {"m4a", ".m4a"}, {"mp4", ".m4a"}} {
+		if strings.Contains(ct, pair[0]) {
+			ext = pair[1]
+			break
+		}
 	}
 
 	tmp, err := os.CreateTemp("", "taki-audio-*"+ext)
@@ -389,10 +587,9 @@ func (s *Server) extractAudio(data []byte, ct string) (string, string) {
 
 func (s *Server) extractVideo(data []byte, ct string) (string, string) {
 	if s.cfg.Whisper.APIBase == "" {
-		return "[video transcription not configured - set whisper.api_base]", "skipped"
+		return "[video transcription not configured]", "skipped"
 	}
 
-	// Extract audio track with ffmpeg
 	tmpVideo, err := os.CreateTemp("", "taki-video-*")
 	if err != nil {
 		return "[temp file error]", "error"
@@ -419,7 +616,6 @@ func (s *Server) extractVideo(data []byte, ct string) (string, string) {
 }
 
 func (s *Server) whisperTranscribe(audioPath string) string {
-	// OpenAI-compatible /v1/audio/transcriptions endpoint
 	url := strings.TrimRight(s.cfg.Whisper.APIBase, "/") + "/audio/transcriptions"
 
 	f, err := os.Open(audioPath)
@@ -428,9 +624,8 @@ func (s *Server) whisperTranscribe(audioPath string) string {
 	}
 	defer f.Close()
 
-	// Build multipart request
 	var buf bytes.Buffer
-	boundary := "----TakiBoundary" + fmt.Sprintf("%d", time.Now().UnixNano())
+	boundary := fmt.Sprintf("----TakiBoundary%d", time.Now().UnixNano())
 	w := NewMultipartWriter(&buf, boundary)
 	w.WriteField("model", s.cfg.Whisper.Model)
 	w.WriteField("language", "de")
@@ -462,7 +657,6 @@ func (s *Server) extractOfficeDoc(data []byte) (string, string) {
 }
 
 func (s *Server) extractSpreadsheet(data []byte) (string, string) {
-	// libreoffice → csv
 	tmp, err := os.CreateTemp("", "taki-*.xlsx")
 	if err != nil {
 		return "", "error"
@@ -479,7 +673,6 @@ func (s *Server) extractSpreadsheet(data []byte) (string, string) {
 		"--outdir", tmpDir, tmp.Name())
 	cmd.Run()
 
-	// Read all csv files
 	csvs, _ := filepath.Glob(filepath.Join(tmpDir, "*.csv"))
 	var parts []string
 	for _, csvPath := range csvs {
@@ -509,7 +702,6 @@ func (s *Server) convertViaPandoc(data []byte, ext string) (string, string) {
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		// Fallback: libreoffice → txt
 		return s.convertViaLibreOffice(tmp.Name())
 	}
 	text := strings.TrimSpace(out.String())
@@ -541,7 +733,6 @@ func (s *Server) convertViaLibreOffice(path string) (string, string) {
 func (s *Server) extractEmail(data []byte) (string, string) {
 	msg, err := mail.ReadMessage(bytes.NewReader(data))
 	if err != nil {
-		// Fallback: raw strings
 		if utf8.Valid(data) {
 			return string(data), "raw_email"
 		}
@@ -549,7 +740,6 @@ func (s *Server) extractEmail(data []byte) (string, string) {
 	}
 
 	var parts []string
-
 	if subj := msg.Header.Get("Subject"); subj != "" {
 		decoded, err := decodeRFC2047(subj)
 		if err == nil {
@@ -605,10 +795,10 @@ func (s *Server) extractArchive(data []byte, ct string) (string, string) {
 	archivePath := filepath.Join(tmpDir, "archive")
 	os.WriteFile(archivePath, data, 0644)
 
-	var extractCmd *exec.Cmd
 	outDir := filepath.Join(tmpDir, "out")
 	os.MkdirAll(outDir, 0755)
 
+	var extractCmd *exec.Cmd
 	switch {
 	case strings.Contains(ct, "zip"), strings.Contains(ct, "java-archive"):
 		extractCmd = exec.Command("unzip", "-o", "-d", outDir, archivePath)
@@ -628,22 +818,17 @@ func (s *Server) extractArchive(data []byte, ct string) (string, string) {
 		return fmt.Sprintf("[archive extraction failed: %v]", err), "error"
 	}
 
-	// Recursively extract text from all files in archive
 	var allText []string
 	filepath.Walk(outDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || info.Size() == 0 || info.Size() > 50*1024*1024 {
 			return nil
 		}
-
 		fileData, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
-
-		// Detect content type
 		fileCT := http.DetectContentType(fileData)
 		relPath, _ := filepath.Rel(outDir, path)
-
 		text, method := s.extract(fileData, fileCT)
 		if text != "" && text[0] != '[' {
 			allText = append(allText, fmt.Sprintf("--- %s [%s] ---\n%s", relPath, method, text))
@@ -657,13 +842,13 @@ func (s *Server) extractArchive(data []byte, ct string) (string, string) {
 	return "[empty archive]", "archive"
 }
 
-// ── Magic byte detection fallback ────────────────────────────
+// ── Magic byte detection ─────────────────────────────────────
 
 func (s *Server) extractByMagic(body []byte) (string, string) {
 	if len(body) > 4 && string(body[:4]) == "%PDF" {
 		return s.extractPDF(body)
 	}
-	if len(body) > 2 && body[0] == 0x50 && body[1] == 0x4B { // PK = ZIP
+	if len(body) > 2 && body[0] == 0x50 && body[1] == 0x4B {
 		return s.extractArchive(body, "application/zip")
 	}
 	if utf8.Valid(body) {
@@ -687,8 +872,6 @@ func (s *Server) llmDescribe(imagePath, prompt string) string {
 		mediaType = "image/jpeg"
 	case ".webp":
 		mediaType = "image/webp"
-	case ".gif":
-		mediaType = "image/gif"
 	}
 
 	b64 := base64.StdEncoding.EncodeToString(imgData)
@@ -700,12 +883,19 @@ func (s *Server) llmVision(dataURL, prompt string) string {
 		{Type: "text", Text: prompt},
 		{Type: "image_url", ImageURL: &imageURL{URL: dataURL}},
 	}
+	return s.llmComplete([]chatMessage{{Role: "user", Content: content}})
+}
 
+func (s *Server) llmChat(prompt string) string {
+	return s.llmComplete([]chatMessage{{Role: "user", Content: prompt}})
+}
+
+func (s *Server) llmComplete(messages []chatMessage) string {
 	reqBody := chatRequest{
 		Model:     s.cfg.LLM.Model,
 		MaxTokens: s.cfg.LLM.MaxTokens,
 		Temp:      0.0,
-		Messages:  []chatMessage{{Role: "user", Content: content}},
+		Messages:  messages,
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
@@ -743,7 +933,7 @@ func stripThinkTags(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// ── Multipart writer (minimal, for Whisper API) ──────────────
+// ── Multipart writer (for Whisper API) ───────────────────────
 
 type MultipartWriter struct {
 	buf      *bytes.Buffer
@@ -775,22 +965,18 @@ func (w *MultipartWriter) Close() {
 // ── Health & main ────────────────────────────────────────────
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	features := map[string]bool{
-		"pdf":     true,
-		"office":  true,
-		"image":   true,
-		"audio":   s.cfg.Whisper.APIBase != "",
-		"archive": true,
-		"email":   true,
-	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":   "ok",
-		"name":     "open_taki",
-		"version":  version,
-		"llm":      s.cfg.LLM.APIBase,
-		"whisper":  s.cfg.Whisper.APIBase,
-		"features": features,
+		"status":  "ok",
+		"name":    "open_taki",
+		"version": version,
+		"llm":     s.cfg.LLM.APIBase,
+		"whisper": s.cfg.Whisper.APIBase,
+		"features": map[string]bool{
+			"pdf": true, "office": true, "image": true,
+			"audio": s.cfg.Whisper.APIBase != "", "archive": true,
+			"email": true, "taki_v1_protocol": true,
+		},
 	})
 }
 
@@ -802,7 +988,6 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 func main() {
 	configPath := flag.String("config", "config.yaml", "config file path")
 	flag.Parse()
-
 	if flag.NArg() > 0 {
 		*configPath = flag.Arg(0)
 	}
@@ -814,13 +999,13 @@ func main() {
 	if cfg.Whisper.APIBase != "" {
 		log.Printf("  Whisper: %s (model: %s)", cfg.Whisper.APIBase, cfg.Whisper.Model)
 	} else {
-		log.Printf("  Whisper: disabled (no whisper.api_base configured)")
+		log.Printf("  Whisper: disabled")
 	}
-	log.Printf("  PDF:     %d DPI, max %d pages", cfg.PDF.DPI, cfg.PDF.MaxPages)
 
 	srv := NewServer(cfg)
 
 	http.HandleFunc("/tika/text", srv.handleTikaText)
+	http.HandleFunc("/rmeta/text", srv.handleRmetaText)
 	http.HandleFunc("/tika", srv.handleHealth)
 	http.HandleFunc("/version", srv.handleVersion)
 	http.HandleFunc("/", srv.handleHealth)
