@@ -1,11 +1,17 @@
 # open_taki config
 listen: ":9998"
 
-# LLM Backend (microllm or direct vLLM)
+# LLM Backend (microllm or direct vLLM) — for PDF OCR + image description
 llm:
   api_base: "http://localhost:8012/v1"
   model: "local"
   max_tokens: 4096
+
+# Whisper Backend — for audio/video transcription
+# Leave api_base empty to disable audio support
+whisper:
+  api_base: "http://localhost:8019/v1"  # OpenAI-compatible Whisper API
+  model: "whisper-large-v3"
 
 # PDF to image conversion
 pdf:
