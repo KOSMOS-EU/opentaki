@@ -29,7 +29,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -712,16 +714,28 @@ func (s *Server) llmOCR(data []byte) string {
 	if len(pages) == 0 {
 		return ""
 	}
+	sort.Strings(pages)
 	if len(pages) > s.cfg.PDF.MaxPages {
 		pages = pages[:s.cfg.PDF.MaxPages]
 	}
 
+	// Parallel OCR — all pages concurrently (vLLM handles batching)
+	results := make([]string, len(pages))
+	var wg sync.WaitGroup
+	for i, pagePath := range pages {
+		wg.Add(1)
+		go func(idx int, path string) {
+			defer wg.Done()
+			results[idx] = s.llmDescribe(path,
+				"Extract all text from this scanned document page. "+
+					"Return the complete text content, preserving structure. "+
+					"If it's a form or contract, extract structured fields.")
+		}(i, pagePath)
+	}
+	wg.Wait()
+
 	var allText []string
-	for _, pagePath := range pages {
-		text := s.llmDescribe(pagePath,
-			"Extract all text from this scanned document page. "+
-				"Return the complete text content, preserving structure. "+
-				"If it's a form or contract, extract structured fields.")
+	for _, text := range results {
 		if text != "" {
 			allText = append(allText, text)
 		}
