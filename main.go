@@ -36,7 +36,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const version = "0.4.0"
+const version = "0.7.0"
 
 type Config struct {
 	Listen string `yaml:"listen"`
@@ -57,6 +57,9 @@ type Config struct {
 		URL        string `yaml:"url"`
 		Collection string `yaml:"collection"`
 	} `yaml:"vector"`
+	Collabora struct {
+		URL string `yaml:"url"` // e.g. http://collabora:9980
+	} `yaml:"collabora"`
 	PDF struct {
 		DPI      int `yaml:"dpi"`
 		MaxPages int `yaml:"max_pages"`
@@ -851,75 +854,87 @@ func (s *Server) whisperTranscribe(audioPath string) string {
 // ── Office documents ─────────────────────────────────────────
 
 func (s *Server) extractOfficeDoc(data []byte) (string, string) {
+	// 1. Collabora (if configured) — handles DOC, DOCX, ODT, RTF
+	if text, ok := s.convertViaCollabora(data, "txt"); ok {
+		return text, "collabora"
+	}
+	// 2. pandoc — handles DOCX, ODT, EPUB, RTF (not DOC)
 	return s.convertViaPandoc(data, "docx")
 }
 
 func (s *Server) extractSpreadsheet(data []byte) (string, string) {
-	tmp, err := os.CreateTemp("", "taki-*.xlsx")
-	if err != nil {
-		return "", "error"
+	// 1. Collabora → CSV
+	if text, ok := s.convertViaCollabora(data, "csv"); ok {
+		return text, "collabora"
 	}
-	defer os.Remove(tmp.Name())
-	tmp.Write(data)
-	tmp.Close()
-
-	tmpDir, _ := os.MkdirTemp("", "taki-lo-*")
-	defer os.RemoveAll(tmpDir)
-
-	cmd := exec.Command("libreoffice", "--headless",
-		"--convert-to", "csv:Text - txt - csv (StarCalc):44,34,76,1",
-		"--outdir", tmpDir, tmp.Name())
-	cmd.Run()
-
-	csvs, _ := filepath.Glob(filepath.Join(tmpDir, "*.csv"))
-	var parts []string
-	for _, csvPath := range csvs {
-		content, _ := os.ReadFile(csvPath)
-		parts = append(parts, string(content))
-	}
-	if len(parts) > 0 {
-		return strings.Join(parts, "\n---\n"), "libreoffice"
-	}
-	return "[spreadsheet extraction failed]", "error"
+	return "[spreadsheet extraction requires collabora — set collabora.url in config]", "skipped"
 }
 
 func (s *Server) extractPresentation(data []byte) (string, string) {
-	// Pandoc can't handle PPT/PPTX well → libreoffice→PDF→pdftotext
-	tmp, err := os.CreateTemp("", "taki-pres-*")
+	// 1. Collabora → PDF → pdftotext
+	if pdfData, ok := s.convertViaCollaboraRaw(data, "pdf"); ok {
+		text := s.pdftotext(pdfData)
+		if text != "" {
+			return text, "collabora_pdf"
+		}
+		// Scan-slides: LLM OCR
+		llmText := s.llmOCR(pdfData)
+		if llmText != "" {
+			return llmText, "collabora_pdf_ocr"
+		}
+	}
+	// 2. pandoc (PPTX only, limited)
+	return s.convertViaPandoc(data, "pptx")
+}
+
+// convertViaCollabora sends data to Collabora's /cool/convert-to endpoint.
+// Returns extracted text and true if successful.
+func (s *Server) convertViaCollabora(data []byte, targetFormat string) (string, bool) {
+	raw, ok := s.convertViaCollaboraRaw(data, targetFormat)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(string(raw)), true
+}
+
+// convertViaCollaboraRaw returns raw bytes from Collabora conversion.
+func (s *Server) convertViaCollaboraRaw(data []byte, targetFormat string) ([]byte, bool) {
+	if s.cfg.Collabora.URL == "" {
+		return nil, false
+	}
+
+	url := strings.TrimRight(s.cfg.Collabora.URL, "/") + "/cool/convert-to/" + targetFormat
+
+	// Build multipart form
+	var buf bytes.Buffer
+	boundary := fmt.Sprintf("----TakiBoundary%d", time.Now().UnixNano())
+	w := NewMultipartWriter(&buf, boundary)
+	w.WriteFile("data", "document", bytes.NewReader(data))
+	w.Close()
+
+	req, err := http.NewRequest("POST", url, &buf)
 	if err != nil {
-		return "", "error"
+		return nil, false
 	}
-	defer os.Remove(tmp.Name())
-	tmp.Write(data)
-	tmp.Close()
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 
-	tmpDir, _ := os.MkdirTemp("", "taki-pres-conv-*")
-	defer os.RemoveAll(tmpDir)
-
-	// Convert to PDF first (preserves all slide content)
-	cmd := exec.Command("libreoffice", "--headless",
-		"--convert-to", "pdf", "--outdir", tmpDir, tmp.Name())
-	if err := cmd.Run(); err != nil {
-		return s.convertViaLibreOffice(tmp.Name())
-	}
-
-	base := strings.TrimSuffix(filepath.Base(tmp.Name()), filepath.Ext(tmp.Name()))
-	pdfPath := filepath.Join(tmpDir, base+".pdf")
-	pdfData, err := os.ReadFile(pdfPath)
+	resp, err := s.client.Do(req)
 	if err != nil {
-		return s.convertViaLibreOffice(tmp.Name())
+		log.Printf("collabora error: %v", err)
+		return nil, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("collabora returned %d", resp.StatusCode)
+		return nil, false
 	}
 
-	text := s.pdftotext(pdfData)
-	if text != "" {
-		return text, "libreoffice_pdf"
+	result, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false
 	}
-	// Scan-slides: LLM OCR
-	llmText := s.llmOCR(pdfData)
-	if llmText != "" {
-		return llmText, "libreoffice_pdf_ocr"
-	}
-	return "[presentation extraction failed]", "error"
+	return result, len(result) > 0
 }
 
 func (s *Server) convertViaPandoc(data []byte, ext string) (string, string) {
@@ -935,30 +950,13 @@ func (s *Server) convertViaPandoc(data []byte, ext string) (string, string) {
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return s.convertViaLibreOffice(tmp.Name())
+		return "[conversion failed — install collabora for full office support]", "error"
 	}
 	text := strings.TrimSpace(out.String())
 	if text != "" {
 		return text, "pandoc"
 	}
-	return s.convertViaLibreOffice(tmp.Name())
-}
-
-func (s *Server) convertViaLibreOffice(path string) (string, string) {
-	tmpDir, _ := os.MkdirTemp("", "taki-lo-*")
-	defer os.RemoveAll(tmpDir)
-
-	cmd := exec.Command("libreoffice", "--headless",
-		"--convert-to", "txt:Text", "--outdir", tmpDir, path)
-	cmd.Run()
-
-	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	txtPath := filepath.Join(tmpDir, base+".txt")
-	content, err := os.ReadFile(txtPath)
-	if err != nil {
-		return "[office conversion failed]", "error"
-	}
-	return strings.TrimSpace(string(content)), "libreoffice"
+	return "[no text extracted]", "error"
 }
 
 // ── Email ────────────────────────────────────────────────────
@@ -1449,10 +1447,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"version": version,
 		"llm":     s.cfg.LLM.APIBase,
 		"whisper": s.cfg.Whisper.APIBase,
+		"collabora": s.cfg.Collabora.URL,
 		"features": map[string]bool{
-			"pdf": true, "office": true, "image": true,
-			"audio": s.cfg.Whisper.APIBase != "", "archive": true,
-			"email": true, "taki_v1_protocol": true,
+			"pdf":       true,
+			"office":    s.cfg.Collabora.URL != "",
+			"image":     true,
+			"audio":     s.cfg.Whisper.APIBase != "",
+			"archive":   true,
+			"email":     true,
+			"taki_v2":   true,
 		},
 	})
 }
@@ -1472,11 +1475,16 @@ func main() {
 	cfg := loadConfig(*configPath)
 
 	log.Printf("open_taki %s starting on %s", version, cfg.Listen)
-	log.Printf("  LLM:     %s (model: %s)", cfg.LLM.APIBase, cfg.LLM.Model)
-	if cfg.Whisper.APIBase != "" {
-		log.Printf("  Whisper: %s (model: %s)", cfg.Whisper.APIBase, cfg.Whisper.Model)
+	log.Printf("  LLM:       %s (model: %s)", cfg.LLM.APIBase, cfg.LLM.Model)
+	if cfg.Collabora.URL != "" {
+		log.Printf("  Collabora: %s (office conversion)", cfg.Collabora.URL)
 	} else {
-		log.Printf("  Whisper: disabled")
+		log.Printf("  Collabora: not configured (office: pandoc-only, no DOC/XLS/PPT)")
+	}
+	if cfg.Whisper.APIBase != "" {
+		log.Printf("  Whisper:   %s (model: %s)", cfg.Whisper.APIBase, cfg.Whisper.Model)
+	} else {
+		log.Printf("  Whisper:   disabled")
 	}
 
 	srv := NewServer(cfg)
