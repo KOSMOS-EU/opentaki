@@ -4,13 +4,130 @@
 
 open_taki replaces Apache Tika in OpenCloud deployments. Same port (9998), same API (`/rmeta/text`), same service name (`tika`) — just swap the container image.
 
-### What changes
+### Before: Apache Tika
 
 ```
-BEFORE:  OpenCloud → Apache Tika (Java, Tesseract OCR, ~1 GB)
-AFTER:   OpenCloud → open_taki (Go, LLM Vision OCR, 268 MB)
-                       ├→ Collabora (office conversion, already in stack)
-                       └→ vLLM/microllm (LLM for OCR + analysis)
+┌────────────────────────────────────────────────────────────────┐
+│ OpenCloud Compose Stack                                        │
+│                                                                │
+│  ┌──────────┐    PUT /rmeta/text    ┌───────────────────────┐  │
+│  │OpenCloud │ ──────────────────── │ Apache Tika  (~1 GB)  │  │
+│  │ (search) │                      │                       │  │
+│  └──────────┘                      │  Java 21 + JVM        │  │
+│       │                            │  Tesseract OCR (CPU)   │  │
+│       ▼                            │  70 parsers            │  │
+│  ┌──────────┐                      │  1400 MIME types       │  │
+│  │  Bleve   │                      └───────────────────────┘  │
+│  │  Index   │                                                  │
+│  └──────────┘          ┌───────────────────────┐              │
+│                        │ Collabora  (unused     │              │
+│                        │ for search indexing)    │              │
+│                        └───────────────────────┘              │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### After: open_taki
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ OpenCloud Compose Stack                                        │
+│                                                                │
+│  ┌──────────┐    PUT /rmeta/text    ┌───────────────────────┐  │
+│  │OpenCloud │ ──────────────────── │ open_taki  (268 MB)   │  │
+│  │ (search) │   X-Taki-Protocol:v2 │                       │  │
+│  └──────────┘                      │  Go binary (6 MB)     │  │
+│       │                            │  pdftotext + pandoc    │  │
+│       ▼                            └──┬─────┬─────┬───────┘  │
+│  ┌──────────┐                         │     │     │           │
+│  │  Bleve   │  meta + content ────────┘     │     │           │
+│  │  Index   │  (selective per routing)      │     │           │
+│  └──────────┘                               │     │           │
+│                                             │     │           │
+│  ┌──────────┐  embedding + source ref ──────┘     │           │
+│  │  Qdrant  │  (vector search, optional)          │           │
+│  │ VectorDB │                                     │           │
+│  └──────────┘                                     │           │
+│                        ┌──────────────────────┐   │           │
+│                        │ Collabora            │   │           │
+│                        │ /cool/convert-to     │◄──┘           │
+│                        │ DOC XLS PPT ODT ODS  │  office       │
+│                        └──────────────────────┘  conversion   │
+└────────────────────────────────────────────────────────────────┘
+          │
+          │  LLM API (OpenAI-compatible)
+          ▼
+┌──────────────────────────────────────┐
+│ GPU Server (external or local)       │
+│                                      │
+│  ┌────────────┐   ┌──────────────┐   │
+│  │ microllm   │──│ vLLM         │   │
+│  │ :8012      │   │ qwen3.5-122B │   │
+│  │ (routing)  │   │ (Vision+Chat)│   │
+│  └────────────┘   └──────────────┘   │
+│                                      │
+│  ┌────────────┐   ┌──────────────┐   │
+│  │ Embedding  │   │ Whisper      │   │
+│  │ nomic-embed│   │ (optional)   │   │
+│  │ :8019      │   │ transcription│   │
+│  └────────────┘   └──────────────┘   │
+└──────────────────────────────────────┘
+```
+
+### Data flow
+
+```
+File uploaded to OpenCloud
+        │
+        ▼
+   OpenCloud search service
+        │
+        │  PUT /rmeta/text
+        │  Content-Type: application/pdf
+        │  X-Taki-Protocol: v2
+        │  X-Taki-Features: meta,entities,summary,embedding
+        ▼
+   open_taki receives file
+        │
+        ├─ PDF? ──── pdftotext ──── good text? ──── yes ─── content ──┐
+        │                                   │                          │
+        │                                   no                         │
+        │                                   │                          │
+        │                    PDF→PNG→LLM Vision OCR ── content ───────┤
+        │                                                              │
+        ├─ DOC/XLS/PPT? ── Collabora /cool/convert-to ── content ────┤
+        │                                                              │
+        ├─ DOCX/ODT? ───── pandoc ── content ─────────────────────────┤
+        │                                                              │
+        ├─ Image? ──────── LLM Vision (describe) ── content ─────────┤
+        │                                                              │
+        ├─ Audio? ──────── Whisper transcribe ── content ─────────────┤
+        │                                                              │
+        ├─ Archive? ────── unzip → recursive extract ── content ──────┤
+        │                                                              │
+        └─ Text/HTML? ──── passthrough/pandoc ── content ─────────────┤
+                                                                       │
+        ┌──────────────────────────────────────────────────────────────┘
+        │
+        ▼
+   LLM enrichment (if v2 protocol)
+        │
+        ├── meta:     title, author, date, language, doc_type
+        ├── entities: persons, orgs, locations, dates, amounts
+        ├── summary:  1-2 sentence description
+        └── embedding: 768-dim vector (nomic-embed)
+        │
+        ▼
+   Response with routing decision
+        │
+        ├── content_target: "both"   → content to bleve + vector
+        ├── content_target: "vector" → content to vector only (images, audio)
+        ├── meta_target: "bleve"     → always (title, entities in keyword index)
+        └── vector_target: "vector"  → always (embedding for semantic search)
+        │
+        ▼
+   OpenCloud stores results
+        ├── Bleve index:  title + content (if routed) + metadata
+        └── Qdrant:       embedding + source reference (future)
 ```
 
 ### Why
