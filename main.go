@@ -38,7 +38,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const version = "0.7.0"
+const version = "0.8.0"
 
 type Config struct {
 	Listen string `yaml:"listen"`

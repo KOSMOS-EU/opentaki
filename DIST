@@ -1,0 +1,7 @@
+HOST=cloud.brandis.eu
+DOCKER_REGISTRY=codeberg.org
+DOCKER_NS=kosmos-eu
+IMAGE=open_taki
+SERVICES=.
+DATAPATH=/data/opencloud_podman
+CONTAINER_NAME=opencloud_full-tika-1
