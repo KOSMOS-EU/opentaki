@@ -1952,6 +1952,7 @@ func (s *Server) handleSchema(w http.ResponseWriter, r *http.Request) {
 			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 			"application/vnd.oasis.opendocument.text",
 			"message/rfc822",
+			"application/vnd.ms-outlook",
 		}
 		// Also check routing rules for additional MIME types with "meta" feature
 		for _, rule := range s.cfg.Routing.BleveRules {
