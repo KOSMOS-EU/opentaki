@@ -1,6 +1,6 @@
 # job.py build-pod
 REPO=opentaki
-BRANCH=main
+BRANCH=master
 GIT_BASE=https://codeberg.org/kosmos-eu
 PIPELINE=build-pod
 
