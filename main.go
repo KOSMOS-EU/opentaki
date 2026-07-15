@@ -174,10 +174,15 @@ type chatRequest struct {
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 }
 
-// responseFormat for structured output (guided_json via vLLM / OpenAI compatible)
+// responseFormat for structured output (OpenAI json_schema format, supported by vLLM)
 type responseFormat struct {
-	Type       string          `json:"type"`                  // "json_schema"
-	JSONSchema json.RawMessage `json:"json_schema,omitempty"` // the schema object
+	Type       string            `json:"type"`                  // "json_schema"
+	JSONSchema *jsonSchemaRef    `json:"json_schema,omitempty"` // wrapper with name + schema
+}
+
+type jsonSchemaRef struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type chatMessage struct {
@@ -1821,8 +1826,11 @@ func (s *Server) llmComplete(messages []chatMessage) string {
 // The schema must be a valid JSON schema as json.RawMessage.
 func (s *Server) llmCompleteStructured(messages []chatMessage, schema json.RawMessage) string {
 	rf := &responseFormat{
-		Type:       "json_schema",
-		JSONSchema: schema,
+		Type: "json_schema",
+		JSONSchema: &jsonSchemaRef{
+			Name:   "docmeta",
+			Schema: schema,
+		},
 	}
 	return s.llmCompleteOpts(messages, rf)
 }
