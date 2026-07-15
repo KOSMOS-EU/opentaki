@@ -38,13 +38,23 @@ fallback:
   min_chars: 200
   min_chars_per_page: 50
 
+# Structured metadata extraction from document letterheads
+# Uses guided_json (constrained decoding) for deterministic extraction
+docmeta:
+  enabled: true
+  rescue_pass: true                            # text-based fallback if vision pass incomplete
+  required_fields: [doc.date, sender.company]  # trigger rescue if these are null
+
 # Routing (active with X-Taki-Protocol: v2)
 routing:
   vector: always
   bleve_rules:
     - match:
         mime: ["application/pdf", "application/msword", "application/vnd.openxmlformats-*"]
-      features: [meta, entities, summary]
+      features: [docmeta, meta, entities, summary]
+    - match:
+        mime: ["image/*"]
+      features: [docmeta, meta]
     - match:
         mime: ["application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml*"]
       features: [meta]
@@ -57,4 +67,4 @@ routing:
     - match:
         space_type: ["project"]
         mime: ["*"]
-      features: [meta, entities, summary]
+      features: [docmeta, meta, entities, summary]

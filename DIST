@@ -1,3 +1,10 @@
+# job.py build-pod
+REPO=opentaki
+BRANCH=main
+GIT_BASE=https://codeberg.org/kosmos-eu
+PIPELINE=build-pod
+
+# deploy.sh
 HOST=cloud.brandis.eu
 DOCKER_REGISTRY=codeberg.org
 DOCKER_NS=kosmos-eu
