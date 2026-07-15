@@ -1,0 +1,52 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["is_letterhead", "doc", "sender", "uncertain"],
+  "properties": {
+    "is_letterhead": { "type": "boolean" },
+    "doc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "subject_inferred", "type", "date", "reference"],
+      "properties": {
+        "subject": { "type": ["string", "null"] },
+        "subject_inferred": { "type": "boolean" },
+        "type": {
+          "type": ["string", "null"],
+          "enum": ["rechnung", "bescheid", "antrag", "angebot",
+                   "mahnung", "vertrag", "kuendigung", "mitteilung",
+                   "einladung", "sonstiges", null]
+        },
+        "date": {
+          "type": ["string", "null"],
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "reference": { "type": ["string", "null"] }
+      }
+    },
+    "sender": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["company", "given_name", "family_name", "street",
+                   "house_number", "postal_code", "sub_locality",
+                   "city", "country", "email", "phone"],
+      "properties": {
+        "company":      { "type": ["string", "null"] },
+        "given_name":   { "type": ["string", "null"] },
+        "family_name":  { "type": ["string", "null"] },
+        "street":       { "type": ["string", "null"] },
+        "house_number": { "type": ["string", "null"] },
+        "postal_code":  { "type": ["string", "null"] },
+        "sub_locality": { "type": ["string", "null"] },
+        "city":         { "type": ["string", "null"] },
+        "country":      { "type": ["string", "null"], "pattern": "^[A-Z]{2}$" },
+        "email":        { "type": ["string", "null"] },
+        "phone":        { "type": ["string", "null"] }
+      }
+    },
+    "uncertain": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

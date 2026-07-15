@@ -76,9 +76,17 @@ type Config struct {
 
 // DocMetaConfig controls structured metadata extraction from document letterheads.
 type DocMetaConfig struct {
-	Enabled        bool     `yaml:"enabled"`
-	RescuePass     bool     `yaml:"rescue_pass"`
-	RequiredFields []string `yaml:"required_fields"` // fields that trigger rescue if null
+	Enabled          bool     `yaml:"enabled"`
+	RescuePass       bool     `yaml:"rescue_pass"`
+	RequiredFields   []string `yaml:"required_fields"`    // fields that trigger rescue if null
+	SchemaFile       string   `yaml:"schema_file"`        // path to guided_json schema (default: /etc/open_taki/docmeta_schema.json)
+	PromptFile       string   `yaml:"prompt_file"`        // path to vision prompt (default: /etc/open_taki/docmeta_prompt.txt)
+	RescuePromptFile string   `yaml:"rescue_prompt_file"` // path to rescue prompt (default: /etc/open_taki/docmeta_rescue_prompt.txt)
+
+	// Loaded at startup (not from YAML)
+	schema       json.RawMessage
+	prompt       string
+	rescuePrompt string
 }
 
 // ── Routing ──────────────────────────────────────────────────
@@ -263,165 +271,68 @@ type takiAudio struct {
 
 // ── DocMeta types (structured document metadata from letterhead) ──
 
-type takiDocMeta struct {
-	IsLetterhead    bool           `json:"is_letterhead"`
-	Doc             docMetaDoc     `json:"doc"`
-	Sender          docMetaSender  `json:"sender"`
-	Uncertain       []string       `json:"uncertain"`
-	Source          string         `json:"source,omitempty"` // "vision", "rescue", "merged"
+// takiDocMeta is a dynamic map — schema defines the structure, not Go types.
+// This allows adding fields in docmeta_schema.json without code changes.
+type takiDocMeta map[string]interface{}
+
+// loadDocMetaFiles loads schema, prompt and rescue prompt from external files.
+// Falls back to built-in defaults if files are not found.
+func (cfg *Config) loadDocMetaFiles(configDir string) {
+	if !cfg.DocMeta.Enabled {
+		return
+	}
+
+	// Defaults for file paths
+	if cfg.DocMeta.SchemaFile == "" {
+		cfg.DocMeta.SchemaFile = filepath.Join(configDir, "docmeta_schema.json")
+	}
+	if cfg.DocMeta.PromptFile == "" {
+		cfg.DocMeta.PromptFile = filepath.Join(configDir, "docmeta_prompt.txt")
+	}
+	if cfg.DocMeta.RescuePromptFile == "" {
+		cfg.DocMeta.RescuePromptFile = filepath.Join(configDir, "docmeta_rescue_prompt.txt")
+	}
+
+	// Load schema
+	if data, err := os.ReadFile(cfg.DocMeta.SchemaFile); err == nil {
+		// Validate it's valid JSON
+		var test json.RawMessage
+		if json.Unmarshal(data, &test) == nil {
+			cfg.DocMeta.schema = data
+			log.Printf("  DocMeta schema: %s (%d bytes)", cfg.DocMeta.SchemaFile, len(data))
+		} else {
+			log.Fatalf("docmeta: invalid JSON in %s: %v", cfg.DocMeta.SchemaFile, err)
+		}
+	} else {
+		log.Printf("  DocMeta schema: using built-in default (%s not found)", cfg.DocMeta.SchemaFile)
+		cfg.DocMeta.schema = docMetaDefaultSchema
+	}
+
+	// Load prompt
+	if data, err := os.ReadFile(cfg.DocMeta.PromptFile); err == nil {
+		cfg.DocMeta.prompt = strings.TrimSpace(string(data))
+		log.Printf("  DocMeta prompt: %s (%d chars)", cfg.DocMeta.PromptFile, len(cfg.DocMeta.prompt))
+	} else {
+		log.Printf("  DocMeta prompt: using built-in default (%s not found)", cfg.DocMeta.PromptFile)
+		cfg.DocMeta.prompt = docMetaDefaultPrompt
+	}
+
+	// Load rescue prompt
+	if data, err := os.ReadFile(cfg.DocMeta.RescuePromptFile); err == nil {
+		cfg.DocMeta.rescuePrompt = strings.TrimSpace(string(data))
+		log.Printf("  DocMeta rescue: %s (%d chars)", cfg.DocMeta.RescuePromptFile, len(cfg.DocMeta.rescuePrompt))
+	} else {
+		log.Printf("  DocMeta rescue: using built-in default (%s not found)", cfg.DocMeta.RescuePromptFile)
+		cfg.DocMeta.rescuePrompt = docMetaDefaultRescuePrompt
+	}
 }
 
-type docMetaDoc struct {
-	Subject         *string `json:"subject"`
-	SubjectInferred bool    `json:"subject_inferred"`
-	Type            *string `json:"type"`      // rechnung, bescheid, antrag, ...
-	Date            *string `json:"date"`      // ISO 8601 YYYY-MM-DD
-	Reference       *string `json:"reference"` // sender's reference/Az.
-}
+// Built-in defaults (used when external files are not found)
+var docMetaDefaultSchema = json.RawMessage(`{"type":"object","additionalProperties":false,"required":["is_letterhead","doc","sender","uncertain"],"properties":{"is_letterhead":{"type":"boolean"},"doc":{"type":"object","additionalProperties":false,"required":["subject","subject_inferred","type","date","reference"],"properties":{"subject":{"type":["string","null"]},"subject_inferred":{"type":"boolean"},"type":{"type":["string","null"],"enum":["rechnung","bescheid","antrag","angebot","mahnung","vertrag","kuendigung","mitteilung","einladung","sonstiges",null]},"date":{"type":["string","null"],"pattern":"^\\d{4}-\\d{2}-\\d{2}$"},"reference":{"type":["string","null"]}}},"sender":{"type":"object","additionalProperties":false,"required":["company","given_name","family_name","street","house_number","postal_code","sub_locality","city","country","email","phone"],"properties":{"company":{"type":["string","null"]},"given_name":{"type":["string","null"]},"family_name":{"type":["string","null"]},"street":{"type":["string","null"]},"house_number":{"type":["string","null"]},"postal_code":{"type":["string","null"]},"sub_locality":{"type":["string","null"]},"city":{"type":["string","null"]},"country":{"type":["string","null"],"pattern":"^[A-Z]{2}$"},"email":{"type":["string","null"]},"phone":{"type":["string","null"]}}},"uncertain":{"type":"array","items":{"type":"string"}}}}`)
 
-type docMetaSender struct {
-	Company     *string `json:"company"`
-	GivenName   *string `json:"given_name"`
-	FamilyName  *string `json:"family_name"`
-	Street      *string `json:"street"`
-	HouseNumber *string `json:"house_number"`
-	PostalCode  *string `json:"postal_code"`
-	SubLocality *string `json:"sub_locality"`
-	City        *string `json:"city"`
-	Country     *string `json:"country"` // ISO 3166-1 alpha-2
-	Email       *string `json:"email"`
-	Phone       *string `json:"phone"`
-}
+const docMetaDefaultPrompt = "Du bist ein Extraktionssystem. Extrahiere Metadaten als JSON. Gib NUR das JSON zurück."
 
-// docMetaSchema is the guided_json schema for Pass 1 (vision extraction).
-// Enforces constrained decoding — the LLM can only output valid JSON matching this schema.
-var docMetaSchema = json.RawMessage(`{
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["is_letterhead", "doc", "sender", "uncertain"],
-  "properties": {
-    "is_letterhead": { "type": "boolean" },
-    "doc": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["subject", "subject_inferred", "type", "date", "reference"],
-      "properties": {
-        "subject": { "type": ["string", "null"] },
-        "subject_inferred": { "type": "boolean" },
-        "type": {
-          "type": ["string", "null"],
-          "enum": ["rechnung", "bescheid", "antrag", "angebot",
-                   "mahnung", "vertrag", "kuendigung", "mitteilung",
-                   "einladung", "sonstiges", null]
-        },
-        "date": {
-          "type": ["string", "null"],
-          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
-        },
-        "reference": { "type": ["string", "null"] }
-      }
-    },
-    "sender": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["company", "given_name", "family_name", "street",
-                   "house_number", "postal_code", "sub_locality",
-                   "city", "country", "email", "phone"],
-      "properties": {
-        "company":      { "type": ["string", "null"] },
-        "given_name":   { "type": ["string", "null"] },
-        "family_name":  { "type": ["string", "null"] },
-        "street":       { "type": ["string", "null"] },
-        "house_number": { "type": ["string", "null"] },
-        "postal_code":  { "type": ["string", "null"] },
-        "sub_locality": { "type": ["string", "null"] },
-        "city":         { "type": ["string", "null"] },
-        "country":      { "type": ["string", "null"], "pattern": "^[A-Z]{2}$" },
-        "email":        { "type": ["string", "null"] },
-        "phone":        { "type": ["string", "null"] }
-      }
-    },
-    "uncertain": {
-      "type": "array",
-      "items": { "type": "string" }
-    }
-  }
-}`)
-
-const docMetaPrompt = `Du bist ein Extraktionssystem für den Posteingang einer deutschen
-Kommunalverwaltung. Du erhältst die erste Seite eines eingescannten
-Schriftstücks als Bild. Extrahiere ausschließlich die unten definierten
-Metadaten und gib sie als JSON zurück.
-
-REGELN:
-1. Extrahiere NUR, was tatsächlich lesbar im Dokument steht.
-   Felder ohne Beleg im Dokument sind null. Niemals raten,
-   ergänzen oder aus Kontextwissen ableiten (keine PLZ zu einer
-   Stadt erfinden, keine Anrede zu einem Namen erfinden).
-2. Datumsangaben als ISO 8601 (YYYY-MM-DD). "3. Juli 2026" → "2026-07-03".
-   Bei mehreren Datumsangaben gilt das Briefdatum im Kopf, nicht
-   Fristen oder Bezugsdaten im Text.
-3. country als ISO-3166-1-alpha-2-Code ("DE", "AT", "CH").
-   Fehlt die Länderangabe, aber die Adresse ist eindeutig deutsch
-   formatiert (5-stellige PLZ), setze "DE". Sonst null.
-4. sender = der Absender des Schriftstücks (Briefkopf/Absenderzeile),
-   NICHT der Empfänger im Adressfeld.
-5. given_name/family_name nur bei natürlichen Personen als Absender
-   oder namentlich genanntem Sachbearbeiter im Briefkopf.
-   company = Organisation/Firma/Behörde. Beides kann gesetzt sein.
-6. doc.reference = das Zeichen des ABSENDERS ("Unser Zeichen",
-   "Az.", "Geschäftszeichen", Rechnungsnummer). "Ihr Zeichen" ignorieren.
-7. doc.subject = die Betreffzeile wörtlich, ohne das Wort "Betreff:".
-   Fehlt eine Betreffzeile, fasse den Zweck in max. 10 Wörtern zusammen
-   und setze subject_inferred auf true.
-8. doc.type: wähle genau einen Wert aus dem Enum. Im Zweifel "sonstiges".
-9. is_letterhead = false, wenn die Seite ein Fax-Deckblatt,
-   Scan-Trennblatt oder eine Anlage ohne Briefkopf ist.
-10. uncertain: Liste aller Feldnamen, deren Wert du gesetzt hast,
-    aber wegen schlechter Scanqualität, Handschrift oder Mehrdeutigkeit
-    nicht sicher bist.
-11. Gib NUR das JSON zurück, keinen weiteren Text.`
-
-const docMetaRescuePrompt = `Du bist ein Extraktionssystem für den Posteingang einer deutschen
-Kommunalverwaltung. Ein erster Extraktionslauf über die Titelseite
-konnte einige Metadatenfelder nicht sicher bestimmen. Du erhältst:
-
-1. den vollständigen OCR-Text des Schriftstücks (alle Seiten)
-2. die Liste der offenen Felder
-3. die bereits sicher extrahierten Werte als Kontext
-
-Deine Aufgabe: Bestimme AUSSCHLIESSLICH die offenen Felder aus dem
-OCR-Text. Bereits gesetzte Werte sind nicht dein Auftrag und dürfen
-nicht verändert werden.
-
-REGELN:
-1. Nur Werte eintragen, die wörtlich oder eindeutig belegbar im
-   OCR-Text stehen. Kein Feld belegbar → null. Niemals raten oder
-   aus Weltwissen ergänzen.
-2. Der OCR-Text kann Erkennungsfehler enthalten (0/O, 1/l/I,
-   Umlaut-Verstümmelung). Offensichtliche OCR-Fehler darfst du
-   korrigieren, wenn die Korrektur eindeutig ist ("Leipzlg" →
-   "Leipzig"). Nicht eindeutige Fälle: Wert setzen und das Feld
-   in uncertain aufnehmen.
-3. Datumsangaben als ISO 8601 (YYYY-MM-DD). Gesucht ist das
-   Briefdatum des Schriftstücks — nicht Fristen, Bezugsdaten,
-   Rechnungszeiträume oder das Scandatum.
-4. sender = Absender des Schriftstücks. Achtung: Im Volltext stehen
-   auch Empfängeradresse, ggf. zitierte Adressen Dritter und
-   Bankverbindungen. Absenderdaten stehen typischerweise im
-   Briefkopf (Textanfang), in der Fußzeile oder im Signaturblock.
-5. doc.reference = Zeichen des Absenders ("Unser Zeichen", "Az.",
-   Rechnungsnummer). "Ihr Zeichen" ignorieren.
-6. Gib NUR das JSON zurück, keinen weiteren Text.
-
-OFFENE FELDER:
-%s
-
-BEREITS EXTRAHIERT (Kontext, nicht verändern):
-%s
-
-OCR-TEXT:
-%s`
+const docMetaDefaultRescuePrompt = "Bestimme die offenen Felder aus dem OCR-Text. Gib NUR JSON zurück.\n\nOFFENE FELDER:\n%s\n\nBEREITS EXTRAHIERT:\n%s\n\nOCR-TEXT:\n%s"
 
 // ── Config ───────────────────────────────────────────────────
 
@@ -444,11 +355,13 @@ func loadConfig(path string) Config {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("config %s not found, using defaults", path)
+		cfg.loadDocMetaFiles(filepath.Dir(path))
 		return cfg
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("config parse error: %v", err)
 	}
+	cfg.loadDocMetaFiles(filepath.Dir(path))
 	return cfg
 }
 
@@ -654,11 +567,90 @@ func (s *Server) enrichWithLLM(resp *takiResponse, content, ct string, features 
 }
 
 // ── DocMeta extraction (structured metadata from document letterhead) ──
+//
+// takiDocMeta is map[string]interface{} — all field access is dynamic.
+// Helper functions use dot-notation paths like "doc.subject" or "sender.company".
+
+// dmGet retrieves a nested value from a docmeta map using dot-notation (e.g. "doc.subject").
+func dmGet(dm takiDocMeta, path string) interface{} {
+	parts := strings.SplitN(path, ".", 2)
+	val, ok := dm[parts[0]]
+	if !ok || val == nil {
+		return nil
+	}
+	if len(parts) == 1 {
+		return val
+	}
+	sub, ok := val.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return sub[parts[1]]
+}
+
+// dmGetStr retrieves a string value, returns "" if null/missing.
+func dmGetStr(dm takiDocMeta, path string) string {
+	v := dmGet(dm, path)
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// dmGetBool retrieves a bool value, returns false if missing.
+func dmGetBool(dm takiDocMeta, path string) bool {
+	v := dmGet(dm, path)
+	if v == nil {
+		return false
+	}
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return false
+}
+
+// dmGetStrSlice retrieves a string slice (e.g. "uncertain").
+func dmGetStrSlice(dm takiDocMeta, path string) []string {
+	v := dmGet(dm, path)
+	if v == nil {
+		return nil
+	}
+	if arr, ok := v.([]interface{}); ok {
+		var result []string
+		for _, item := range arr {
+			if s, ok := item.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	}
+	return nil
+}
+
+// dmSet sets a nested value using dot-notation. Creates intermediate maps as needed.
+func dmSet(dm takiDocMeta, path string, val interface{}) {
+	parts := strings.SplitN(path, ".", 2)
+	if len(parts) == 1 {
+		dm[parts[0]] = val
+		return
+	}
+	sub, ok := dm[parts[0]].(map[string]interface{})
+	if !ok {
+		sub = map[string]interface{}{}
+		dm[parts[0]] = sub
+	}
+	sub[parts[1]] = val
+}
+
+// dmIsNull checks if a dot-notation field is null or missing.
+func dmIsNull(dm takiDocMeta, path string) bool {
+	return dmGet(dm, path) == nil
+}
 
 // extractDocMeta extracts structured metadata from a document.
-// For PDFs: renders page 1 as image, sends to LLM with guided_json.
-// For images: sends the image directly.
-// Returns nil if extraction fails or docmeta is disabled.
 func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDocMeta {
 	if !s.cfg.DocMeta.Enabled {
 		return nil
@@ -668,7 +660,6 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 
 	switch {
 	case strings.Contains(strings.ToLower(ct), "pdf"):
-		// Render first page as PNG
 		imgData := s.pdfPageToImage(body, 1)
 		if imgData == nil {
 			log.Printf("docmeta: failed to render PDF page 1")
@@ -692,7 +683,6 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 		dataURL = "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(body)
 
 	default:
-		// Not a visual document — skip vision pass
 		log.Printf("docmeta: skipping non-visual content type %s", ct)
 		return nil
 	}
@@ -702,33 +692,33 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 	if dm == nil {
 		return nil
 	}
-	dm.Source = "vision"
+	(*dm)["source"] = "vision"
 
-	// If not a letterhead, try page 2 (might be a cover sheet)
-	if !dm.IsLetterhead && strings.Contains(strings.ToLower(ct), "pdf") {
+	// If not a letterhead, try page 2
+	if !dmGetBool(*dm, "is_letterhead") && strings.Contains(strings.ToLower(ct), "pdf") {
 		imgData2 := s.pdfPageToImage(body, 2)
 		if imgData2 != nil {
 			dataURL2 := "data:image/png;base64," + base64.StdEncoding.EncodeToString(imgData2)
 			dm2 := s.docMetaVisionPass(dataURL2)
-			if dm2 != nil && dm2.IsLetterhead {
+			if dm2 != nil && dmGetBool(*dm2, "is_letterhead") {
 				dm = dm2
-				dm.Source = "vision_p2"
+				(*dm)["source"] = "vision_p2"
 			}
 		}
 	}
 
-	// Rescue pass: if required fields are null or uncertain is non-empty
-	if s.cfg.DocMeta.RescuePass && fulltext != "" && s.docMetaNeedsRescue(dm) {
-		rescued := s.docMetaRescuePass(dm, fulltext)
+	// Rescue pass
+	if s.cfg.DocMeta.RescuePass && fulltext != "" && s.docMetaNeedsRescue(*dm) {
+		rescued := s.docMetaRescuePass(*dm, fulltext)
 		if rescued != nil {
 			dm = rescued
 		}
 	}
 
-	log.Printf("docmeta: source=%s letterhead=%v type=%v date=%v sender=%v uncertain=%d",
-		dm.Source, dm.IsLetterhead,
-		ptrStr(dm.Doc.Type), ptrStr(dm.Doc.Date),
-		ptrStr(dm.Sender.Company), len(dm.Uncertain))
+	log.Printf("docmeta: source=%s letterhead=%v type=%s date=%s sender=%s uncertain=%d",
+		dmGetStr(*dm, "source"), dmGetBool(*dm, "is_letterhead"),
+		dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.date"),
+		dmGetStr(*dm, "sender.company"), len(dmGetStrSlice(*dm, "uncertain")))
 
 	return dm
 }
@@ -736,12 +726,12 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 // docMetaVisionPass sends a single page image to the LLM with guided_json schema.
 func (s *Server) docMetaVisionPass(dataURL string) *takiDocMeta {
 	content := []contentBlock{
-		{Type: "text", Text: docMetaPrompt},
+		{Type: "text", Text: s.cfg.DocMeta.prompt},
 		{Type: "image_url", ImageURL: &imageURL{URL: dataURL}},
 	}
 
 	messages := []chatMessage{{Role: "user", Content: content}}
-	result := s.llmCompleteStructured(messages, docMetaSchema)
+	result := s.llmCompleteStructured(messages, s.cfg.DocMeta.schema)
 	if result == "" {
 		return nil
 	}
@@ -755,7 +745,6 @@ func (s *Server) docMetaVisionPass(dataURL string) *takiDocMeta {
 }
 
 // pdfPageToImage renders a single PDF page to a PNG image.
-// pageNum is 1-based. Returns nil on failure.
 func (s *Server) pdfPageToImage(pdfData []byte, pageNum int) []byte {
 	tmpDir, err := os.MkdirTemp("", "taki-docmeta-*")
 	if err != nil {
@@ -789,80 +778,42 @@ func (s *Server) pdfPageToImage(pdfData []byte, pageNum int) []byte {
 }
 
 // docMetaNeedsRescue checks if required fields are missing or uncertain.
-func (s *Server) docMetaNeedsRescue(dm *takiDocMeta) bool {
-	if !dm.IsLetterhead {
-		return false // not a letterhead — rescue won't help
+func (s *Server) docMetaNeedsRescue(dm takiDocMeta) bool {
+	if !dmGetBool(dm, "is_letterhead") {
+		return false
 	}
-	if len(dm.Uncertain) > 0 {
+	if len(dmGetStrSlice(dm, "uncertain")) > 0 {
 		return true
 	}
 	for _, field := range s.cfg.DocMeta.RequiredFields {
-		if s.docMetaFieldIsNull(dm, field) {
+		if dmIsNull(dm, field) {
 			return true
 		}
 	}
 	return false
 }
 
-// docMetaFieldIsNull checks if a dot-separated field path is null in the docmeta.
-func (s *Server) docMetaFieldIsNull(dm *takiDocMeta, field string) bool {
-	switch field {
-	case "doc.subject":
-		return dm.Doc.Subject == nil
-	case "doc.type":
-		return dm.Doc.Type == nil
-	case "doc.date":
-		return dm.Doc.Date == nil
-	case "doc.reference":
-		return dm.Doc.Reference == nil
-	case "sender.company":
-		return dm.Sender.Company == nil
-	case "sender.given_name":
-		return dm.Sender.GivenName == nil
-	case "sender.family_name":
-		return dm.Sender.FamilyName == nil
-	case "sender.city":
-		return dm.Sender.City == nil
-	case "sender.email":
-		return dm.Sender.Email == nil
-	default:
-		return false
-	}
-}
-
-func ptrStr(p *string) string {
-	if p == nil {
-		return "<nil>"
-	}
-	return *p
-}
-
 // ── Rescue pass (text-based metadata recovery) ──────────────
 
 // docMetaRescuePass attempts to fill missing fields from OCR fulltext.
-// Uses a smaller, text-only LLM call — no vision needed.
-func (s *Server) docMetaRescuePass(dm *takiDocMeta, fulltext string) *takiDocMeta {
-	// Collect missing and uncertain fields
+func (s *Server) docMetaRescuePass(dm takiDocMeta, fulltext string) *takiDocMeta {
 	missing := s.docMetaMissingFields(dm)
 	if len(missing) == 0 {
 		return nil
 	}
 
-	// Build known values JSON for context
 	knownJSON, _ := json.MarshalIndent(dm, "", "  ")
 
-	// Truncate fulltext for LLM context
 	text := fulltext
 	if len(text) > 12000 {
 		text = text[:12000]
 	}
 
-	prompt := fmt.Sprintf(docMetaRescuePrompt,
+	prompt := fmt.Sprintf(s.cfg.DocMeta.rescuePrompt,
 		strings.Join(missing, ", "),
 		string(knownJSON),
 		text)
 
-	// Rescue uses simple JSON mode (no vision, no guided_json — rescue schema is dynamic)
 	result := s.llmChat(prompt)
 	if result == "" {
 		return nil
@@ -873,7 +824,6 @@ func (s *Server) docMetaRescuePass(dm *takiDocMeta, fulltext string) *takiDocMet
 		return nil
 	}
 
-	// Parse rescue response — flexible structure
 	var rescue struct {
 		Fields    map[string]interface{} `json:"fields"`
 		Evidence  map[string]string      `json:"evidence"`
@@ -885,64 +835,19 @@ func (s *Server) docMetaRescuePass(dm *takiDocMeta, fulltext string) *takiDocMet
 	}
 
 	// Merge: pass 1 wins on secure values, rescue fills gaps
-	merged := *dm // copy
-	mergedAny := false
+	merged := make(takiDocMeta)
+	// Deep copy original
+	origJSON, _ := json.Marshal(dm)
+	json.Unmarshal(origJSON, &merged)
 
+	mergedAny := false
 	for _, field := range missing {
 		val, ok := rescue.Fields[field]
 		if !ok || val == nil {
 			continue
 		}
-		strVal, ok := val.(string)
-		if !ok || strVal == "" {
-			continue
-		}
-
-		switch field {
-		case "doc.subject":
-			merged.Doc.Subject = &strVal
-			mergedAny = true
-		case "doc.type":
-			merged.Doc.Type = &strVal
-			mergedAny = true
-		case "doc.date":
-			merged.Doc.Date = &strVal
-			mergedAny = true
-		case "doc.reference":
-			merged.Doc.Reference = &strVal
-			mergedAny = true
-		case "sender.company":
-			merged.Sender.Company = &strVal
-			mergedAny = true
-		case "sender.given_name":
-			merged.Sender.GivenName = &strVal
-			mergedAny = true
-		case "sender.family_name":
-			merged.Sender.FamilyName = &strVal
-			mergedAny = true
-		case "sender.street":
-			merged.Sender.Street = &strVal
-			mergedAny = true
-		case "sender.house_number":
-			merged.Sender.HouseNumber = &strVal
-			mergedAny = true
-		case "sender.postal_code":
-			merged.Sender.PostalCode = &strVal
-			mergedAny = true
-		case "sender.sub_locality":
-			merged.Sender.SubLocality = &strVal
-			mergedAny = true
-		case "sender.city":
-			merged.Sender.City = &strVal
-			mergedAny = true
-		case "sender.country":
-			merged.Sender.Country = &strVal
-			mergedAny = true
-		case "sender.email":
-			merged.Sender.Email = &strVal
-			mergedAny = true
-		case "sender.phone":
-			merged.Sender.Phone = &strVal
+		if strVal, ok := val.(string); ok && strVal != "" {
+			dmSet(merged, field, strVal)
 			mergedAny = true
 		}
 	}
@@ -953,44 +858,44 @@ func (s *Server) docMetaRescuePass(dm *takiDocMeta, fulltext string) *takiDocMet
 
 	// Merge uncertain lists
 	uncertainSet := map[string]bool{}
-	for _, u := range dm.Uncertain {
+	for _, u := range dmGetStrSlice(dm, "uncertain") {
 		uncertainSet[u] = true
 	}
 	for _, u := range rescue.Uncertain {
 		uncertainSet[u] = true
 	}
-	// Remove fields that are no longer missing from uncertain
-	merged.Uncertain = nil
+	var newUncertain []string
 	for u := range uncertainSet {
-		if !s.docMetaFieldIsNull(&merged, u) {
-			merged.Uncertain = append(merged.Uncertain, u)
+		if !dmIsNull(merged, u) {
+			newUncertain = append(newUncertain, u)
 		}
 	}
+	merged["uncertain"] = newUncertain
+	merged["source"] = "merged"
 
-	merged.Source = "merged"
 	log.Printf("docmeta: rescue pass filled %d fields from fulltext", len(missing))
 	return &merged
 }
 
-// docMetaMissingFields returns field paths that are null or in the uncertain list.
-func (s *Server) docMetaMissingFields(dm *takiDocMeta) []string {
-	allFields := []string{
-		"doc.subject", "doc.type", "doc.date", "doc.reference",
-		"sender.company", "sender.given_name", "sender.family_name",
-		"sender.street", "sender.house_number", "sender.postal_code",
-		"sender.sub_locality", "sender.city", "sender.country",
-		"sender.email", "sender.phone",
-	}
-
+// docMetaMissingFields collects fields from the schema that are null or uncertain.
+// Walks "doc.*" and "sender.*" sub-objects dynamically.
+func (s *Server) docMetaMissingFields(dm takiDocMeta) []string {
 	uncertainSet := map[string]bool{}
-	for _, u := range dm.Uncertain {
+	for _, u := range dmGetStrSlice(dm, "uncertain") {
 		uncertainSet[u] = true
 	}
 
 	var missing []string
-	for _, f := range allFields {
-		if s.docMetaFieldIsNull(dm, f) || uncertainSet[f] {
-			missing = append(missing, f)
+	for _, prefix := range []string{"doc", "sender"} {
+		sub, ok := dm[prefix].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for key, val := range sub {
+			path := prefix + "." + key
+			if val == nil || uncertainSet[path] {
+				missing = append(missing, path)
+			}
 		}
 	}
 	return missing

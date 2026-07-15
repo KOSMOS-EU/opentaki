@@ -12,6 +12,9 @@ RUN apk add --no-cache poppler-utils pandoc
 # Audio/video: add ffmpeg if whisper is configured
 COPY --from=builder /open_taki /usr/local/bin/open_taki
 COPY config.yaml /etc/open_taki/config.yaml
+COPY docmeta_schema.json /etc/open_taki/docmeta_schema.json
+COPY docmeta_prompt.txt /etc/open_taki/docmeta_prompt.txt
+COPY docmeta_rescue_prompt.txt /etc/open_taki/docmeta_rescue_prompt.txt
 EXPOSE 9998
 ENTRYPOINT ["open_taki"]
 CMD ["/etc/open_taki/config.yaml"]
