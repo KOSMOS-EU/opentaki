@@ -2,35 +2,40 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "${SCRIPT_DIR}/DIST"
+cd "${SCRIPT_DIR}"
 
-TAG="$(date +%Y%m%d-%H%M)"
+# Source DIST if present (not always available in build-worker)
+[ -f DIST ] && . DIST
+
+IMAGE="${IMAGE:-open_taki}"
+DOCKER_REGISTRY="${DOCKER_REGISTRY:-codeberg.org}"
+DOCKER_NS="${DOCKER_NS:-kosmos-eu}"
+TAG="${TAG:-$(date +%Y%m%d-%H%M)}"
 FULL_IMAGE="${DOCKER_REGISTRY}/${DOCKER_NS}/${IMAGE}"
 
 echo "=== Build ${IMAGE}: ${FULL_IMAGE}:${TAG} ==="
 
-# Build Go binary (use Go 1.26 if available)
-echo "--- Go build ---"
-cd "${SCRIPT_DIR}"
-GO_BIN="go"
-if [ -x "$HOME/go1.26/bin/go" ]; then
-    GO_BIN="$HOME/go1.26/bin/go"
-fi
-echo "  using: $($GO_BIN version)"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $GO_BIN build -ldflags="-s -w" -o open_taki_linux .
-
-# Build container image with date tag + latest
+# Container build (multi-stage Dockerfile compiles Go inside)
 echo "--- Container build ---"
-podman build \
-    --no-cache \
-    -t "${FULL_IMAGE}:${TAG}" \
-    -t "${FULL_IMAGE}:latest" \
-    .
+if command -v buildah &>/dev/null; then
+    buildah bud --no-cache --network=host --security-opt label=disable \
+        -t "${FULL_IMAGE}:${TAG}" \
+        -t "${FULL_IMAGE}:latest" \
+        .
+else
+    podman build --no-cache --network=host \
+        -t "${FULL_IMAGE}:${TAG}" \
+        -t "${FULL_IMAGE}:latest" \
+        .
+fi
+
+# Push if token available (build-worker provides PUSH_TOKEN)
+if [ -n "${PUSH_TOKEN:-}" ]; then
+    echo "--- Push ---"
+    buildah push --creds="token:${PUSH_TOKEN}" "${FULL_IMAGE}:${TAG}"
+    buildah tag "${FULL_IMAGE}:${TAG}" "${FULL_IMAGE}:latest"
+    buildah push --creds="token:${PUSH_TOKEN}" "${FULL_IMAGE}:latest"
+fi
 
 echo ""
 echo "=== Built: ${FULL_IMAGE}:${TAG} ==="
-echo "  Tag: ${TAG}"
-echo ""
-echo "Next steps:"
-echo "  1. Push:    ./push.sh ${TAG}"
-echo "  2. Deploy:  ./deploy.sh ${TAG}"

@@ -3,6 +3,7 @@ REPO=opentaki
 BRANCH=master
 GIT_BASE=https://codeberg.org/kosmos-eu
 PIPELINE=build-pod
+PUSH_TOKEN=06a3d7852c445a0d1c144c7cdf64317778fe7bd4
 
 # deploy.sh
 HOST=cloud.brandis.eu
