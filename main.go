@@ -1937,6 +1937,99 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "open_taki %s\n", version)
 }
 
+// handleSchema returns the metadata keys that taki can enrich per MIME type.
+// Used by the search service to determine which files need re-enrichment.
+func (s *Server) handleSchema(w http.ResponseWriter, r *http.Request) {
+	schema := map[string][]string{}
+
+	// DocMeta keys from docmeta_schema.json (PDF, Office, Message)
+	if s.cfg.DocMeta.Enabled && len(s.cfg.DocMeta.schema) > 0 {
+		docKeys := extractSchemaKeys(s.cfg.DocMeta.schema)
+		// DocMeta applies to these MIME types (match routing rules with "meta" feature)
+		docMimes := []string{
+			"application/pdf",
+			"application/msword",
+			"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+			"application/vnd.oasis.opendocument.text",
+			"message/rfc822",
+		}
+		// Also check routing rules for additional MIME types with "meta" feature
+		for _, rule := range s.cfg.Routing.BleveRules {
+			for _, f := range rule.Features {
+				if f == "meta" {
+					docMimes = append(docMimes, rule.Match.Mime...)
+				}
+			}
+		}
+		for _, mime := range docMimes {
+			schema[mime] = appendUnique(schema[mime], docKeys...)
+		}
+	}
+
+	// Audio metadata (from whisper + LLM)
+	if s.cfg.Whisper.APIBase != "" {
+		audioKeys := []string{"libre.graph.audio.title", "libre.graph.audio.artist",
+			"libre.graph.audio.album", "libre.graph.audio.genre", "libre.graph.audio.year",
+			"libre.graph.audio.track", "libre.graph.audio.duration"}
+		for _, mime := range []string{"audio/mpeg", "audio/flac", "audio/ogg", "audio/wav", "audio/aac", "audio/mp4"} {
+			schema[mime] = appendUnique(schema[mime], audioKeys...)
+		}
+	}
+
+	// Image/Photo metadata (from EXIF + LLM)
+	imageKeys := []string{"libre.graph.image.width", "libre.graph.image.height"}
+	photoKeys := []string{"libre.graph.photo.cameraMake", "libre.graph.photo.cameraModel",
+		"libre.graph.photo.takenDateTime", "libre.graph.photo.iso"}
+	locationKeys := []string{"libre.graph.location.latitude", "libre.graph.location.longitude"}
+	for _, mime := range []string{"image/jpeg", "image/png", "image/tiff", "image/webp"} {
+		schema[mime] = appendUnique(schema[mime], imageKeys...)
+		schema[mime] = appendUnique(schema[mime], photoKeys...)
+		schema[mime] = appendUnique(schema[mime], locationKeys...)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(schema)
+}
+
+// extractSchemaKeys flattens the docmeta JSON schema into "prefix.key" strings.
+func extractSchemaKeys(schemaJSON json.RawMessage) []string {
+	var s struct {
+		Properties map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaJSON, &s); err != nil {
+		return nil
+	}
+	var keys []string
+	for prefix, obj := range s.Properties {
+		if prefix == "is_letterhead" || prefix == "uncertain" {
+			continue
+		}
+		for key := range obj.Properties {
+			if key == "subject_inferred" {
+				continue // internal flag, not a metadata key
+			}
+			keys = append(keys, prefix+"."+key)
+		}
+	}
+	return keys
+}
+
+func appendUnique(slice []string, items ...string) []string {
+	seen := map[string]bool{}
+	for _, s := range slice {
+		seen[s] = true
+	}
+	for _, item := range items {
+		if !seen[item] {
+			slice = append(slice, item)
+			seen[item] = true
+		}
+	}
+	return slice
+}
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "config file path")
 	flag.Parse()
@@ -1966,6 +2059,7 @@ func main() {
 
 	http.HandleFunc("/tika/text", srv.handleTikaText)
 	http.HandleFunc("/rmeta/text", srv.handleRmetaText)
+	http.HandleFunc("/schema", srv.handleSchema)
 	http.HandleFunc("/tika", srv.handleHealth)
 	http.HandleFunc("/version", srv.handleVersion)
 	http.HandleFunc("/", srv.handleHealth)
