@@ -1937,6 +1937,160 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "open_taki %s\n", version)
 }
 
+// handleTest probes all subsystems and returns structured status.
+func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
+	type subsystem struct {
+		Name    string `json:"name"`
+		Status  string `json:"status"` // "ok", "failed", "disabled"
+		Detail  string `json:"detail,omitempty"`
+		Latency string `json:"latency,omitempty"`
+	}
+
+	results := []subsystem{}
+
+	// 1. LLM (local-ocr or configured model)
+	if s.cfg.LLM.APIBase != "" {
+		t0 := time.Now()
+		llmStatus := "ok"
+		llmDetail := fmt.Sprintf("%s (model: %s)", s.cfg.LLM.APIBase, s.cfg.LLM.Model)
+		body := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}`, s.cfg.LLM.Model)
+		req, _ := http.NewRequest("POST", s.cfg.LLM.APIBase+"/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := s.client.Do(req)
+		if err != nil {
+			llmStatus = "failed"
+			llmDetail = err.Error()
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				llmStatus = "failed"
+				llmDetail = fmt.Sprintf("HTTP %d from %s", resp.StatusCode, s.cfg.LLM.APIBase)
+			}
+		}
+		results = append(results, subsystem{
+			Name: "llm", Status: llmStatus, Detail: llmDetail,
+			Latency: fmt.Sprintf("%dms", time.Since(t0).Milliseconds()),
+		})
+	} else {
+		results = append(results, subsystem{Name: "llm", Status: "disabled"})
+	}
+
+	// 2. Embedding
+	if s.cfg.Embedding.APIBase != "" {
+		t0 := time.Now()
+		embStatus := "ok"
+		embDetail := fmt.Sprintf("%s (model: %s)", s.cfg.Embedding.APIBase, s.cfg.Embedding.Model)
+		body := fmt.Sprintf(`{"model":"%s","input":"test"}`, s.cfg.Embedding.Model)
+		req, _ := http.NewRequest("POST", s.cfg.Embedding.APIBase+"/embeddings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := s.client.Do(req)
+		if err != nil {
+			embStatus = "failed"
+			embDetail = err.Error()
+		} else {
+			var result struct {
+				Data []struct {
+					Embedding []float64 `json:"embedding"`
+				} `json:"data"`
+			}
+			json.NewDecoder(resp.Body).Decode(&result)
+			resp.Body.Close()
+			if len(result.Data) > 0 && len(result.Data[0].Embedding) > 0 {
+				embDetail = fmt.Sprintf("%s → %d dims", embDetail, len(result.Data[0].Embedding))
+			} else if resp.StatusCode >= 400 {
+				embStatus = "failed"
+				embDetail = fmt.Sprintf("HTTP %d from %s", resp.StatusCode, s.cfg.Embedding.APIBase)
+			} else {
+				embStatus = "failed"
+				embDetail = "no embedding returned"
+			}
+		}
+		results = append(results, subsystem{
+			Name: "embedding", Status: embStatus, Detail: embDetail,
+			Latency: fmt.Sprintf("%dms", time.Since(t0).Milliseconds()),
+		})
+	} else {
+		results = append(results, subsystem{Name: "embedding", Status: "disabled"})
+	}
+
+	// 3. Whisper
+	if s.cfg.Whisper.APIBase != "" {
+		t0 := time.Now()
+		whisperStatus := "ok"
+		whisperDetail := fmt.Sprintf("%s (model: %s)", s.cfg.Whisper.APIBase, s.cfg.Whisper.Model)
+		req, _ := http.NewRequest("GET", s.cfg.Whisper.APIBase+"/models", nil)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			whisperStatus = "failed"
+			whisperDetail = err.Error()
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				whisperStatus = "failed"
+				whisperDetail = fmt.Sprintf("HTTP %d from %s", resp.StatusCode, s.cfg.Whisper.APIBase)
+			}
+		}
+		results = append(results, subsystem{
+			Name: "whisper", Status: whisperStatus, Detail: whisperDetail,
+			Latency: fmt.Sprintf("%dms", time.Since(t0).Milliseconds()),
+		})
+	} else {
+		results = append(results, subsystem{Name: "whisper", Status: "disabled"})
+	}
+
+	// 4. Collabora
+	if s.cfg.Collabora.URL != "" {
+		t0 := time.Now()
+		collabStatus := "ok"
+		collabDetail := s.cfg.Collabora.URL
+		resp, err := s.client.Get(s.cfg.Collabora.URL)
+		if err != nil {
+			collabStatus = "failed"
+			collabDetail = err.Error()
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				collabStatus = "failed"
+				collabDetail = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			}
+		}
+		results = append(results, subsystem{
+			Name: "collabora", Status: collabStatus, Detail: collabDetail,
+			Latency: fmt.Sprintf("%dms", time.Since(t0).Milliseconds()),
+		})
+	} else {
+		results = append(results, subsystem{Name: "collabora", Status: "disabled"})
+	}
+
+	// 5. DocMeta
+	if s.cfg.DocMeta.Enabled {
+		dmStatus := "ok"
+		dmDetail := fmt.Sprintf("schema: %d bytes, rescue: %v", len(s.cfg.DocMeta.schema), s.cfg.DocMeta.RescuePass)
+		results = append(results, subsystem{Name: "docmeta", Status: dmStatus, Detail: dmDetail})
+	} else {
+		results = append(results, subsystem{Name: "docmeta", Status: "disabled"})
+	}
+
+	// Overall
+	allOK := true
+	for _, r := range results {
+		if r.Status == "failed" {
+			allOK = false
+		}
+	}
+	overall := "ok"
+	if !allOK {
+		overall = "degraded"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     overall,
+		"version":    version,
+		"subsystems": results,
+	})
+}
+
 // handleSchema returns the metadata keys that taki can enrich per MIME type.
 // Used by the search service to determine which files need re-enrichment.
 func (s *Server) handleSchema(w http.ResponseWriter, r *http.Request) {
@@ -2061,6 +2215,7 @@ func main() {
 	http.HandleFunc("/tika/text", srv.handleTikaText)
 	http.HandleFunc("/rmeta/text", srv.handleRmetaText)
 	http.HandleFunc("/schema", srv.handleSchema)
+	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/tika", srv.handleHealth)
 	http.HandleFunc("/version", srv.handleVersion)
 	http.HandleFunc("/", srv.handleHealth)
