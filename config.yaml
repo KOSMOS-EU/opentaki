@@ -44,6 +44,7 @@ fallback:
 # Edit those files to add/change metadata fields without rebuilding.
 docmeta:
   enabled: true
+  model_version: "qwen3-doctype-1.0"           # doctype model version (prompt + schema + types)
   rescue_pass: true                            # text-based fallback if vision pass incomplete
   required_fields: [doc.date, sender.company]  # trigger rescue if these are null
   schema_file: ""        # default: /etc/open_taki/docmeta_schema.json

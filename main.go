@@ -76,9 +76,10 @@ type Config struct {
 	DocMeta DocMetaConfig `yaml:"docmeta"`
 }
 
-// DocMetaConfig controls structured metadata extraction from document letterheads.
+// DocMetaConfig controls structured metadata extraction from documents.
 type DocMetaConfig struct {
 	Enabled          bool     `yaml:"enabled"`
+	ModelVersion     string   `yaml:"model_version"`      // doctype model version (e.g. "qwen3-doctype-1.0")
 	RescuePass       bool     `yaml:"rescue_pass"`
 	RequiredFields   []string `yaml:"required_fields"`    // fields that trigger rescue if null
 	SchemaFile       string   `yaml:"schema_file"`        // path to guided_json schema (default: /etc/open_taki/docmeta_schema.json)
@@ -356,6 +357,7 @@ func loadConfig(path string) Config {
 	cfg.Fallback.MinChars = 200
 	cfg.Fallback.MinCharsPerPage = 50
 	cfg.DocMeta.Enabled = true
+	cfg.DocMeta.ModelVersion = "qwen3-doctype-1.0"
 	cfg.DocMeta.RescuePass = true
 	cfg.DocMeta.RequiredFields = []string{"doc.date", "sender.company"}
 
@@ -728,10 +730,15 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 		}
 	}
 
-	log.Printf("docmeta: source=%s type=%s date=%s sender=%s uncertain=%d",
+	if s.cfg.DocMeta.ModelVersion != "" {
+		(*dm)["model"] = s.cfg.DocMeta.ModelVersion
+	}
+
+	log.Printf("docmeta: source=%s type=%s date=%s sender=%s uncertain=%d model=%s",
 		dmGetStr(*dm, "source"),
 		dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.date"),
-		dmGetStr(*dm, "sender.company"), len(dmGetStrSlice(*dm, "uncertain")))
+		dmGetStr(*dm, "sender.company"), len(dmGetStrSlice(*dm, "uncertain")),
+		s.cfg.DocMeta.ModelVersion)
 
 	return dm
 }
@@ -1950,6 +1957,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"taki_v2":   true,
 			"docmeta":   s.cfg.DocMeta.Enabled,
 		},
+		"docmeta_model": s.cfg.DocMeta.ModelVersion,
 	})
 }
 
@@ -2086,7 +2094,7 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 	// 5. DocMeta
 	if s.cfg.DocMeta.Enabled {
 		dmStatus := "ok"
-		dmDetail := fmt.Sprintf("schema: %d bytes, rescue: %v", len(s.cfg.DocMeta.schema), s.cfg.DocMeta.RescuePass)
+		dmDetail := fmt.Sprintf("model: %s, schema: %d bytes, rescue: %v", s.cfg.DocMeta.ModelVersion, len(s.cfg.DocMeta.schema), s.cfg.DocMeta.RescuePass)
 		results = append(results, subsystem{Name: "docmeta", Status: dmStatus, Detail: dmDetail})
 	} else {
 		results = append(results, subsystem{Name: "docmeta", Status: "disabled"})
@@ -2228,7 +2236,7 @@ func main() {
 		log.Printf("  Whisper:   disabled")
 	}
 	if cfg.DocMeta.Enabled {
-		log.Printf("  DocMeta:   enabled (rescue=%v, required=%v)", cfg.DocMeta.RescuePass, cfg.DocMeta.RequiredFields)
+		log.Printf("  DocMeta:   enabled (model=%s, rescue=%v, required=%v)", cfg.DocMeta.ModelVersion, cfg.DocMeta.RescuePass, cfg.DocMeta.RequiredFields)
 	}
 
 	srv := NewServer(cfg)
