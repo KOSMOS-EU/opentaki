@@ -1875,18 +1875,43 @@ func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) str
 	jsonData, _ := json.Marshal(reqBody)
 	url := strings.TrimRight(s.cfg.LLM.APIBase, "/") + "/chat/completions"
 
-	resp, err := s.client.Post(url, "application/json", bytes.NewReader(jsonData))
-	if err != nil {
-		log.Printf("LLM error: %v", err)
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		resp, err := s.client.Post(url, "application/json", bytes.NewReader(jsonData))
+		if err != nil {
+			log.Printf("LLM error (attempt %d/%d): %v", attempt, maxRetries, err)
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+			return ""
+		}
+
+		var chatResp chatResponse
+		json.NewDecoder(resp.Body).Decode(&chatResp)
+		resp.Body.Close()
+
+		if len(chatResp.Choices) > 0 {
+			return stripThinkTags(chatResp.Choices[0].Message.Content)
+		}
+
+		// Empty response (LLM overloaded) — retry
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			log.Printf("LLM HTTP %d (attempt %d/%d), retrying", resp.StatusCode, attempt, maxRetries)
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+		}
+
+		// 2xx but no choices — LLM returned empty, retry once
+		if len(chatResp.Choices) == 0 && attempt < maxRetries {
+			log.Printf("LLM empty response (attempt %d/%d), retrying", attempt, maxRetries)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			continue
+		}
+
 		return ""
-	}
-	defer resp.Body.Close()
-
-	var chatResp chatResponse
-	json.NewDecoder(resp.Body).Decode(&chatResp)
-
-	if len(chatResp.Choices) > 0 {
-		return stripThinkTags(chatResp.Choices[0].Message.Content)
 	}
 	return ""
 }
