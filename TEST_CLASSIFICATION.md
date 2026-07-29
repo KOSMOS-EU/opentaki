@@ -7,7 +7,7 @@ per Graph API / WebDAV, schickt sie an taki und zeigt das Ergebnis.
 ## Voraussetzungen
 
 - SSH-Zugang zu cloud.brandis.eu
-- `taki-test.py` liegt auf dem Host unter `/nu/container/cloud_brandis/taki-test.py`
+- `taki-test.py` liegt auf dem Host unter `/nu/container/cloud_brandis/compose/taki-test.py`
 - tika-Service läuft im Pod `cloud_brandis`
 
 ## Aufruf
@@ -16,7 +16,7 @@ per Graph API / WebDAV, schickt sie an taki und zeigt das Ergebnis.
 # Vom Entwicklungsrechner:
 ssh root@cloud.brandis.eu '
   PID=$(podman inspect --format "{{.State.Pid}}" systemd-cloud_brandis-opencloud)
-  nsenter -t $PID -n -- python3 /nu/container/cloud_brandis/taki-test.py \
+  nsenter -t $PID -n -- python3 /nu/container/cloud_brandis/compose/taki-test.py \
     --drive "Archikart DMS" --limit 10
 '
 ```
@@ -69,7 +69,7 @@ Jede Zeile zeigt: `doc.type`, `doc.date`, `sender.company`, Extraktionsquelle (`
 
 Bei Änderungen am Script:
 ```bash
-scp taki-test.py root@cloud.brandis.eu:/nu/container/cloud_brandis/taki-test.py
+scp taki-test.py root@cloud.brandis.eu:/nu/container/cloud_brandis/compose/taki-test.py
 ```
 
 ## Testergebnisse (qwen3-doctype-1.0, 2026-07-29)
