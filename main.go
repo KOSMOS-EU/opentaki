@@ -1876,12 +1876,14 @@ func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) str
 	url := strings.TrimRight(s.cfg.LLM.APIBase, "/") + "/chat/completions"
 
 	const maxRetries = 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	backoff := [3]time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		resp, err := s.client.Post(url, "application/json", bytes.NewReader(jsonData))
 		if err != nil {
-			log.Printf("LLM error (attempt %d/%d): %v", attempt, maxRetries, err)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			log.Printf("LLM error (attempt %d/%d): %v", attempt+1, maxRetries, err)
+			if attempt < maxRetries-1 {
+				time.Sleep(backoff[attempt])
 				continue
 			}
 			return ""
@@ -1895,19 +1897,20 @@ func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) str
 			return stripThinkTags(chatResp.Choices[0].Message.Content)
 		}
 
-		// Empty response (LLM overloaded) — retry
+		// Server error or rate limit — retry with backoff
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			log.Printf("LLM HTTP %d (attempt %d/%d), retrying", resp.StatusCode, attempt, maxRetries)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			log.Printf("LLM HTTP %d (attempt %d/%d), retrying in %v", resp.StatusCode, attempt+1, maxRetries, backoff[attempt])
+			if attempt < maxRetries-1 {
+				time.Sleep(backoff[attempt])
 				continue
 			}
+			return ""
 		}
 
-		// 2xx but no choices — LLM returned empty, retry once
-		if len(chatResp.Choices) == 0 && attempt < maxRetries {
-			log.Printf("LLM empty response (attempt %d/%d), retrying", attempt, maxRetries)
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		// 2xx but no choices — LLM returned empty, retry
+		if attempt < maxRetries-1 {
+			log.Printf("LLM empty response (attempt %d/%d), retrying in %v", attempt+1, maxRetries, backoff[attempt])
+			time.Sleep(backoff[attempt])
 			continue
 		}
 
