@@ -35,9 +35,23 @@ other           - Sonstiges
 
 ## Fragen
 
-- Gibt es eine Norm/Standard für Dokumenttypen (z.B. DIN, Dublin Core)?
 - Wie granular? `invoice` vs. `invoice_incoming` / `invoice_outgoing`?
 - Soll der Typ vom LLM erkannt werden oder regelbasiert (MIME + Heuristik)?
+
+## Etablierte Standards (Recherche)
+
+- **Schema.org** — `schema:DigitalDocument`, `schema:Invoice`, `schema:Letter` etc.
+  Standardisiert, erweiterbar, als Basis für Typ-Liste geeignet.
+- **Dublin Core (ISO 15836)** — 15 Basis-Metadaten (title, creator, subject, date, type).
+  Sehr generisch, eher für Metadaten-Keys als für Typ-Klassifikation.
+- **CMIS (OASIS)** — `cmis:document`, `cmis:folder` mit Properties.
+  OpenYard nutzt CMIS 1.1 schon. Dokumenttypen aber nicht granular.
+- **DIN 6763** — Aktenplan-Systematik für deutsche Kommunalverwaltung.
+  Relevant für Brandis (Bescheid, Verfügung, Satzung, Niederschrift).
+- **DCAT** — Datenkatalog-Vokabular, eher für Open Data als für DMS.
+
+**Empfehlung**: Schema.org als Basis + DIN 6763 für Verwaltungs-Typen + Custom für Scanner/DMS.
+Recherche der konkreten Schema.org Document-Types und Mapping auf Verwaltungs-Typen steht aus.
 
 ## Architektur-Idee
 
