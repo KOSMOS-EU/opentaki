@@ -8,6 +8,7 @@ per Graph API / WebDAV, schickt sie an taki und zeigt das Ergebnis.
 
 - SSH-Zugang zu cloud.brandis.eu
 - `taki-test.py` liegt auf dem Host unter `/nu/container/cloud_brandis/compose/taki-test.py`
+  (liegt im Compose-Dir, wird von nu-compose nicht verarbeitet, aber persistent)
 - tika-Service läuft im Pod `cloud_brandis`
 
 ## Aufruf
