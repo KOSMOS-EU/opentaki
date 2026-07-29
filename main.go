@@ -17,6 +17,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -60,7 +61,8 @@ type Config struct {
 		Collection string `yaml:"collection"`
 	} `yaml:"vector"`
 	Collabora struct {
-		URL string `yaml:"url"` // e.g. http://collabora:9980
+		URL      string `yaml:"url"`      // e.g. http://collabora:9980
+		Insecure bool   `yaml:"insecure"` // skip TLS verification
 	} `yaml:"collabora"`
 	PDF struct {
 		DPI      int `yaml:"dpi"`
@@ -371,11 +373,17 @@ func loadConfig(path string) Config {
 }
 
 func NewServer(cfg Config) *Server {
+	client := &http.Client{
+		Timeout: 5 * time.Minute,
+	}
+	if cfg.Collabora.Insecure {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
 	return &Server{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: 5 * time.Minute,
-		},
+		cfg:    cfg,
+		client: client,
 	}
 }
 
