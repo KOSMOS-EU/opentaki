@@ -335,7 +335,7 @@ func (cfg *Config) loadDocMetaFiles(configDir string) {
 }
 
 // Built-in defaults (used when external files are not found)
-var docMetaDefaultSchema = json.RawMessage(`{"type":"object","additionalProperties":false,"required":["is_letterhead","doc","sender","uncertain"],"properties":{"is_letterhead":{"type":"boolean"},"doc":{"type":"object","additionalProperties":false,"required":["subject","subject_inferred","type","date","reference"],"properties":{"subject":{"type":["string","null"]},"subject_inferred":{"type":"boolean"},"type":{"type":["string","null"],"enum":["rechnung","bescheid","antrag","angebot","mahnung","vertrag","kuendigung","mitteilung","einladung","sonstiges",null]},"date":{"type":["string","null"],"pattern":"^\\d{4}-\\d{2}-\\d{2}$"},"reference":{"type":["string","null"]}}},"sender":{"type":"object","additionalProperties":false,"required":["company","given_name","family_name","street","house_number","postal_code","sub_locality","city","country","email","phone"],"properties":{"company":{"type":["string","null"]},"given_name":{"type":["string","null"]},"family_name":{"type":["string","null"]},"street":{"type":["string","null"]},"house_number":{"type":["string","null"]},"postal_code":{"type":["string","null"]},"sub_locality":{"type":["string","null"]},"city":{"type":["string","null"]},"country":{"type":["string","null"],"pattern":"^[A-Z]{2}$"},"email":{"type":["string","null"]},"phone":{"type":["string","null"]}}},"uncertain":{"type":"array","items":{"type":"string"}}}}`)
+var docMetaDefaultSchema = json.RawMessage(`{"type":"object","additionalProperties":false,"required":["doc","sender","uncertain"],"properties":{"doc":{"type":"object","additionalProperties":false,"required":["subject","subject_inferred","type","date","reference"],"properties":{"subject":{"type":["string","null"]},"subject_inferred":{"type":"boolean"},"type":{"type":["string","null"],"enum":["brief","bescheid","verfuegung","satzung","niederschrift","antrag","vertrag","mitteilung","einladung","kuendigung","angebot","rechnung","lieferschein","kontoauszug","kassenbon","ec_bon","mahnung","gutschrift","urkunde","zeugnis","foto","skizze","tabelle","praesentation","email","sonstiges",null]},"date":{"type":["string","null"],"pattern":"^\\d{4}-\\d{2}-\\d{2}$"},"reference":{"type":["string","null"]}}},"sender":{"type":"object","additionalProperties":false,"required":["company","given_name","family_name","street","house_number","postal_code","sub_locality","city","country","email","phone"],"properties":{"company":{"type":["string","null"]},"given_name":{"type":["string","null"]},"family_name":{"type":["string","null"]},"street":{"type":["string","null"]},"house_number":{"type":["string","null"]},"postal_code":{"type":["string","null"]},"sub_locality":{"type":["string","null"]},"city":{"type":["string","null"]},"country":{"type":["string","null"],"pattern":"^[A-Z]{2}$"},"email":{"type":["string","null"]},"phone":{"type":["string","null"]}}},"recipient":{"type":"object","additionalProperties":false,"required":["company","given_name","family_name"],"properties":{"company":{"type":["string","null"]},"given_name":{"type":["string","null"]},"family_name":{"type":["string","null"]}}},"amounts":{"type":"object","additionalProperties":false,"required":["total","tax","currency","payment_due"],"properties":{"total":{"type":["string","null"]},"tax":{"type":["string","null"]},"currency":{"type":["string","null"],"pattern":"^[A-Z]{3}$"},"payment_due":{"type":["string","null"],"pattern":"^\\d{4}-\\d{2}-\\d{2}$"}}},"uncertain":{"type":"array","items":{"type":"string"}}}}`)
 
 const docMetaDefaultPrompt = "Du bist ein Extraktionssystem. Extrahiere Metadaten als JSON. Gib NUR das JSON zurück."
 
@@ -707,13 +707,13 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 	}
 	(*dm)["source"] = "vision"
 
-	// If not a letterhead, try page 2
-	if !dmGetBool(*dm, "is_letterhead") && strings.Contains(strings.ToLower(ct), "pdf") {
+	// If not a formal document type, try page 2 (cover sheet → content page)
+	if !isDocMetaFormal(dmGetStr(*dm, "doc.type")) && strings.Contains(strings.ToLower(ct), "pdf") {
 		imgData2 := s.pdfPageToImage(body, 2)
 		if imgData2 != nil {
 			dataURL2 := "data:image/png;base64," + base64.StdEncoding.EncodeToString(imgData2)
 			dm2 := s.docMetaVisionPass(dataURL2)
-			if dm2 != nil && dmGetBool(*dm2, "is_letterhead") {
+			if dm2 != nil && isDocMetaFormal(dmGetStr(*dm2, "doc.type")) {
 				dm = dm2
 				(*dm)["source"] = "vision_p2"
 			}
@@ -728,8 +728,8 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 		}
 	}
 
-	log.Printf("docmeta: source=%s letterhead=%v type=%s date=%s sender=%s uncertain=%d",
-		dmGetStr(*dm, "source"), dmGetBool(*dm, "is_letterhead"),
+	log.Printf("docmeta: source=%s type=%s date=%s sender=%s uncertain=%d",
+		dmGetStr(*dm, "source"),
 		dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.date"),
 		dmGetStr(*dm, "sender.company"), len(dmGetStrSlice(*dm, "uncertain")))
 
@@ -790,9 +790,22 @@ func (s *Server) pdfPageToImage(pdfData []byte, pageNum int) []byte {
 	return imgData
 }
 
+// isDocMetaFormal returns true for document types that have formal structure
+// (letterhead, sender, dates) — triggers page-2 and rescue logic.
+func isDocMetaFormal(docType string) bool {
+	switch docType {
+	case "brief", "bescheid", "verfuegung", "satzung", "niederschrift",
+		"antrag", "vertrag", "mitteilung", "einladung", "kuendigung",
+		"angebot", "rechnung", "lieferschein", "mahnung", "gutschrift",
+		"urkunde", "zeugnis":
+		return true
+	}
+	return false
+}
+
 // docMetaNeedsRescue checks if required fields are missing or uncertain.
 func (s *Server) docMetaNeedsRescue(dm takiDocMeta) bool {
-	if !dmGetBool(dm, "is_letterhead") {
+	if !isDocMetaFormal(dmGetStr(dm, "doc.type")) {
 		return false
 	}
 	if len(dmGetStrSlice(dm, "uncertain")) > 0 {
@@ -899,7 +912,7 @@ func (s *Server) docMetaMissingFields(dm takiDocMeta) []string {
 	}
 
 	var missing []string
-	for _, prefix := range []string{"doc", "sender"} {
+	for _, prefix := range []string{"doc", "sender", "recipient", "amounts"} {
 		sub, ok := dm[prefix].(map[string]interface{})
 		if !ok {
 			continue
@@ -2166,7 +2179,7 @@ func extractSchemaKeys(schemaJSON json.RawMessage) []string {
 	}
 	var keys []string
 	for prefix, obj := range s.Properties {
-		if prefix == "is_letterhead" || prefix == "uncertain" {
+		if prefix == "uncertain" {
 			continue
 		}
 		for key := range obj.Properties {

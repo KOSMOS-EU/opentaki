@@ -24,9 +24,49 @@ REGELN:
 7. doc.subject = die Betreffzeile wörtlich, ohne das Wort "Betreff:".
    Fehlt eine Betreffzeile, fasse den Zweck in max. 10 Wörtern zusammen
    und setze subject_inferred auf true.
-8. doc.type: wähle genau einen Wert aus dem Enum. Im Zweifel "sonstiges".
-9. is_letterhead = false, wenn die Seite ein Fax-Deckblatt,
-   Scan-Trennblatt oder eine Anlage ohne Briefkopf ist.
+
+DOKUMENTTYP-KLASSIFIKATION (doc.type):
+8. Bestimme den Dokumenttyp anhand von Inhalt und Erscheinungsbild.
+   Wähle genau einen Wert aus dem Enum:
+   - Verwaltung: brief, bescheid, verfuegung, satzung, niederschrift,
+     antrag, vertrag, mitteilung, einladung, kuendigung, angebot
+   - Buchhaltung: rechnung, lieferschein, kontoauszug, kassenbon,
+     ec_bon, mahnung, gutschrift
+   - Urkunden: urkunde, zeugnis
+   - Medien: foto, skizze, tabelle, praesentation, email
+   - Fallback: sonstiges
+   Im Zweifel "sonstiges".
+
+TYP-SPEZIFISCHE EXTRAKTION:
+9. Je nach doc.type sind unterschiedliche Felder relevant:
+
+   Verwaltung (brief, bescheid, verfuegung, satzung, niederschrift,
+   antrag, vertrag, mitteilung, einladung, kuendigung, angebot):
+   → sender.* vollständig, recipient.*, doc.subject, doc.date, doc.reference
+
+   Buchhaltung (rechnung, lieferschein, mahnung, gutschrift):
+   → sender.company, amounts.* (total, tax, currency, payment_due),
+     doc.reference (= Rechnungs-/Belegnummer), doc.date
+
+   Kleinbelege (kassenbon, ec_bon, kontoauszug):
+   → sender.company, amounts.total, amounts.currency, doc.date
+
+   Urkunden (urkunde, zeugnis):
+   → sender.*, doc.subject, doc.date, doc.reference
+
+   Foto/Skizze (foto, skizze):
+   → doc.subject (kurze Bildbeschreibung), subject_inferred = true.
+     Sender/Amounts sind null.
+
+   Email (email):
+   → sender.email, sender.given_name, sender.family_name,
+     doc.subject, doc.date
+
+   Sonstiges:
+   → Extrahiere was erkennbar ist, Rest null.
+
+   Felder die nicht zum Dokumenttyp gehören, MÜSSEN null sein.
+
 10. uncertain: Liste aller Feldnamen, deren Wert du gesetzt hast,
     aber wegen schlechter Scanqualität, Handschrift oder Mehrdeutigkeit
     nicht sicher bist.

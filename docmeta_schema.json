@@ -1,9 +1,8 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["is_letterhead", "doc", "sender", "uncertain"],
+  "required": ["doc", "sender", "uncertain"],
   "properties": {
-    "is_letterhead": { "type": "boolean" },
     "doc": {
       "type": "object",
       "additionalProperties": false,
@@ -13,9 +12,15 @@
         "subject_inferred": { "type": "boolean" },
         "type": {
           "type": ["string", "null"],
-          "enum": ["rechnung", "bescheid", "antrag", "angebot",
-                   "mahnung", "vertrag", "kuendigung", "mitteilung",
-                   "einladung", "sonstiges", null]
+          "enum": [
+            "brief", "bescheid", "verfuegung", "satzung", "niederschrift",
+            "antrag", "vertrag", "mitteilung", "einladung", "kuendigung", "angebot",
+            "rechnung", "lieferschein", "kontoauszug", "kassenbon", "ec_bon",
+            "mahnung", "gutschrift",
+            "urkunde", "zeugnis",
+            "foto", "skizze", "tabelle", "praesentation", "email",
+            "sonstiges", null
+          ]
         },
         "date": {
           "type": ["string", "null"],
@@ -42,6 +47,27 @@
         "country":      { "type": ["string", "null"], "pattern": "^[A-Z]{2}$" },
         "email":        { "type": ["string", "null"] },
         "phone":        { "type": ["string", "null"] }
+      }
+    },
+    "recipient": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["company", "given_name", "family_name"],
+      "properties": {
+        "company":      { "type": ["string", "null"] },
+        "given_name":   { "type": ["string", "null"] },
+        "family_name":  { "type": ["string", "null"] }
+      }
+    },
+    "amounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "tax", "currency", "payment_due"],
+      "properties": {
+        "total":       { "type": ["string", "null"] },
+        "tax":         { "type": ["string", "null"] },
+        "currency":    { "type": ["string", "null"], "pattern": "^[A-Z]{3}$" },
+        "payment_due": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
       }
     },
     "uncertain": {

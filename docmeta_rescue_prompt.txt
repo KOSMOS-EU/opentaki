@@ -28,7 +28,11 @@ REGELN:
    Briefkopf (Textanfang), in der Fußzeile oder im Signaturblock.
 5. doc.reference = Zeichen des Absenders ("Unser Zeichen", "Az.",
    Rechnungsnummer). "Ihr Zeichen" ignorieren.
-6. Gib NUR das JSON zurück, keinen weiteren Text.
+6. amounts: Bei Rechnungen/Belegen: total = Bruttobetrag,
+   tax = MwSt-Betrag, currency = ISO-4217-Code (EUR, CHF, ...),
+   payment_due = Fälligkeitsdatum.
+7. Felder die nicht zum Dokumenttyp (doc.type) gehören, sind null.
+8. Gib NUR das JSON zurück, keinen weiteren Text.
 
 OFFENE FELDER:
 %s
