@@ -381,7 +381,7 @@ func loadConfig(path string) Config {
 
 func NewServer(cfg Config) *Server {
 	client := &http.Client{
-		Timeout: 5 * time.Minute,
+		Timeout: 30 * time.Minute,
 	}
 	if cfg.Collabora.Insecure {
 		client.Transport = &http.Transport{
