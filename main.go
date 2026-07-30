@@ -43,10 +43,11 @@ const version = "0.9.0"
 
 type Config struct {
 	Listen string `yaml:"listen"`
-	LLM    struct {
+	LLM struct {
 		APIBase   string `yaml:"api_base"`
 		Model     string `yaml:"model"`
 		MaxTokens int    `yaml:"max_tokens"`
+		TimeoutS  int    `yaml:"timeout_s"` // HTTP timeout in seconds (default: 1800)
 	} `yaml:"llm"`
 	Whisper struct {
 		APIBase string `yaml:"api_base"`
@@ -380,8 +381,12 @@ func loadConfig(path string) Config {
 }
 
 func NewServer(cfg Config) *Server {
+	timeout := 30 * time.Minute
+	if cfg.LLM.TimeoutS > 0 {
+		timeout = time.Duration(cfg.LLM.TimeoutS) * time.Second
+	}
 	client := &http.Client{
-		Timeout: 30 * time.Minute,
+		Timeout: timeout,
 	}
 	if cfg.Collabora.Insecure {
 		client.Transport = &http.Transport{
