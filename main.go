@@ -665,25 +665,35 @@ func dmIsNull(dm takiDocMeta, path string) bool {
 	return dmGet(dm, path) == nil
 }
 
-// docMetaFallback returns a minimal docmeta with "none" placeholders for manual editing.
-// If fulltext is available, it tries a text-based LLM pass first.
+// docMetaFallback tries a text-based LLM pass when vision is unavailable.
+// Returns nil if LLM is down (no fake metadata).
+// Returns "none" placeholders if LLM answered but couldn't extract anything useful.
 func (s *Server) docMetaFallback(reason string, fulltext string) *takiDocMeta {
-	// Try text-based classification if we have content
-	if fulltext != "" && len(fulltext) > 20 {
-		dm := s.docMetaTextPass(fulltext)
-		if dm != nil {
-			(*dm)["source"] = "text"
-			if s.cfg.DocMeta.ModelVersion != "" {
-				(*dm)["model"] = s.cfg.DocMeta.ModelVersion
-			}
-			log.Printf("docmeta: text pass (%s) → type=%s subject=%s",
-				reason, dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.subject"))
-			return dm
-		}
+	if fulltext == "" || len(fulltext) <= 20 {
+		log.Printf("docmeta: no extraction possible (%s, no fulltext)", reason)
+		return nil
 	}
 
-	// Hard fallback: "none" placeholders for manual editing
-	dm := takiDocMeta{
+	dm, llmReached := s.docMetaTextPass(fulltext)
+	if dm != nil {
+		(*dm)["source"] = "text"
+		if s.cfg.DocMeta.ModelVersion != "" {
+			(*dm)["model"] = s.cfg.DocMeta.ModelVersion
+		}
+		log.Printf("docmeta: text pass (%s) → type=%s subject=%s",
+			reason, dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.subject"))
+		return dm
+	}
+
+	if !llmReached {
+		// LLM down — no metadata at all
+		log.Printf("docmeta: no extraction possible (%s, LLM unavailable)", reason)
+		return nil
+	}
+
+	// LLM answered but extraction failed — provide "none" for manual editing
+	log.Printf("docmeta: LLM reached but extraction empty (%s) → none placeholders", reason)
+	fallback := takiDocMeta{
 		"doc": map[string]interface{}{
 			"subject":          "none",
 			"subject_inferred": false,
@@ -705,17 +715,18 @@ func (s *Server) docMetaFallback(reason string, fulltext string) *takiDocMeta {
 			"phone":        nil,
 		},
 		"uncertain": []interface{}{},
-		"source":    "fallback",
+		"source":    "none",
 	}
 	if s.cfg.DocMeta.ModelVersion != "" {
-		dm["model"] = s.cfg.DocMeta.ModelVersion
+		fallback["model"] = s.cfg.DocMeta.ModelVersion
 	}
-	log.Printf("docmeta: hard fallback (%s) → type=sonstiges subject=none", reason)
-	return &dm
+	return &fallback
 }
 
 // docMetaTextPass extracts metadata from fulltext (no vision) using guided_json.
-func (s *Server) docMetaTextPass(fulltext string) *takiDocMeta {
+// Returns (result, llmReached): result is the parsed docmeta, llmReached indicates
+// whether the LLM responded at all (false = network/timeout error).
+func (s *Server) docMetaTextPass(fulltext string) (*takiDocMeta, bool) {
 	truncated := fulltext
 	if len(truncated) > 4000 {
 		truncated = truncated[:4000]
@@ -734,15 +745,15 @@ func (s *Server) docMetaTextPass(fulltext string) *takiDocMeta {
 	messages := []chatMessage{{Role: "user", Content: prompt}}
 	result := s.llmCompleteStructured(messages, s.cfg.DocMeta.schema)
 	if result == "" {
-		return nil
+		return nil, false // LLM not reached
 	}
 
 	var dm takiDocMeta
 	if err := json.Unmarshal([]byte(result), &dm); err != nil {
 		log.Printf("docmeta: text pass JSON parse error: %v", err)
-		return nil
+		return nil, true // LLM answered but unparsable
 	}
-	return &dm
+	return &dm, true
 }
 
 // extractDocMeta extracts structured metadata from a document.
