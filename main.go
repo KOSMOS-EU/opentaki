@@ -750,7 +750,7 @@ func (s *Server) docMetaTextPass(fulltext string) (*takiDocMeta, bool) {
 
 	var dm takiDocMeta
 	if err := json.Unmarshal([]byte(result), &dm); err != nil {
-		log.Printf("docmeta: text pass JSON parse error: %v", err)
+		log.Printf("docmeta: text pass JSON parse error: %v (raw: %.200s)", err, result)
 		return nil, true // LLM answered but unparsable
 	}
 	return &dm, true
@@ -849,7 +849,7 @@ func (s *Server) docMetaVisionPass(dataURL string) *takiDocMeta {
 
 	var dm takiDocMeta
 	if err := json.Unmarshal([]byte(result), &dm); err != nil {
-		log.Printf("docmeta: vision pass JSON parse error: %v", err)
+		log.Printf("docmeta: vision pass JSON parse error: %v (raw: %.200s)", err, result)
 		return nil
 	}
 	return &dm
@@ -1980,9 +1980,19 @@ func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) str
 			return ""
 		}
 
-		var chatResp chatResponse
-		json.NewDecoder(resp.Body).Decode(&chatResp)
+		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+
+		var chatResp chatResponse
+		if err := json.Unmarshal(respBody, &chatResp); err != nil {
+			log.Printf("LLM response parse error (HTTP %d, attempt %d/%d): %v (raw: %.300s)",
+				resp.StatusCode, attempt+1, maxRetries, err, string(respBody))
+			if attempt < maxRetries-1 {
+				time.Sleep(backoff[attempt])
+				continue
+			}
+			return ""
+		}
 
 		if len(chatResp.Choices) > 0 {
 			return stripThinkTags(chatResp.Choices[0].Message.Content)
@@ -1990,7 +2000,8 @@ func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) str
 
 		// Server error or rate limit — retry with backoff
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			log.Printf("LLM HTTP %d (attempt %d/%d), retrying in %v", resp.StatusCode, attempt+1, maxRetries, backoff[attempt])
+			log.Printf("LLM HTTP %d (attempt %d/%d), retrying in %v (raw: %.200s)",
+				resp.StatusCode, attempt+1, maxRetries, backoff[attempt], string(respBody))
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
