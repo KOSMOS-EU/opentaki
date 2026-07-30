@@ -449,8 +449,10 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 	protocol := r.Header.Get("X-Taki-Protocol")
 	features := parseFeatures(r.Header.Get("X-Taki-Features"))
 
+	sourceRef := r.Header.Get("X-Taki-Source-Ref")
+
 	text, method := s.extract(body, ct)
-	log.Printf("/rmeta/text: %d chars via %s (%s) proto=%s", len(text), method, ct, protocol)
+	log.Printf("/rmeta/text: %d chars via %s (%s) proto=%s ref=%s", len(text), method, ct, protocol, sourceRef)
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -485,9 +487,13 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 
-		// DocMeta extraction — structured metadata from letterhead (BEFORE general enrichment)
+		// DocMeta extraction — structured metadata (BEFORE general enrichment)
 		if routedFeatures["docmeta"] && s.cfg.DocMeta.Enabled {
 			resp.DocMeta = s.extractDocMeta(body, ct, text)
+			if resp.DocMeta != nil {
+				log.Printf("  ref=%s docmeta: type=%s subject=%s",
+					sourceRef, dmGetStr(*resp.DocMeta, "doc.type"), dmGetStr(*resp.DocMeta, "doc.subject"))
+			}
 		}
 
 		// LLM enrichment
