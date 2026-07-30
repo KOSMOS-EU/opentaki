@@ -166,6 +166,11 @@ func (r *BleveRule) matches(ct, spaceType string) bool {
 type Server struct {
 	cfg    Config
 	client *http.Client
+
+	// In-flight LLM request tracking
+	llmMu       sync.Mutex
+	llmInFlight int
+	llmOldest   time.Time // zero if no requests in flight
 }
 
 // OpenAI chat completion request/response
@@ -1954,7 +1959,38 @@ func (s *Server) llmCompleteStructured(messages []chatMessage, schema json.RawMe
 	return s.llmCompleteOpts(messages, rf)
 }
 
+func (s *Server) llmTrackStart() {
+	s.llmMu.Lock()
+	s.llmInFlight++
+	if s.llmInFlight == 1 {
+		s.llmOldest = time.Now()
+	}
+	s.llmMu.Unlock()
+}
+
+func (s *Server) llmTrackDone() {
+	s.llmMu.Lock()
+	s.llmInFlight--
+	if s.llmInFlight <= 0 {
+		s.llmInFlight = 0
+		s.llmOldest = time.Time{}
+	}
+	s.llmMu.Unlock()
+}
+
+func (s *Server) llmQueueStats() (int, time.Duration) {
+	s.llmMu.Lock()
+	defer s.llmMu.Unlock()
+	if s.llmInFlight == 0 {
+		return 0, 0
+	}
+	return s.llmInFlight, time.Since(s.llmOldest)
+}
+
 func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) string {
+	s.llmTrackStart()
+	defer s.llmTrackDone()
+
 	reqBody := chatRequest{
 		Model:          s.cfg.LLM.Model,
 		MaxTokens:      s.cfg.LLM.MaxTokens,
@@ -2250,11 +2286,21 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		overall = "degraded"
 	}
 
+	// Queue stats
+	inFlight, oldest := s.llmQueueStats()
+	queue := map[string]interface{}{
+		"in_flight": inFlight,
+	}
+	if inFlight > 0 {
+		queue["oldest_seconds"] = int(oldest.Seconds())
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":     overall,
 		"version":    version,
 		"subsystems": results,
+		"queue":      queue,
 	})
 }
 
