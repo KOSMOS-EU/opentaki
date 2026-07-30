@@ -665,6 +665,86 @@ func dmIsNull(dm takiDocMeta, path string) bool {
 	return dmGet(dm, path) == nil
 }
 
+// docMetaFallback returns a minimal docmeta with "none" placeholders for manual editing.
+// If fulltext is available, it tries a text-based LLM pass first.
+func (s *Server) docMetaFallback(reason string, fulltext string) *takiDocMeta {
+	// Try text-based classification if we have content
+	if fulltext != "" && len(fulltext) > 20 {
+		dm := s.docMetaTextPass(fulltext)
+		if dm != nil {
+			(*dm)["source"] = "text"
+			if s.cfg.DocMeta.ModelVersion != "" {
+				(*dm)["model"] = s.cfg.DocMeta.ModelVersion
+			}
+			log.Printf("docmeta: text pass (%s) → type=%s subject=%s",
+				reason, dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.subject"))
+			return dm
+		}
+	}
+
+	// Hard fallback: "none" placeholders for manual editing
+	dm := takiDocMeta{
+		"doc": map[string]interface{}{
+			"subject":          "none",
+			"subject_inferred": false,
+			"type":             "sonstiges",
+			"date":             nil,
+			"reference":        nil,
+		},
+		"sender": map[string]interface{}{
+			"company":      "none",
+			"given_name":   nil,
+			"family_name":  nil,
+			"street":       nil,
+			"house_number": nil,
+			"postal_code":  nil,
+			"sub_locality": nil,
+			"city":         nil,
+			"country":      nil,
+			"email":        nil,
+			"phone":        nil,
+		},
+		"uncertain": []interface{}{},
+		"source":    "fallback",
+	}
+	if s.cfg.DocMeta.ModelVersion != "" {
+		dm["model"] = s.cfg.DocMeta.ModelVersion
+	}
+	log.Printf("docmeta: hard fallback (%s) → type=sonstiges subject=none", reason)
+	return &dm
+}
+
+// docMetaTextPass extracts metadata from fulltext (no vision) using guided_json.
+func (s *Server) docMetaTextPass(fulltext string) *takiDocMeta {
+	truncated := fulltext
+	if len(truncated) > 4000 {
+		truncated = truncated[:4000]
+	}
+
+	prompt := "Du bist ein Klassifikationssystem. Analysiere den folgenden Text und extrahiere Metadaten als JSON.\n\n" +
+		"REGELN:\n" +
+		"1. doc.type: Bestimme den Dokumenttyp. Im Zweifel \"sonstiges\".\n" +
+		"2. doc.subject: Fasse den Inhalt in max. 10 Wörtern zusammen. Setze subject_inferred auf true.\n" +
+		"3. doc.date: Dokumentdatum als YYYY-MM-DD, falls erkennbar. Sonst null.\n" +
+		"4. sender: Nur setzen wenn ein Absender klar erkennbar ist. Sonst null.\n" +
+		"5. Felder ohne Beleg sind null.\n" +
+		"6. Gib NUR das JSON zurück.\n\n" +
+		"TEXT:\n" + truncated
+
+	messages := []chatMessage{{Role: "user", Content: prompt}}
+	result := s.llmCompleteStructured(messages, s.cfg.DocMeta.schema)
+	if result == "" {
+		return nil
+	}
+
+	var dm takiDocMeta
+	if err := json.Unmarshal([]byte(result), &dm); err != nil {
+		log.Printf("docmeta: text pass JSON parse error: %v", err)
+		return nil
+	}
+	return &dm
+}
+
 // extractDocMeta extracts structured metadata from a document.
 func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDocMeta {
 	if !s.cfg.DocMeta.Enabled {
@@ -678,7 +758,7 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 		imgData := s.pdfPageToImage(body, 1)
 		if imgData == nil {
 			log.Printf("docmeta: failed to render PDF page 1")
-			return nil
+			return s.docMetaFallback("pdf render failed", fulltext)
 		}
 		dataURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(imgData)
 
@@ -698,14 +778,14 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 		dataURL = "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(body)
 
 	default:
-		log.Printf("docmeta: skipping non-visual content type %s", ct)
-		return nil
+		log.Printf("docmeta: non-visual content type %s, using text pass", ct)
+		return s.docMetaFallback("non-visual "+ct, fulltext)
 	}
 
 	// Pass 1: Vision extraction with guided_json
 	dm := s.docMetaVisionPass(dataURL)
 	if dm == nil {
-		return nil
+		return s.docMetaFallback("vision failed", fulltext)
 	}
 	(*dm)["source"] = "vision"
 
@@ -2005,6 +2085,14 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 
 	results := []subsystem{}
 
+	// Health-Check Client: 30s Timeout statt 5min (Produktions-Client)
+	testClient := &http.Client{Timeout: 30 * time.Second}
+	if s.cfg.Collabora.Insecure {
+		testClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+
 	// 1. LLM (local-ocr or configured model)
 	if s.cfg.LLM.APIBase != "" {
 		t0 := time.Now()
@@ -2013,7 +2101,7 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		body := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}`, s.cfg.LLM.Model)
 		req, _ := http.NewRequest("POST", s.cfg.LLM.APIBase+"/chat/completions", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := s.client.Do(req)
+		resp, err := testClient.Do(req)
 		if err != nil {
 			llmStatus = "failed"
 			llmDetail = err.Error()
@@ -2040,7 +2128,7 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		body := fmt.Sprintf(`{"model":"%s","input":"test"}`, s.cfg.Embedding.Model)
 		req, _ := http.NewRequest("POST", s.cfg.Embedding.APIBase+"/embeddings", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := s.client.Do(req)
+		resp, err := testClient.Do(req)
 		if err != nil {
 			embStatus = "failed"
 			embDetail = err.Error()
@@ -2076,7 +2164,7 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		whisperStatus := "ok"
 		whisperDetail := fmt.Sprintf("%s (model: %s)", s.cfg.Whisper.APIBase, s.cfg.Whisper.Model)
 		req, _ := http.NewRequest("GET", s.cfg.Whisper.APIBase+"/models", nil)
-		resp, err := s.client.Do(req)
+		resp, err := testClient.Do(req)
 		if err != nil {
 			whisperStatus = "failed"
 			whisperDetail = err.Error()
@@ -2100,7 +2188,7 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		t0 := time.Now()
 		collabStatus := "ok"
 		collabDetail := s.cfg.Collabora.URL
-		resp, err := s.client.Get(s.cfg.Collabora.URL)
+		resp, err := testClient.Get(s.cfg.Collabora.URL)
 		if err != nil {
 			collabStatus = "failed"
 			collabDetail = err.Error()
