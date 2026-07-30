@@ -44,10 +44,11 @@ const version = "0.9.0"
 type Config struct {
 	Listen string `yaml:"listen"`
 	LLM struct {
-		APIBase   string `yaml:"api_base"`
-		Model     string `yaml:"model"`
-		MaxTokens int    `yaml:"max_tokens"`
-		TimeoutS  int    `yaml:"timeout_s"` // HTTP timeout in seconds (default: 1800)
+		APIBase       string `yaml:"api_base"`
+		Model         string `yaml:"model"`
+		MaxTokens     int    `yaml:"max_tokens"`
+		TimeoutS      int    `yaml:"timeout_s"`      // HTTP timeout in seconds (default: 1800)
+		MaxConcurrent int    `yaml:"max_concurrent"`  // max parallel LLM calls (default: 8)
 	} `yaml:"llm"`
 	Whisper struct {
 		APIBase string `yaml:"api_base"`
@@ -167,6 +168,7 @@ func (r *BleveRule) matches(ct, spaceType string) bool {
 type Server struct {
 	cfg    Config
 	client *http.Client
+	llmSem chan struct{} // concurrency limiter for LLM calls
 
 	// In-flight LLM request tracking
 	llmMu       sync.Mutex
@@ -393,9 +395,14 @@ func NewServer(cfg Config) *Server {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
 	}
+	maxConcurrent := cfg.LLM.MaxConcurrent
+	if maxConcurrent < 1 {
+		maxConcurrent = 8
+	}
 	return &Server{
 		cfg:    cfg,
 		client: client,
+		llmSem: make(chan struct{}, maxConcurrent),
 	}
 }
 
@@ -1993,6 +2000,8 @@ func (s *Server) llmQueueStats() (int, time.Duration) {
 }
 
 func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) string {
+	s.llmSem <- struct{}{}        // acquire slot
+	defer func() { <-s.llmSem }() // release slot
 	s.llmTrackStart()
 	defer s.llmTrackDone()
 
