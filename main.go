@@ -171,9 +171,8 @@ type Server struct {
 	llmSem chan struct{} // concurrency limiter for LLM calls
 
 	// In-flight LLM request tracking
-	llmMu       sync.Mutex
-	llmInFlight int
-	llmOldest   time.Time // zero if no requests in flight
+	llmMu        sync.Mutex
+	llmStartTimes []time.Time // start time of each in-flight request
 }
 
 // OpenAI chat completion request/response
@@ -1977,21 +1976,21 @@ func (s *Server) llmCompleteStructured(messages []chatMessage, schema json.RawMe
 	return s.llmCompleteOpts(messages, rf)
 }
 
-func (s *Server) llmTrackStart() {
+func (s *Server) llmTrackStart() time.Time {
+	t := time.Now()
 	s.llmMu.Lock()
-	s.llmInFlight++
-	if s.llmInFlight == 1 {
-		s.llmOldest = time.Now()
-	}
+	s.llmStartTimes = append(s.llmStartTimes, t)
 	s.llmMu.Unlock()
+	return t
 }
 
-func (s *Server) llmTrackDone() {
+func (s *Server) llmTrackDone(t time.Time) {
 	s.llmMu.Lock()
-	s.llmInFlight--
-	if s.llmInFlight <= 0 {
-		s.llmInFlight = 0
-		s.llmOldest = time.Time{}
+	for i, st := range s.llmStartTimes {
+		if st.Equal(t) {
+			s.llmStartTimes = append(s.llmStartTimes[:i], s.llmStartTimes[i+1:]...)
+			break
+		}
 	}
 	s.llmMu.Unlock()
 }
@@ -1999,17 +1998,24 @@ func (s *Server) llmTrackDone() {
 func (s *Server) llmQueueStats() (int, time.Duration) {
 	s.llmMu.Lock()
 	defer s.llmMu.Unlock()
-	if s.llmInFlight == 0 {
+	n := len(s.llmStartTimes)
+	if n == 0 {
 		return 0, 0
 	}
-	return s.llmInFlight, time.Since(s.llmOldest)
+	oldest := s.llmStartTimes[0]
+	for _, t := range s.llmStartTimes[1:] {
+		if t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return n, time.Since(oldest)
 }
 
 func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) string {
 	s.llmSem <- struct{}{}        // acquire slot
 	defer func() { <-s.llmSem }() // release slot
-	s.llmTrackStart()
-	defer s.llmTrackDone()
+	t := s.llmTrackStart()
+	defer s.llmTrackDone(t)
 
 	reqBody := chatRequest{
 		Model:          s.cfg.LLM.Model,
