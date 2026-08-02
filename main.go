@@ -1067,8 +1067,58 @@ func extractJSON(s string) string {
 	return ""
 }
 
+// handleEmbed handles POST /embed — query embedding for semantic search.
+// Accepts plain text (Content-Type: text/plain) or JSON {"text": "..."}.
+// Returns JSON {"embedding": [...], "model": "...", "dimensions": N}.
+func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var text string
+	ct := r.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "application/json") {
+		var req struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		text = req.Text
+	} else {
+		body, _ := io.ReadAll(r.Body)
+		text = string(body)
+	}
+	text = strings.TrimSpace(text)
+
+	if text == "" {
+		http.Error(w, "empty text", http.StatusBadRequest)
+		return
+	}
+
+	// Rate-limit via LLM semaphore (shared with other LLM calls)
+	s.llmSem <- struct{}{}
+	embedding := s.getEmbedding(text)
+	<-s.llmSem
+
+	if embedding == nil {
+		http.Error(w, "embedding failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"embedding":  embedding,
+		"model":      s.cfg.Embedding.Model,
+		"dimensions": len(embedding),
+	})
+	log.Printf("/embed: %d chars → %d dims", len(text), len(embedding))
+}
+
 func (s *Server) getEmbedding(text string) []float64 {
-	if text == "" || len(text) < 10 {
+	if text == "" || len(text) < 3 {
 		return nil
 	}
 
@@ -2453,6 +2503,7 @@ func main() {
 
 	http.HandleFunc("/tika/text", srv.handleTikaText)
 	http.HandleFunc("/rmeta/text", srv.handleRmetaText)
+	http.HandleFunc("/embed", srv.handleEmbed)
 	http.HandleFunc("/schema", srv.handleSchema)
 	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/tika", srv.handleHealth)
