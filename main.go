@@ -2366,6 +2366,7 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 	inFlight, oldest := s.llmQueueStats()
 	queue := map[string]interface{}{
 		"in_flight": inFlight,
+		"max":       cap(s.llmSem),
 	}
 	if inFlight > 0 {
 		queue["oldest_seconds"] = int(oldest.Seconds())
@@ -2392,10 +2393,14 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 					Errors   int     `json:"errors"`
 					AvgTokS  float64 `json:"avg_tok_s"`
 					Backends []struct {
-						APIBase        string   `json:"api_base"`
-						Healthy        bool     `json:"healthy"`
-						FailCount      int      `json:"fail_count"`
-						UnhealthySince *float64 `json:"unhealthy_since"`
+						APIBase        string                  `json:"api_base"`
+						Healthy        bool                    `json:"healthy"`
+						FailCount      int                     `json:"fail_count"`
+						UnhealthySince *float64                `json:"unhealthy_since"`
+						Queue          *struct {
+							InFlight int `json:"in_flight"`
+							Max      int `json:"max"`
+						} `json:"queue,omitempty"`
 					} `json:"backends"`
 				} `json:"models"`
 			}
@@ -2412,6 +2417,9 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 							}
 							if b.FailCount > 0 {
 								entry["fail_count"] = b.FailCount
+							}
+							if b.Queue != nil {
+								entry["queue"] = fmt.Sprintf("%d/%d", b.Queue.InFlight, b.Queue.Max)
 							}
 							backendSummary = append(backendSummary, entry)
 						}
