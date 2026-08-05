@@ -2371,13 +2371,76 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		queue["oldest_seconds"] = int(oldest.Seconds())
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	// microllm backend stats (if LLM or Embedding goes through microllm)
+	var backends interface{}
+	microllmBase := s.cfg.LLM.APIBase
+	if microllmBase == "" {
+		microllmBase = s.cfg.Embedding.APIBase
+	}
+	if microllmBase != "" {
+		statsURL := strings.TrimRight(microllmBase, "/v1") + "/stats"
+		// Try both with and without /v1 suffix
+		if strings.HasSuffix(statsURL, "/v1/stats") {
+			statsURL = strings.TrimSuffix(statsURL, "/v1/stats") + "/stats"
+		}
+		statsResp, err := testClient.Get(statsURL)
+		if err == nil {
+			defer statsResp.Body.Close()
+			var statsData struct {
+				Models map[string]struct {
+					Requests int     `json:"requests"`
+					Errors   int     `json:"errors"`
+					AvgTokS  float64 `json:"avg_tok_s"`
+					Backends []struct {
+						APIBase        string   `json:"api_base"`
+						Healthy        bool     `json:"healthy"`
+						FailCount      int      `json:"fail_count"`
+						UnhealthySince *float64 `json:"unhealthy_since"`
+					} `json:"backends"`
+				} `json:"models"`
+			}
+			if json.NewDecoder(statsResp.Body).Decode(&statsData) == nil {
+				// Extract only models relevant to taki (local-ocr, local-embed, llm-stt)
+				relevant := map[string]interface{}{}
+				for _, name := range []string{"local-ocr", "local-embed", "llm-stt"} {
+					if m, ok := statsData.Models[name]; ok {
+						backendSummary := []map[string]interface{}{}
+						for _, b := range m.Backends {
+							entry := map[string]interface{}{
+								"api_base": b.APIBase,
+								"healthy":  b.Healthy,
+							}
+							if b.FailCount > 0 {
+								entry["fail_count"] = b.FailCount
+							}
+							backendSummary = append(backendSummary, entry)
+						}
+						relevant[name] = map[string]interface{}{
+							"requests": m.Requests,
+							"errors":   m.Errors,
+							"backends": backendSummary,
+						}
+					}
+				}
+				if len(relevant) > 0 {
+					backends = relevant
+				}
+			}
+		}
+	}
+
+	response := map[string]interface{}{
 		"status":     overall,
 		"version":    version,
 		"subsystems": results,
 		"queue":      queue,
-	})
+	}
+	if backends != nil {
+		response["backends"] = backends
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // handleSchema returns the metadata keys that taki can enrich per MIME type.
