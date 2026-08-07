@@ -6,8 +6,9 @@
     "doc": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["subject", "subject_inferred", "type", "date", "reference"],
+      "required": ["title", "subject", "subject_inferred", "type", "date", "reference", "valid_from", "valid_till"],
       "properties": {
+        "title": { "type": ["string", "null"] },
         "subject": { "type": ["string", "null"] },
         "subject_inferred": { "type": "boolean" },
         "type": {
@@ -18,6 +19,7 @@
             "rechnung", "lieferschein", "kontoauszug", "kassenbon", "ec_bon",
             "mahnung", "gutschrift",
             "urkunde", "zeugnis",
+            "sicknote",
             "foto", "skizze", "tabelle", "praesentation", "email",
             "sonstiges", null
           ]
@@ -26,7 +28,15 @@
           "type": ["string", "null"],
           "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
         },
-        "reference": { "type": ["string", "null"] }
+        "reference": { "type": ["string", "null"] },
+        "valid_from": {
+          "type": ["string", "null"],
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "valid_till": {
+          "type": ["string", "null"],
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        }
       }
     },
     "sender": {
@@ -57,6 +67,24 @@
         "company":      { "type": ["string", "null"] },
         "given_name":   { "type": ["string", "null"] },
         "family_name":  { "type": ["string", "null"] }
+      }
+    },
+    "issuer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["company", "given_name", "family_name", "street",
+                   "house_number", "postal_code", "city", "country",
+                   "phone"],
+      "properties": {
+        "company":      { "type": ["string", "null"] },
+        "given_name":   { "type": ["string", "null"] },
+        "family_name":  { "type": ["string", "null"] },
+        "street":       { "type": ["string", "null"] },
+        "house_number": { "type": ["string", "null"] },
+        "postal_code":  { "type": ["string", "null"] },
+        "city":         { "type": ["string", "null"] },
+        "country":      { "type": ["string", "null"], "pattern": "^[A-Z]{2}$" },
+        "phone":        { "type": ["string", "null"] }
       }
     },
     "amounts": {

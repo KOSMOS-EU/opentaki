@@ -24,6 +24,13 @@ REGELN:
 7. doc.subject = die Betreffzeile wörtlich, ohne das Wort "Betreff:".
    Fehlt eine Betreffzeile, fasse den Zweck in max. 10 Wörtern zusammen
    und setze subject_inferred auf true.
+7a. doc.valid_from / doc.valid_till = Gültigkeitszeitraum als YYYY-MM-DD,
+   sofern im Dokument erkennbar (z.B. Vertragslaufzeit, AU-Zeitraum,
+   Genehmigungsfrist). Nicht mit dem Briefdatum verwechseln. Sonst null.
+7b. doc.title = ein treffender Dateiname, zusammengesetzt aus:
+   Datum (YYYY-MM-DD), Absender (Kurzform), Thema (Kurzform).
+   Beispiel: "2026-07-03 Stadtwerke Leipzig Jahresabrechnung Strom".
+   Keine Sonderzeichen außer Leerzeichen und Bindestrich. Kein Suffix.
 
 DOKUMENTTYP-KLASSIFIKATION (doc.type):
 8. Bestimme den Dokumenttyp anhand von Inhalt und Erscheinungsbild.
@@ -33,6 +40,7 @@ DOKUMENTTYP-KLASSIFIKATION (doc.type):
    - Buchhaltung: rechnung, lieferschein, kontoauszug, kassenbon,
      ec_bon, mahnung, gutschrift
    - Urkunden: urkunde, zeugnis
+   - Gesundheit: sicknote (Krankmeldung, Gesundmeldung, AU-Bescheinigung)
    - Medien: foto, skizze, tabelle, praesentation, email
    - Fallback: sonstiges
    Im Zweifel "sonstiges".
@@ -53,6 +61,11 @@ TYP-SPEZIFISCHE EXTRAKTION:
 
    Urkunden (urkunde, zeugnis):
    → sender.*, doc.subject, doc.date, doc.reference
+
+   Krankmeldung (sicknote):
+   → sender.* = der Versicherte/Patient (Name, Adresse)
+   → issuer.* = der ausstellende Arzt/Praxis (Name, Praxisadresse)
+   → doc.subject, doc.date (Ausstellungsdatum)
 
    Foto/Skizze (foto, skizze):
    → doc.subject (kurze Bildbeschreibung), subject_inferred = true.
