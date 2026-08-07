@@ -87,11 +87,13 @@ type DocMetaConfig struct {
 	SchemaFile       string   `yaml:"schema_file"`        // path to guided_json schema (default: /etc/open_taki/docmeta_schema.json)
 	PromptFile       string   `yaml:"prompt_file"`        // path to vision prompt (default: /etc/open_taki/docmeta_prompt.txt)
 	RescuePromptFile string   `yaml:"rescue_prompt_file"` // path to rescue prompt (default: /etc/open_taki/docmeta_rescue_prompt.txt)
+	FieldRulesFile   string   `yaml:"field_rules_file"`   // path to field rules (default: /etc/open_taki/field_rules.json)
 
 	// Loaded at startup (not from YAML)
 	schema       json.RawMessage
 	prompt       string
 	rescuePrompt string
+	fieldRules   map[string]map[string]string // doc.type → field → template
 }
 
 // ── Routing ──────────────────────────────────────────────────
@@ -339,6 +341,22 @@ func (cfg *Config) loadDocMetaFiles(configDir string) {
 	} else {
 		log.Printf("  DocMeta rescue: using built-in default (%s not found)", cfg.DocMeta.RescuePromptFile)
 		cfg.DocMeta.rescuePrompt = docMetaDefaultRescuePrompt
+	}
+
+	// Load field rules
+	if cfg.DocMeta.FieldRulesFile == "" {
+		cfg.DocMeta.FieldRulesFile = filepath.Join(configDir, "field_rules.json")
+	}
+	if data, err := os.ReadFile(cfg.DocMeta.FieldRulesFile); err == nil {
+		var rules map[string]map[string]string
+		if json.Unmarshal(data, &rules) == nil {
+			cfg.DocMeta.fieldRules = rules
+			log.Printf("  DocMeta field_rules: %s (%d types)", cfg.DocMeta.FieldRulesFile, len(rules))
+		} else {
+			log.Printf("  DocMeta field_rules: invalid JSON in %s", cfg.DocMeta.FieldRulesFile)
+		}
+	} else {
+		log.Printf("  DocMeta field_rules: not found (%s), skipping", cfg.DocMeta.FieldRulesFile)
 	}
 }
 
@@ -687,6 +705,68 @@ func dmIsNull(dm takiDocMeta, path string) bool {
 	return dmGet(dm, path) == nil
 }
 
+// applyFieldRules evaluates field_rules templates for the given doc.type
+// and overwrites fields with the rendered result. Templates use {field.name}
+// placeholders. {a|b} tries a first, falls back to b. Empty results are skipped.
+func applyFieldRules(dm takiDocMeta, rules map[string]map[string]string) {
+	if rules == nil {
+		return
+	}
+	docType := dmGetStr(dm, "doc.type")
+
+	// Collect applicable rules: type-specific first, then wildcard
+	var applicable map[string]string
+	if typeRules, ok := rules[docType]; ok {
+		applicable = typeRules
+	} else if fallback, ok := rules["*"]; ok {
+		applicable = fallback
+	}
+	if applicable == nil {
+		return
+	}
+
+	for field, tmpl := range applicable {
+		result := renderFieldTemplate(dm, tmpl)
+		if result != "" {
+			dmSet(dm, field, result)
+		}
+	}
+}
+
+// renderFieldTemplate replaces {field.name} placeholders with values from dm.
+// {a|b} tries field a first, falls back to field b. Consecutive spaces are collapsed.
+func renderFieldTemplate(dm takiDocMeta, tmpl string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(tmpl) {
+		if tmpl[i] == '{' {
+			end := strings.IndexByte(tmpl[i:], '}')
+			if end < 0 {
+				result.WriteByte(tmpl[i])
+				i++
+				continue
+			}
+			expr := tmpl[i+1 : i+end]
+			val := ""
+			for _, alt := range strings.Split(expr, "|") {
+				alt = strings.TrimSpace(alt)
+				if v := dmGetStr(dm, alt); v != "" {
+					val = v
+					break
+				}
+			}
+			result.WriteString(val)
+			i += end + 1
+		} else {
+			result.WriteByte(tmpl[i])
+			i++
+		}
+	}
+	// Collapse multiple spaces, trim
+	out := strings.Join(strings.Fields(result.String()), " ")
+	return out
+}
+
 // docMetaFallback tries a text-based LLM pass when vision is unavailable.
 // Returns nil if LLM is down (no fake metadata).
 // Returns "none" placeholders if LLM answered but couldn't extract anything useful.
@@ -843,14 +923,18 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 		}
 	}
 
+	// Apply field rules (deterministic template overrides)
+	applyFieldRules(*dm, s.cfg.DocMeta.fieldRules)
+
 	if s.cfg.DocMeta.ModelVersion != "" {
 		(*dm)["model"] = s.cfg.DocMeta.ModelVersion
 	}
 
-	log.Printf("docmeta: source=%s type=%s date=%s sender=%s uncertain=%d model=%s",
+	log.Printf("docmeta: source=%s type=%s date=%s sender=%s title=%q uncertain=%d model=%s",
 		dmGetStr(*dm, "source"),
 		dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.date"),
-		dmGetStr(*dm, "sender.company"), len(dmGetStrSlice(*dm, "uncertain")),
+		dmGetStr(*dm, "sender.company"), dmGetStr(*dm, "doc.title"),
+		len(dmGetStrSlice(*dm, "uncertain")),
 		s.cfg.DocMeta.ModelVersion)
 
 	return dm
@@ -917,7 +1001,7 @@ func isDocMetaFormal(docType string) bool {
 	case "brief", "bescheid", "verfuegung", "satzung", "niederschrift",
 		"antrag", "vertrag", "mitteilung", "einladung", "kuendigung",
 		"angebot", "rechnung", "lieferschein", "mahnung", "gutschrift",
-		"urkunde", "zeugnis":
+		"urkunde", "zeugnis", "sicknote":
 		return true
 	}
 	return false

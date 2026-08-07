@@ -1,0 +1,27 @@
+{
+  "sicknote": {
+    "doc.title": "{doc.date} {sender.family_name} {sender.given_name} Krankmeldung",
+    "doc.subject": "AU {sender.family_name} {doc.valid_from} - {doc.valid_till}"
+  },
+  "rechnung": {
+    "doc.title": "{doc.date} {sender.company} Rechnung {doc.reference}"
+  },
+  "mahnung": {
+    "doc.title": "{doc.date} {sender.company} Mahnung {doc.reference}"
+  },
+  "gutschrift": {
+    "doc.title": "{doc.date} {sender.company} Gutschrift {doc.reference}"
+  },
+  "bescheid": {
+    "doc.title": "{doc.date} {sender.company} {doc.subject}"
+  },
+  "vertrag": {
+    "doc.title": "{doc.date} {sender.company} Vertrag {doc.subject}"
+  },
+  "kuendigung": {
+    "doc.title": "{doc.date} {sender.company} Kuendigung {doc.subject}"
+  },
+  "*": {
+    "doc.title": "{doc.date} {sender.company|sender.family_name} {doc.subject}"
+  }
+}
