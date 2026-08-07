@@ -30,6 +30,8 @@ REGELN:
 7b. doc.title = ein treffender Dateiname, zusammengesetzt aus:
    Datum (YYYY-MM-DD), Absender (Kurzform), Thema (Kurzform).
    Beispiel: "2026-07-03 Stadtwerke Leipzig Jahresabrechnung Strom".
+   Bei sicknote: Datum, Name des Versicherten (sender), "Krankmeldung".
+   Beispiel: "2026-07-03 Mustermann Max Krankmeldung".
    Keine Sonderzeichen außer Leerzeichen und Bindestrich. Kein Suffix.
 
 DOKUMENTTYP-KLASSIFIKATION (doc.type):
