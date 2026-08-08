@@ -60,7 +60,7 @@ UPLOAD_URL=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.std
 curl -sf -X POST \
     -H "Authorization: token ${TOKEN}" \
     -H "Content-Type: application/zip" \
-    "${UPLOAD_URL}?name=${PACKAGE_NAME}-${TAG}.zip" \
+    "${UPLOAD_URL}?name=${PACKAGE_NAME}.zip" \
     --data-binary "@${ZIP_PATH}" > /dev/null
 
 echo "=== Pushed ${PACKAGE_NAME}:pkg-${TAG} ==="
