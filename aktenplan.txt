@@ -1,5 +1,7 @@
+11  Innere Verwaltung
 11.11.01.04  Innere Verwaltung > Repräsentationen, Ehrungen, partnerschaftliche Beziehungen 1
 11.11.01.05  Innere Verwaltung > Beauftragte (Gleichstellung, Senioren)
+11.12.02     Innere Verwaltung > Personalangelegenheiten
 11.12.02.00  Innere Verwaltung > AVL Auszubildende
 11.13.05.02  Innere Verwaltung > Rathaus Markt 1-3
 11.13.05.03  Innere Verwaltung > Rathausgasse 7-11, Mathildenstr. 7 Brandis
@@ -57,6 +59,7 @@
 11.16.14.01  Innere Verwaltung > Baubetriebshof Haltung von Fahrzeugen
 11.16.14.02  Innere Verwaltung > Baubetriebshof Geräte, Ausrüstungsgegenstände, Einsatztechnik
 11.16.14.10  Innere Verwaltung > Baubetriebshof Hausmeister-Sammelstelle
+12  Sicherheit und Ordnung
 12.11.01.00  Sicherheit und Ordnung > AVL Statistik/Wahlen
 12.21.01.00  Sicherheit und Ordnung > AVL Ordnungsaufgaben
 12.21.01.03  Sicherheit und Ordnung > Erteilung der Genehmigung und Überwachung erlaubnispflichtiger Gewerbebetriebe
@@ -66,12 +69,14 @@
 12.60.01.03  Sicherheit und Ordnung > FFW Haltung von Fahrzeugen
 12.80.01.01  Sicherheit und Ordnung > LF 16 TS - L-UK 8010
 12.80.01.02  Sicherheit und Ordnung > RW 1 - L-UK 8011
+21  Schule und Bildung
 21.11.01.00  Schule und Bildung > AVL Grundschulen
 21.11.01.01  Schule und Bildung > Grundschule Brandis
 21.11.01.02  Schule und Bildung > Grundschule Beucha
 21.11.02.01  Schule und Bildung > GS Brandis Inklusion
 21.11.02.02  Schule und Bildung > GS Beucha Inklusion
 21.51.02.01  Schule und Bildung > Oberschule Inklusion
+28  Kultur
 28.10.01.01  Kultur > Eigene Veranstaltungen Stadt Brandis
 28.10.01.02  Kultur > Stadtfest Brandis
 28.10.01.03  Kultur > Vereinstreffen
@@ -80,9 +85,11 @@
 28.10.01.09  Kultur > Kulturelle Veranstaltungen im OT Beucha
 28.10.01.10  Kultur > sonstige Kulturaufgaben
 28.10.01.11  Kultur > GEMA
+31  Soziale Leistungen
 31.11.01.01  Soziale Leistungen > Soziale Hilfen für Bedürftige nach SGB IX und XII
 31.22.01.01  Soziale Leistungen > Eingliederungsleistungen - Beschäftigte der Verwaltung
 31.22.01.02  Soziale Leistungen > Eingliederungsleistungen - Beschäftigte des Baubetriebshofs
+36  Kinder- und Jugendarbeit
 36.21.01.02  Kinder- und Jugendarbeit > Initiative Jugend bewegt Kommune
 36.51.01.04  Kinder- und Jugendarbeit > Kinderkombination (am Bahnhof)
 36.61.01.00  Kinder- und Jugendarbeit > Jugendarbeit - Eigene Einrichtungen
@@ -91,6 +98,7 @@
 36.62.01.00  Kinder- und Jugendarbeit > Jugendarbeit - Freie Träger
 36.62.01.01  Kinder- und Jugendarbeit > Kinder- und Jugendhaus des CVJM Brandis e.V.
 36.62.01.02  Kinder- und Jugendarbeit > Freier Träger Jugendarbeit - AWO
+42  Sportförderung
 42.10.01.02  Sportförderung > Förderung im Rahmen der Sportförderrichtlinie der Stadt Brandis
 42.10.02.01  Sportförderung > Sportveranstaltungen
 42.10.02.02  Sportförderung > Beuchaer Triathlon Day
@@ -105,16 +113,20 @@
 42.41.02.01  Sportförderung > Sporthalle des Gymnasium Brandis
 42.41.02.02  Sportförderung > Sport- und Mehrzweckhalle Brandis
 42.41.02.03  Sportförderung > Stadtmeisterschaften Fußball
+51  Bauleitplanung, Stadtentwicklung
 51.11.01.02  Bauleitplanung, Stadtentwicklung > Städtebauliche Sanierung und Entwicklung
 51.11.01.03  Bauleitplanung, Stadtentwicklung > Dorferneuerung
 51.20.05.01  Bauleitplanung, Stadtentwicklung > Geoinformationsdienste, Kartografische Serviceprodukte
+52  Bauordnung, Wohnungswesen
 52.20.01.01  Bauordnung, Wohnungswesen > Wohnungsbauförderung
 52.30.01.01  Bauordnung, Wohnungswesen > Kriegsgräber / Ehrenmale
 52.30.01.02  Bauordnung, Wohnungswesen > Bergkirche Beucha
+53  Ver- und Entsorgung
 53.10.01.01  Ver- und Entsorgung > Sicherstellg. Elektrizitätsvers. incl. Förderung u. Konzessionsabgabe
 53.20.01.01  Ver- und Entsorgung > Sicherstellg. Gasversorgung einschl. Förderung u. Konzessionsabgabe
 53.30.01.01  Ver- und Entsorgung > Kommunale Wasserversorgung bei Zweckverbänden weitere Untergliederung
 53.80.01.01  Ver- und Entsorgung > Abwasserbeseitigung
+54  Verkehrswesen
 54.10.01.00  Verkehrswesen > AVL Gemeindestraßen
 54.20.01.00  Verkehrswesen > AVL Kreisstraßen
 54.20.01.01  Verkehrswesen > Bereitstellung und Unterhaltung der Rad- und Gehwege an Kreisstraßen
@@ -129,6 +141,7 @@
 54.60.01.01  Verkehrswesen > Bereitstellung und Betrieb und Wartung von Parkeinrichtungen, Parkscheinautomaten und Parkuhren
 54.70.01.00  Verkehrswesen > ÖPNV Muldental in Fahrt
 54.80.01.01  Verkehrswesen > Bereitstellung und Betrieb von sonstigen Anlagen des Personen- und Güterverkehrs
+55  Öffentliches Grün, Umwelt
 55.10.01.01  Öffentliches Grün, Umwelt > AVL Öffentliches Grün und Landschaftsbau
 55.10.01.02  Öffentliches Grün, Umwelt > Grün- und Parkanlagen - Bereitstellung und Unterhaltung
 55.10.01.03  Öffentliches Grün, Umwelt > Kleingartenanlagen und Kleingartenwesen - Bereitstellung und Unterhaltung
@@ -144,6 +157,7 @@
 55.51.01.01  Öffentliches Grün, Umwelt > AVL Land- und Forstwirtschaft
 55.51.01.02  Öffentliches Grün, Umwelt > Bewirtschaftung und Verpachtung eigener landwirtschaftlicher Flächen
 55.51.01.03  Öffentliches Grün, Umwelt > Vollzug von Förderprogrammen der ländlichen Entwicklung
+57  Wirtschaftsförderung
 57.10.01.00  Wirtschaftsförderung > AVL Wirtschaftsförderung
 57.10.01.01  Wirtschaftsförderung > Gewerbegebiet Brandis-West
 57.10.01.02  Wirtschaftsförderung > Gewerbepark Beucha
@@ -158,7 +172,10 @@
 57.30.01.08  Wirtschaftsförderung > Festzelt, Bühne, sonst. Einrichtungen und Anlagen (st.pfl.)
 57.30.02.07  Wirtschaftsförderung > Weihnachtsmärkte, andere Markteinrichtungen
 57.50.01.01  Wirtschaftsförderung > Tourismusförderung/Spendenbänke
+61  Finanzwirtschaft, Steuern
 61.10.01.01  Finanzwirtschaft, Steuern > Steuern, allgemeine Zuweisungen, allgemeine Umlagen
 61.30.01.01  Finanzwirtschaft, Steuern > Abwicklung der Vorjahre
+71  Brand- und Katastrophenschutz
 71.20.01.00  Brand- und Katastrophenschutz > Katastrophenschutz, Hochwasser
+81  Personalwirtschaft
 81.01.00.00  Personalwirtschaft > Lohnverrechnung
