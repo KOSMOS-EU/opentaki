@@ -1,0 +1,164 @@
+11.11.01.04  Innere Verwaltung > Repräsentationen, Ehrungen, partnerschaftliche Beziehungen 1
+11.11.01.05  Innere Verwaltung > Beauftragte (Gleichstellung, Senioren)
+11.12.02.00  Innere Verwaltung > AVL Auszubildende
+11.13.05.02  Innere Verwaltung > Rathaus Markt 1-3
+11.13.05.03  Innere Verwaltung > Rathausgasse 7-11, Mathildenstr. 7 Brandis
+11.13.05.04  Innere Verwaltung > Gemeindehaus Beucha August-Bebel-Str. 12
+11.13.05.05  Innere Verwaltung > Gemeindehaus Polenz Zur Rodelbahn 6
+11.13.05.06  Innere Verwaltung > Baubetriebshof Am Bahnhof 5 mit Nebengebäude Beucha u. Polenz
+11.13.05.07  Innere Verwaltung > Dorfgemeinschaftshaus Polenz
+11.13.05.08  Innere Verwaltung > Feuerwehrgerätehaus Brandis Markt 4
+11.13.05.09  Innere Verwaltung > Feuerwehrgerätehaus Polenz Klingaer Str. 20
+11.13.05.10  Innere Verwaltung > Feuerwehrgerätehaus Beucha August-Bebel-Str. 10 a
+11.13.05.11  Innere Verwaltung > Grundschule Brandis Poststr. 8
+11.13.05.12  Innere Verwaltung > Grundschule Brandis, Hort Poststr. 8
+11.13.05.13  Innere Verwaltung > Grundschule Beucha Kleinsteinberger Str. 20
+11.13.05.14  Innere Verwaltung > Grundschule Beucha, Hort Kleinsteinberger Str. 20
+11.13.05.15  Innere Verwaltung > Oberschule Brandis Poststr. 20
+11.13.05.16  Innere Verwaltung > Gymnasium Brandis Bahnhofstr. 18 a, Schulstr. 3
+11.13.05.17  Innere Verwaltung > Bibliothek Brandis Bahnhofstr. 20 a
+11.13.05.18  Innere Verwaltung > Jugendclub Polenz Zur Rodelbahn 6
+11.13.05.19  Innere Verwaltung > Turnhalle Schulkomplex Brandis Schulstr. 3 a
+11.13.05.20  Innere Verwaltung > Wohngebäude Rathausgasse 6
+11.13.05.21  Innere Verwaltung > Speiseraum Schulkomplex Brandis Schulstr. 3 a
+11.13.05.22  Innere Verwaltung > Sport- und Mehrzweckhalle Brandis Poststr. 22
+11.13.05.23  Innere Verwaltung > Kinderkombination Regenbogen Brandis Pappelallee 6
+11.13.05.24  Innere Verwaltung > Kinderkrippe Brandis Waldstr. 6 e d. Aussenst. d. Kinderkomb. Regenbogen
+11.13.05.25  Innere Verwaltung > Kindertagesstätte Knirpsentreff Beucha Kleinsteinberger Str. 28
+11.13.05.26  Innere Verwaltung > Jugendclub Beucha August-Bebel-Str. 4
+11.13.05.27  Innere Verwaltung > DRK-Kinderheim Schwalbennest Waldsteinberg
+11.13.05.28  Innere Verwaltung > Kegelbahn Polenz Siedlungsring 16 a
+11.13.05.29  Innere Verwaltung > Sportplatz Freundschaft mit Sportlerheim Brandis Dahlienweg
+11.13.05.30  Innere Verwaltung > Sportplatz Lange Stücken Beucha
+11.13.05.31  Innere Verwaltung > Sportlerheim Beucha August-Bebel-Str. 10
+11.13.05.32  Innere Verwaltung > Kegelbahn Brandis Bahnhofstr. 22
+11.13.05.33  Innere Verwaltung > Sportplatz mit Sporthalle Schützenplatz Brandis Waldstr. 6 f
+11.13.05.34  Innere Verwaltung > Friedhof Brandis Waldstraße 16
+11.13.05.35  Innere Verwaltung > Ratskeller Brandis Markt 9
+11.13.05.36  Innere Verwaltung > Waldbad MZ-Gebäude Brandis
+11.13.05.37  Innere Verwaltung > Kulturhaus Beucha August-Bebel-Str. 60
+11.13.05.38  Innere Verwaltung > Wohnhaus Beucha, Moritz-Nebe-Weg 4
+11.13.05.39  Innere Verwaltung > Sportplatz Polenz, Klingaer Str.
+11.13.05.40  Innere Verwaltung > Bungalows Siedlerverband Beucha
+11.13.05.41  Innere Verwaltung > Sport- und Freizeitpark Lange Stücken Beucha
+11.13.05.42  Innere Verwaltung > Beucha Dorfstr. 14
+11.13.05.43  Innere Verwaltung > Haus am See Beucha (Rock e.V.)
+11.13.05.44  Innere Verwaltung > Garagenhöfe Beucha
+11.13.05.45  Innere Verwaltung > Kleinsteinberger Str. 58
+11.13.05.46  Innere Verwaltung > Kleinsteinberger Str. 68/70 u. 70a
+11.13.05.47  Innere Verwaltung > Hausmeisterwohnung GS Beucha
+11.13.05.48  Innere Verwaltung > Wohngebäude Mathildenstr. 6
+11.13.05.49  Innere Verwaltung > Wasserturm Beucha
+11.13.05.50  Innere Verwaltung > Turnhalle Grundschule Beucha, Kleinsteinberger Straße 20
+11.13.05.51  Innere Verwaltung > Bungalows Beucha Kleinsteinberger Str. 46-48
+11.13.05.52  Innere Verwaltung > Südl. und Nordl. Toilettengebäude Autobahnsee
+11.16.08.01  Innere Verwaltung > Stadtarchiv
+11.16.09.00  Innere Verwaltung > Archiv
+11.16.14.01  Innere Verwaltung > Baubetriebshof Haltung von Fahrzeugen
+11.16.14.02  Innere Verwaltung > Baubetriebshof Geräte, Ausrüstungsgegenstände, Einsatztechnik
+11.16.14.10  Innere Verwaltung > Baubetriebshof Hausmeister-Sammelstelle
+12.11.01.00  Sicherheit und Ordnung > AVL Statistik/Wahlen
+12.21.01.00  Sicherheit und Ordnung > AVL Ordnungsaufgaben
+12.21.01.03  Sicherheit und Ordnung > Erteilung der Genehmigung und Überwachung erlaubnispflichtiger Gewerbebetriebe
+12.22.01.00  Sicherheit und Ordnung > AVL Melde- und Personenstandswesen
+12.60.01.00  Sicherheit und Ordnung > AVL Brandschutz
+12.60.01.02  Sicherheit und Ordnung > Feuerwehrgerätehäuser
+12.60.01.03  Sicherheit und Ordnung > FFW Haltung von Fahrzeugen
+12.80.01.01  Sicherheit und Ordnung > LF 16 TS - L-UK 8010
+12.80.01.02  Sicherheit und Ordnung > RW 1 - L-UK 8011
+21.11.01.00  Schule und Bildung > AVL Grundschulen
+21.11.01.01  Schule und Bildung > Grundschule Brandis
+21.11.01.02  Schule und Bildung > Grundschule Beucha
+21.11.02.01  Schule und Bildung > GS Brandis Inklusion
+21.11.02.02  Schule und Bildung > GS Beucha Inklusion
+21.51.02.01  Schule und Bildung > Oberschule Inklusion
+28.10.01.01  Kultur > Eigene Veranstaltungen Stadt Brandis
+28.10.01.02  Kultur > Stadtfest Brandis
+28.10.01.03  Kultur > Vereinstreffen
+28.10.01.07  Kultur > Kulturelle Veranstaltungen im OT Brandis
+28.10.01.08  Kultur > Kulturelle Veranstaltungen im OT Polenz
+28.10.01.09  Kultur > Kulturelle Veranstaltungen im OT Beucha
+28.10.01.10  Kultur > sonstige Kulturaufgaben
+28.10.01.11  Kultur > GEMA
+31.11.01.01  Soziale Leistungen > Soziale Hilfen für Bedürftige nach SGB IX und XII
+31.22.01.01  Soziale Leistungen > Eingliederungsleistungen - Beschäftigte der Verwaltung
+31.22.01.02  Soziale Leistungen > Eingliederungsleistungen - Beschäftigte des Baubetriebshofs
+36.21.01.02  Kinder- und Jugendarbeit > Initiative Jugend bewegt Kommune
+36.51.01.04  Kinder- und Jugendarbeit > Kinderkombination (am Bahnhof)
+36.61.01.00  Kinder- und Jugendarbeit > Jugendarbeit - Eigene Einrichtungen
+36.61.01.01  Kinder- und Jugendarbeit > Kinder- und Jugendclub Beucha der Stadt Brandis
+36.61.01.02  Kinder- und Jugendarbeit > Jugendclub Polenz der Stadt Brandis
+36.62.01.00  Kinder- und Jugendarbeit > Jugendarbeit - Freie Träger
+36.62.01.01  Kinder- und Jugendarbeit > Kinder- und Jugendhaus des CVJM Brandis e.V.
+36.62.01.02  Kinder- und Jugendarbeit > Freier Träger Jugendarbeit - AWO
+42.10.01.02  Sportförderung > Förderung im Rahmen der Sportförderrichtlinie der Stadt Brandis
+42.10.02.01  Sportförderung > Sportveranstaltungen
+42.10.02.02  Sportförderung > Beuchaer Triathlon Day
+42.10.02.03  Sportförderung > Sachsenpokal im Feuerwehrsport
+42.41.01.00  Sportförderung > Sportstätten
+42.41.01.01  Sportförderung > Sportplatz Schützenplatz
+42.41.01.02  Sportförderung > Sport- und Freizeitpark Lange Stücken
+42.41.01.03  Sportförderung > Sportplatz Freundschaft
+42.41.01.04  Sportförderung > Kegelbahn Brandis
+42.41.01.05  Sportförderung > Kegelbahn Polenz
+42.41.02.00  Sportförderung > Turn- und Sporthallen
+42.41.02.01  Sportförderung > Sporthalle des Gymnasium Brandis
+42.41.02.02  Sportförderung > Sport- und Mehrzweckhalle Brandis
+42.41.02.03  Sportförderung > Stadtmeisterschaften Fußball
+51.11.01.02  Bauleitplanung, Stadtentwicklung > Städtebauliche Sanierung und Entwicklung
+51.11.01.03  Bauleitplanung, Stadtentwicklung > Dorferneuerung
+51.20.05.01  Bauleitplanung, Stadtentwicklung > Geoinformationsdienste, Kartografische Serviceprodukte
+52.20.01.01  Bauordnung, Wohnungswesen > Wohnungsbauförderung
+52.30.01.01  Bauordnung, Wohnungswesen > Kriegsgräber / Ehrenmale
+52.30.01.02  Bauordnung, Wohnungswesen > Bergkirche Beucha
+53.10.01.01  Ver- und Entsorgung > Sicherstellg. Elektrizitätsvers. incl. Förderung u. Konzessionsabgabe
+53.20.01.01  Ver- und Entsorgung > Sicherstellg. Gasversorgung einschl. Förderung u. Konzessionsabgabe
+53.30.01.01  Ver- und Entsorgung > Kommunale Wasserversorgung bei Zweckverbänden weitere Untergliederung
+53.80.01.01  Ver- und Entsorgung > Abwasserbeseitigung
+54.10.01.00  Verkehrswesen > AVL Gemeindestraßen
+54.20.01.00  Verkehrswesen > AVL Kreisstraßen
+54.20.01.01  Verkehrswesen > Bereitstellung und Unterhaltung der Rad- und Gehwege an Kreisstraßen
+54.20.01.02  Verkehrswesen > Bereitstellung und Unterhaltung von öffentlicher Beleuchtung an Kreisstraßen
+54.20.01.03  Verkehrswesen > Kalkulation und Abrechnung von Erschließungs- und Straßenbaubeiträgen für Kreisstraßen und Anlagen
+54.30.01.00  Verkehrswesen > AVL Staatsstraßen
+54.30.01.01  Verkehrswesen > Bereitstellung und Unterhaltung der Rad- und Gehwege an Staatsstraßen
+54.30.01.02  Verkehrswesen > Bereitstellung und Unterhaltung von öffentlicher Beleuchtung an Staatsstraßen
+54.30.01.03  Verkehrswesen > Kalkulation und Abrechnung von Erschließungs- und Straßenbaubeiträgen für Staatsstraßen und Anlagen
+54.30.02.01  Verkehrswesen > Verkehrsflächen und Anlagen, ÖPNV
+54.51.01.01  Verkehrswesen > Straßenreinigung
+54.60.01.01  Verkehrswesen > Bereitstellung und Betrieb und Wartung von Parkeinrichtungen, Parkscheinautomaten und Parkuhren
+54.70.01.00  Verkehrswesen > ÖPNV Muldental in Fahrt
+54.80.01.01  Verkehrswesen > Bereitstellung und Betrieb von sonstigen Anlagen des Personen- und Güterverkehrs
+55.10.01.01  Öffentliches Grün, Umwelt > AVL Öffentliches Grün und Landschaftsbau
+55.10.01.02  Öffentliches Grün, Umwelt > Grün- und Parkanlagen - Bereitstellung und Unterhaltung
+55.10.01.03  Öffentliches Grün, Umwelt > Kleingartenanlagen und Kleingartenwesen - Bereitstellung und Unterhaltung
+55.10.01.04  Öffentliches Grün, Umwelt > Spielplätze - Bereitstellung und Unterhaltung
+55.10.01.05  Öffentliches Grün, Umwelt > Sonstige Maßnahmen und Einrichtungen die der Erholung und Freizeitgestaltung dienen
+55.20.01.01  Öffentliches Grün, Umwelt > Autobahnsee Öffentliche Gewässer II. Ordnung - Unterhaltung
+55.20.01.03  Öffentliches Grün, Umwelt > Bereitstellung, Unterhaltung, Instandsetzung und Betrieb wasserbaulicher Anlagen
+55.20.01.04  Öffentliches Grün, Umwelt > Vorbeugender Grundwasser- und Hochwasserschutz
+55.30.01.02  Öffentliches Grün, Umwelt > Personalisierte UGA Friedhof Brandis Waldstraße
+55.40.01.01  Öffentliches Grün, Umwelt > AVL Naturschutz und Landschaftspflege
+55.40.01.02  Öffentliches Grün, Umwelt > Durchführung und Förderung von landschaftspflegerischen und gestalterischen Maßnahmen (LEADER)
+55.40.01.03  Öffentliches Grün, Umwelt > Ausgleichsflächen (Ökokonto)
+55.51.01.01  Öffentliches Grün, Umwelt > AVL Land- und Forstwirtschaft
+55.51.01.02  Öffentliches Grün, Umwelt > Bewirtschaftung und Verpachtung eigener landwirtschaftlicher Flächen
+55.51.01.03  Öffentliches Grün, Umwelt > Vollzug von Förderprogrammen der ländlichen Entwicklung
+57.10.01.00  Wirtschaftsförderung > AVL Wirtschaftsförderung
+57.10.01.01  Wirtschaftsförderung > Gewerbegebiet Brandis-West
+57.10.01.02  Wirtschaftsförderung > Gewerbepark Beucha
+57.10.01.03  Wirtschaftsförderung > Gewerbepark Waldpolenz und ehem. Flugplatz
+57.30.01.01  Wirtschaftsförderung > AVL Allg. Einrichtungen und Unternehmen
+57.30.01.02  Wirtschaftsförderung > Sport- und Mehrzweckhalle Brandis
+57.30.01.03  Wirtschaftsförderung > Gemeindehaus Polenz
+57.30.01.04  Wirtschaftsförderung > Öffentliche Toiletten
+57.30.01.05  Wirtschaftsförderung > Verpachtete Garagen und Garagenhöfe
+57.30.01.06  Wirtschaftsförderung > Verpachtete Werbeflächen
+57.30.01.07  Wirtschaftsförderung > Wochenmarkt, sonstige Markteinrichtungen
+57.30.01.08  Wirtschaftsförderung > Festzelt, Bühne, sonst. Einrichtungen und Anlagen (st.pfl.)
+57.30.02.07  Wirtschaftsförderung > Weihnachtsmärkte, andere Markteinrichtungen
+57.50.01.01  Wirtschaftsförderung > Tourismusförderung/Spendenbänke
+61.10.01.01  Finanzwirtschaft, Steuern > Steuern, allgemeine Zuweisungen, allgemeine Umlagen
+61.30.01.01  Finanzwirtschaft, Steuern > Abwicklung der Vorjahre
+71.20.01.00  Brand- und Katastrophenschutz > Katastrophenschutz, Hochwasser
+81.01.00.00  Personalwirtschaft > Lohnverrechnung

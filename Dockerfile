@@ -16,6 +16,8 @@ COPY docmeta_schema.json /etc/open_taki/docmeta_schema.json
 COPY docmeta_prompt.txt /etc/open_taki/docmeta_prompt.txt
 COPY docmeta_rescue_prompt.txt /etc/open_taki/docmeta_rescue_prompt.txt
 COPY field_rules.json /etc/open_taki/field_rules.json
+COPY store_detect_prompt.txt /etc/open_taki/store_detect_prompt.txt
+COPY aktenplan.txt /etc/open_taki/aktenplan.txt
 EXPOSE 9998
 ENTRYPOINT ["open_taki"]
 CMD ["/etc/open_taki/config.yaml"]

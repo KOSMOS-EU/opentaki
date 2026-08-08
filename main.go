@@ -87,13 +87,17 @@ type DocMetaConfig struct {
 	SchemaFile       string   `yaml:"schema_file"`        // path to guided_json schema (default: /etc/open_taki/docmeta_schema.json)
 	PromptFile       string   `yaml:"prompt_file"`        // path to vision prompt (default: /etc/open_taki/docmeta_prompt.txt)
 	RescuePromptFile string   `yaml:"rescue_prompt_file"` // path to rescue prompt (default: /etc/open_taki/docmeta_rescue_prompt.txt)
-	FieldRulesFile   string   `yaml:"field_rules_file"`   // path to field rules (default: /etc/open_taki/field_rules.json)
+	FieldRulesFile      string   `yaml:"field_rules_file"`        // path to field rules (default: /etc/open_taki/field_rules.json)
+	StoreDetectPrompt   string   `yaml:"store_detect_prompt"`     // path to store detection prompt (default: /etc/open_taki/store_detect_prompt.txt)
+	StoreDetectPlanFile string   `yaml:"store_detect_plan_file"`  // path to aktenplan candidates (default: /etc/open_taki/aktenplan.txt)
 
 	// Loaded at startup (not from YAML)
-	schema       json.RawMessage
-	prompt       string
-	rescuePrompt string
-	fieldRules   map[string]map[string]string // doc.type → field → template
+	schema           json.RawMessage
+	prompt           string
+	rescuePrompt     string
+	fieldRules       map[string]map[string]string // doc.type → field → template
+	storeDetectPrompt string
+	aktenplan         string
 }
 
 // ── Routing ──────────────────────────────────────────────────
@@ -358,6 +362,28 @@ func (cfg *Config) loadDocMetaFiles(configDir string) {
 	} else {
 		log.Printf("  DocMeta field_rules: not found (%s), skipping", cfg.DocMeta.FieldRulesFile)
 	}
+
+	// Load store detection prompt
+	if cfg.DocMeta.StoreDetectPrompt == "" {
+		cfg.DocMeta.StoreDetectPrompt = filepath.Join(configDir, "store_detect_prompt.txt")
+	}
+	if data, err := os.ReadFile(cfg.DocMeta.StoreDetectPrompt); err == nil {
+		cfg.DocMeta.storeDetectPrompt = strings.TrimSpace(string(data))
+		log.Printf("  DocMeta store_detect: %s (%d chars)", cfg.DocMeta.StoreDetectPrompt, len(cfg.DocMeta.storeDetectPrompt))
+	} else {
+		log.Printf("  DocMeta store_detect: not found (%s), store detection disabled", cfg.DocMeta.StoreDetectPrompt)
+	}
+
+	// Load aktenplan candidates
+	if cfg.DocMeta.StoreDetectPlanFile == "" {
+		cfg.DocMeta.StoreDetectPlanFile = filepath.Join(configDir, "aktenplan.txt")
+	}
+	if data, err := os.ReadFile(cfg.DocMeta.StoreDetectPlanFile); err == nil {
+		cfg.DocMeta.aktenplan = strings.TrimSpace(string(data))
+		log.Printf("  DocMeta aktenplan: %s (%d lines)", cfg.DocMeta.StoreDetectPlanFile, strings.Count(cfg.DocMeta.aktenplan, "\n")+1)
+	} else {
+		log.Printf("  DocMeta aktenplan: not found (%s), store detection disabled", cfg.DocMeta.StoreDetectPlanFile)
+	}
 }
 
 // Built-in defaults (used when external files are not found)
@@ -511,6 +537,11 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 				log.Printf("  ref=%s docmeta: type=%s subject=%s",
 					sourceRef, dmGetStr(*resp.DocMeta, "doc.type"), dmGetStr(*resp.DocMeta, "doc.subject"))
 			}
+		}
+
+		// Store detection — AZ classification (AFTER docmeta, uses its results)
+		if routedFeatures["store_detect"] && resp.DocMeta != nil && s.cfg.DocMeta.storeDetectPrompt != "" && s.cfg.DocMeta.aktenplan != "" {
+			s.storeDetect(&resp, text)
 		}
 
 		// LLM enrichment
@@ -856,6 +887,81 @@ func (s *Server) docMetaTextPass(fulltext string) (*takiDocMeta, bool) {
 		return nil, true // LLM answered but unparsable
 	}
 	return &dm, true
+}
+
+// storeDetect runs a second LLM pass to classify a document into an Aktenplan code.
+// Uses docmeta results from stage 1 + OCR text + aktenplan candidates.
+func (s *Server) storeDetect(resp *takiResponse, fulltext string) {
+	dm := resp.DocMeta
+	if dm == nil {
+		return
+	}
+
+	// Build document summary from stage 1 metadata
+	docInfo := fmt.Sprintf("- Typ: %s\n- Betreff: %s\n- Datum: %s\n",
+		dmGetStr(*dm, "doc.type"),
+		dmGetStr(*dm, "doc.subject"),
+		dmGetStr(*dm, "doc.date"))
+	if ref := dmGetStr(*dm, "doc.reference"); ref != "" {
+		docInfo += fmt.Sprintf("- Bezugszeichen: %s\n", ref)
+	}
+	if company := dmGetStr(*dm, "sender.company"); company != "" {
+		docInfo += fmt.Sprintf("- Absender: %s", company)
+		if city := dmGetStr(*dm, "sender.city"); city != "" {
+			docInfo += ", " + city
+		}
+		docInfo += "\n"
+	} else if name := dmGetStr(*dm, "sender.family_name"); name != "" {
+		docInfo += fmt.Sprintf("- Absender: %s, %s\n", name, dmGetStr(*dm, "sender.given_name"))
+	}
+
+	// Truncate fulltext for first page context
+	pageText := fulltext
+	if len(pageText) > 4000 {
+		pageText = pageText[:4000]
+	}
+
+	// Assemble prompt: static instructions + document + first page + candidates
+	prompt := fmt.Sprintf("%s\n\nDokument:\n%s\nErste Seite:\n%s\n\n----\n\nKandidaten:\n%s",
+		s.cfg.DocMeta.storeDetectPrompt,
+		docInfo,
+		pageText,
+		s.cfg.DocMeta.aktenplan)
+
+	log.Printf("store_detect: starting for %s (type=%s subject=%s)",
+		dmGetStr(*dm, "doc.title"), dmGetStr(*dm, "doc.type"), dmGetStr(*dm, "doc.subject"))
+
+	result := s.llmChat(prompt)
+	if result == "" {
+		log.Printf("store_detect: LLM returned empty")
+		return
+	}
+
+	// Parse JSON response
+	var storeResult struct {
+		Store            string `json:"doc.store"`
+		StoreReason      string `json:"doc.storeReason"`
+		StoreAlternative string `json:"doc.store_alternative"`
+		MehrTextNoetig   bool   `json:"mehr_text_noetig"`
+	}
+	if err := json.Unmarshal([]byte(result), &storeResult); err != nil {
+		log.Printf("store_detect: JSON parse error: %v (raw: %s)", err, result[:min(len(result), 200)])
+		return
+	}
+
+	log.Printf("store_detect: result store=%s reason=%q alt=%s mehr=%v",
+		storeResult.Store, storeResult.StoreReason, storeResult.StoreAlternative, storeResult.MehrTextNoetig)
+
+	// Merge into docmeta
+	if storeResult.Store != "" && storeResult.Store != "unklar" {
+		dmSet(*dm, "doc.store", storeResult.Store)
+	}
+	if storeResult.StoreReason != "" {
+		dmSet(*dm, "doc.storeReason", storeResult.StoreReason)
+	}
+	if storeResult.StoreAlternative != "" {
+		dmSet(*dm, "doc.store_alternative", storeResult.StoreAlternative)
+	}
 }
 
 // extractDocMeta extracts structured metadata from a document.
