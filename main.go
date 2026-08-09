@@ -179,6 +179,67 @@ type Server struct {
 	// In-flight LLM request tracking
 	llmMu        sync.Mutex
 	llmStartTimes []time.Time // start time of each in-flight request
+
+	// Debug work directory (TAKI_WORK_DIR env). When set, per-request
+	// directories are created with all intermediate artifacts.
+	workDir string // empty = disabled
+}
+
+// traceCtx carries per-request debug context through the pipeline.
+type traceCtx struct {
+	id      string // trace ID (from X-Taki-Trace-Id header or generated)
+	ref     string // source ref (from X-Taki-Source-Ref)
+	dir     string // work directory for this request (empty if debug disabled)
+	llmSeq  int    // LLM call sequence counter
+	enabled bool   // whether debug output is active
+}
+
+func newTraceCtx(s *Server, traceID, sourceRef string) *traceCtx {
+	tc := &traceCtx{id: traceID, ref: sourceRef}
+	if s.workDir == "" {
+		return tc
+	}
+	tc.enabled = true
+	if tc.id == "" {
+		tc.id = fmt.Sprintf("%d", time.Now().UnixMilli())
+	}
+	tc.dir = filepath.Join(s.workDir, tc.id)
+	os.MkdirAll(tc.dir, 0755)
+	os.MkdirAll(filepath.Join(tc.dir, "llm"), 0755)
+	// Write metadata
+	meta := map[string]string{"trace_id": tc.id, "source_ref": sourceRef, "timestamp": time.Now().Format(time.RFC3339)}
+	if data, err := json.MarshalIndent(meta, "", "  "); err == nil {
+		os.WriteFile(filepath.Join(tc.dir, "trace.json"), data, 0644)
+	}
+	return tc
+}
+
+func (tc *traceCtx) writeFile(name string, data []byte) {
+	if !tc.enabled || tc.dir == "" {
+		return
+	}
+	os.WriteFile(filepath.Join(tc.dir, name), data, 0644)
+}
+
+func (tc *traceCtx) writeJSON(name string, v interface{}) {
+	if !tc.enabled {
+		return
+	}
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return
+	}
+	tc.writeFile(name, data)
+}
+
+func (tc *traceCtx) logLLM(label string, request, response interface{}) {
+	if !tc.enabled {
+		return
+	}
+	tc.llmSeq++
+	prefix := fmt.Sprintf("llm/%02d_%s", tc.llmSeq, label)
+	tc.writeJSON(prefix+"_request.json", request)
+	tc.writeJSON(prefix+"_response.json", response)
 }
 
 // OpenAI chat completion request/response
@@ -442,10 +503,16 @@ func NewServer(cfg Config) *Server {
 	if maxConcurrent < 1 {
 		maxConcurrent = 8
 	}
+	workDir := os.Getenv("TAKI_WORK_DIR")
+	if workDir != "" {
+		os.MkdirAll(workDir, 0755)
+		log.Printf("  WorkDebug: %s (per-request artifacts)", workDir)
+	}
 	return &Server{
-		cfg:    cfg,
-		client: client,
-		llmSem: make(chan struct{}, maxConcurrent),
+		cfg:     cfg,
+		client:  client,
+		llmSem:  make(chan struct{}, maxConcurrent),
+		workDir: workDir,
 	}
 }
 
@@ -493,9 +560,27 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 	features := parseFeatures(r.Header.Get("X-Taki-Features"))
 
 	sourceRef := r.Header.Get("X-Taki-Source-Ref")
+	traceID := r.Header.Get("X-Taki-Trace-Id")
+
+	// Per-request debug context (active if TAKI_WORK_DIR set or X-Taki-Debug header)
+	tc := newTraceCtx(s, traceID, sourceRef)
+	if r.Header.Get("X-Taki-Debug") == "true" && s.workDir != "" {
+		tc.enabled = true
+	}
+	tc.writeFile("input.bin", body)
+	tc.writeJSON("request_headers.json", map[string]string{
+		"Content-Type":       ct,
+		"X-Taki-Protocol":   protocol,
+		"X-Taki-Features":   r.Header.Get("X-Taki-Features"),
+		"X-Taki-Source-Ref": sourceRef,
+		"X-Taki-Trace-Id":  traceID,
+		"X-Taki-Space-Type": r.Header.Get("X-Taki-Space-Type"),
+		"input_size":        fmt.Sprintf("%d", len(body)),
+	})
 
 	text, method := s.extract(body, ct)
-	log.Printf("/rmeta/text: %d chars via %s (%s) proto=%s ref=%s", len(text), method, ct, protocol, sourceRef)
+	log.Printf("/rmeta/text: %d chars via %s (%s) proto=%s ref=%s trace=%s", len(text), method, ct, protocol, sourceRef, tc.id)
+	tc.writeFile("extracted.txt", []byte(text))
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -534,19 +619,29 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 		if routedFeatures["docmeta"] && s.cfg.DocMeta.Enabled {
 			resp.DocMeta = s.extractDocMeta(body, ct, text)
 			if resp.DocMeta != nil {
-				log.Printf("  ref=%s docmeta: type=%s subject=%s",
-					sourceRef, dmGetStr(*resp.DocMeta, "doc.type"), dmGetStr(*resp.DocMeta, "doc.subject"))
+				log.Printf("  ref=%s trace=%s docmeta: type=%s subject=%s",
+					sourceRef, tc.id, dmGetStr(*resp.DocMeta, "doc.type"), dmGetStr(*resp.DocMeta, "doc.subject"))
 			}
+			tc.writeJSON("docmeta.json", resp.DocMeta)
 		}
 
 		// Store detection — AZ classification (AFTER docmeta, uses its results)
 		if routedFeatures["store_detect"] && resp.DocMeta != nil && s.cfg.DocMeta.storeDetectPrompt != "" && s.cfg.DocMeta.aktenplan != "" {
 			s.storeDetect(&resp, text)
+			tc.writeJSON("store_detect.json", map[string]interface{}{
+				"doc.store":       dmGetStr(*resp.DocMeta, "doc.store"),
+				"doc.storeReason": dmGetStr(*resp.DocMeta, "doc.storeReason"),
+			})
 		}
 
 		// LLM enrichment
 		if routedFeatures["meta"] || routedFeatures["entities"] || routedFeatures["summary"] {
 			s.enrichWithLLM(&resp, text, ct, routedFeatures)
+			tc.writeJSON("enrichment.json", map[string]interface{}{
+				"meta":     resp.Meta,
+				"entities": resp.Entities,
+				"summary":  resp.Summary,
+			})
 		}
 
 		if routedFeatures["transcription"] && (strings.HasPrefix(ct, "audio/") || strings.HasPrefix(ct, "video/")) {
@@ -555,11 +650,18 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 
 		if routedFeatures["embedding"] {
 			resp.Embed = s.getEmbedding(text)
+			tc.writeJSON("embedding.json", map[string]interface{}{
+				"input_len":  len(text),
+				"dims":       len(resp.Embed),
+				"has_vector": len(resp.Embed) > 0,
+			})
 		}
 
-		log.Printf("  routing: content→%s bleve=%v space=%s features=%v",
-			contentTarget, bleveContent, spaceType, routedFeatures)
+		log.Printf("  routing: content→%s bleve=%v space=%s features=%v trace=%s",
+			contentTarget, bleveContent, spaceType, routedFeatures, tc.id)
 
+		tc.writeJSON("response.json", resp)
+		tc.writeJSON("routing.json", resp.Routing)
 		json.NewEncoder(w).Encode([]takiResponse{resp})
 	} else {
 		// Classic Tika MetaRecursive response
@@ -2252,6 +2354,10 @@ func (s *Server) llmQueueStats() (int, time.Duration) {
 }
 
 func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) string {
+	return s.llmCompleteOptsTrace(messages, rf, nil, "")
+}
+
+func (s *Server) llmCompleteOptsTrace(messages []chatMessage, rf *responseFormat, tc *traceCtx, label string) string {
 	s.llmSem <- struct{}{}        // acquire slot
 	defer func() { <-s.llmSem }() // release slot
 	t := s.llmTrackStart()
@@ -2267,6 +2373,11 @@ func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) str
 
 	jsonData, _ := json.Marshal(reqBody)
 	url := strings.TrimRight(s.cfg.LLM.APIBase, "/") + "/chat/completions"
+
+	// Debug: log LLM request
+	if tc != nil && tc.enabled {
+		tc.logLLM(label, reqBody, nil)
+	}
 
 	const maxRetries = 3
 	backoff := [3]time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
@@ -2297,7 +2408,13 @@ func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) str
 		}
 
 		if len(chatResp.Choices) > 0 {
-			return stripThinkTags(chatResp.Choices[0].Message.Content)
+			result := stripThinkTags(chatResp.Choices[0].Message.Content)
+			// Debug: log LLM response (overwrite the nil response from above)
+			if tc != nil && tc.enabled {
+				tc.writeJSON(fmt.Sprintf("llm/%02d_%s_response.json", tc.llmSeq, label),
+					map[string]interface{}{"status": resp.StatusCode, "content": result})
+			}
+			return result
 		}
 
 		// Server error or rate limit — retry with backoff
