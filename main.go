@@ -171,6 +171,14 @@ func (r *BleveRule) matches(ct, spaceType string) bool {
 	return mimeOK && spaceOK
 }
 
+type methodStat struct {
+	Count      int64         `json:"count"`
+	TotalMs    int64         `json:"total_ms"`
+	AvgMs      int64         `json:"avg_ms"`
+	MaxMs      int64         `json:"max_ms"`
+	TotalChars int64         `json:"total_chars"`
+}
+
 type Server struct {
 	cfg    Config
 	client *http.Client
@@ -179,6 +187,10 @@ type Server struct {
 	// In-flight LLM request tracking
 	llmMu        sync.Mutex
 	llmStartTimes []time.Time // start time of each in-flight request
+
+	// Per-method stats
+	statsMu    sync.Mutex
+	methodStats map[string]*methodStat
 
 	// Debug work directory (TAKI_WORK_DIR env). When set, per-request
 	// directories are created with all intermediate artifacts.
@@ -509,7 +521,8 @@ func NewServer(cfg Config) *Server {
 		log.Printf("  WorkDebug: %s (per-request artifacts)", workDir)
 	}
 	return &Server{
-		cfg:     cfg,
+		cfg:         cfg,
+		methodStats: make(map[string]*methodStat),
 		client:  client,
 		llmSem:  make(chan struct{}, maxConcurrent),
 		workDir: workDir,
@@ -555,6 +568,7 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	requestStart := time.Now()
 	ct := r.Header.Get("Content-Type")
 	protocol := r.Header.Get("X-Taki-Protocol")
 	features := parseFeatures(r.Header.Get("X-Taki-Features"))
@@ -578,8 +592,11 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 		"input_size":        fmt.Sprintf("%d", len(body)),
 	})
 
+	extractStart := time.Now()
 	text, method := s.extract(body, ct)
-	log.Printf("/rmeta/text: %d chars via %s (%s) proto=%s ref=%s trace=%s", len(text), method, ct, protocol, sourceRef, tc.id)
+	extractDur := time.Since(extractStart)
+	log.Printf("/rmeta/text: %d chars via %s (%s) extract=%v proto=%s ref=%s trace=%s",
+		len(text), method, ct, extractDur, protocol, sourceRef, tc.id)
 	tc.writeFile("extracted.txt", []byte(text))
 
 	w.Header().Set("Content-Type", "application/json")
@@ -659,6 +676,23 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("  routing: content→%s bleve=%v space=%s features=%v trace=%s",
 			contentTarget, bleveContent, spaceType, routedFeatures, tc.id)
+
+		elapsed := time.Since(requestStart)
+		docType := ""
+		if resp.DocMeta != nil {
+			if dt, ok := (*resp.DocMeta)["doc"]; ok {
+				if dm, ok := dt.(map[string]interface{}); ok {
+					if t, ok := dm["type"].(string); ok {
+						docType = t
+					}
+				}
+			}
+		}
+		log.Printf("  DONE: %v method=%s chars=%d type=%s embed=%d trace=%s",
+			elapsed, method, len(text), docType, len(resp.Embed), tc.id)
+
+		// record stats
+		s.recordStat(method, elapsed, len(text))
 
 		tc.writeJSON("response.json", resp)
 		tc.writeJSON("routing.json", resp.Routing)
@@ -2852,6 +2886,31 @@ func appendUnique(slice []string, items ...string) []string {
 	return slice
 }
 
+func (s *Server) recordStat(method string, elapsed time.Duration, chars int) {
+	ms := elapsed.Milliseconds()
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	st, ok := s.methodStats[method]
+	if !ok {
+		st = &methodStat{}
+		s.methodStats[method] = st
+	}
+	st.Count++
+	st.TotalMs += ms
+	st.TotalChars += int64(chars)
+	st.AvgMs = st.TotalMs / st.Count
+	if ms > st.MaxMs {
+		st.MaxMs = ms
+	}
+}
+
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.methodStats)
+}
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "config file path")
 	flag.Parse()
@@ -2884,6 +2943,7 @@ func main() {
 	http.HandleFunc("/embed", srv.handleEmbed)
 	http.HandleFunc("/schema", srv.handleSchema)
 	http.HandleFunc("/test", srv.handleTest)
+	http.HandleFunc("/stats", srv.handleStats)
 	http.HandleFunc("/tika", srv.handleHealth)
 	http.HandleFunc("/version", srv.handleVersion)
 	http.HandleFunc("/", srv.handleHealth)
