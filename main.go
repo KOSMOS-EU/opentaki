@@ -196,6 +196,10 @@ type Server struct {
 	// Debug work directory (TAKI_WORK_DIR env). When set, per-request
 	// directories are created with all intermediate artifacts.
 	workDir string // empty = disabled
+
+	// PDF OCR enrichment (TAKI_OCR_PDF env). When set, /taki/enrich-pdf
+	// adds invisible text layers to scanned PDF pages via grounded VLM OCR.
+	ocrPDF bool
 }
 
 // traceCtx carries per-request debug context through the pipeline.
@@ -521,12 +525,17 @@ func NewServer(cfg Config) *Server {
 		os.MkdirAll(workDir, 0755)
 		log.Printf("  WorkDebug: %s (per-request artifacts)", workDir)
 	}
+	ocrPDF := os.Getenv("TAKI_OCR_PDF") != ""
+	if ocrPDF {
+		log.Printf("  OCR-PDF enrichment: enabled")
+	}
 	return &Server{
 		cfg:         cfg,
 		methodStats: make(map[string]*methodStat),
 		client:  client,
 		llmSem:  make(chan struct{}, maxConcurrent),
 		workDir: workDir,
+		ocrPDF:  ocrPDF,
 	}
 }
 
@@ -1810,6 +1819,203 @@ func (s *Server) llmOCR(data []byte) string {
 	return strings.Join(allText, "\n\n")
 }
 
+// ── PDF OCR enrichment (TAKI_OCR_PDF) ────────────────────────
+
+// ocrRegion is a text region with bounding box from grounded VLM OCR.
+type ocrRegion struct {
+	BboxD2 [4]int  `json:"bbox_2d"`
+	Text   string  `json:"text"`
+}
+
+const groundedOCRPrompt = `Detect all text regions on this scanned document page. Return a JSON array of objects, each with bbox_2d (pixel coordinates [x1,y1,x2,y2]) and text. Return ONLY the JSON array, no explanation, no markdown fences.`
+
+// groundedOCR sends a page image to the VLM and returns positioned text regions.
+func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
+	raw := s.llmDescribe(imagePath, groundedOCRPrompt)
+	if raw == "" {
+		return nil, fmt.Errorf("empty LLM response")
+	}
+	// Strip markdown fences if present
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "```") {
+		lines := strings.Split(raw, "\n")
+		if len(lines) > 2 {
+			raw = strings.Join(lines[1:len(lines)-1], "\n")
+		}
+	}
+
+	var regions []ocrRegion
+	if err := json.Unmarshal([]byte(raw), &regions); err != nil {
+		return nil, fmt.Errorf("JSON parse error: %v (raw: %.200s)", err, raw)
+	}
+	return regions, nil
+}
+
+// enrichPDF takes a PDF, finds pages without text, runs grounded OCR on them,
+// and embeds invisible text layers via the Python helper.
+func (s *Server) enrichPDF(data []byte) ([]byte, error) {
+	tmp, err := os.CreateTemp("", "taki-enrich-*.pdf")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Write(data)
+	tmp.Close()
+
+	pageCount := s.pdfPageCount(tmp.Name())
+	if pageCount < 1 {
+		return nil, fmt.Errorf("cannot determine page count")
+	}
+
+	// Find weak pages
+	var weakPages []int
+	for i := 0; i < pageCount; i++ {
+		t := s.pdftextPage(tmp.Name(), i+1)
+		if len(t) < s.cfg.Fallback.MinCharsPerPage {
+			weakPages = append(weakPages, i)
+		}
+	}
+
+	if len(weakPages) == 0 {
+		log.Printf("[enrichPDF] all %d pages have text, nothing to enrich", pageCount)
+		return data, nil // already good
+	}
+
+	log.Printf("[enrichPDF] %d/%d pages need OCR", len(weakPages), pageCount)
+
+	// Render weak pages to PNG and run grounded OCR
+	tmpDir, err := os.MkdirTemp("", "taki-enrich-ocr-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	type pageResult struct {
+		pageNum int // 1-based
+		regions []ocrRegion
+	}
+
+	results := make(chan pageResult, len(weakPages))
+	var wg sync.WaitGroup
+
+	for _, pi := range weakPages {
+		if pi >= s.cfg.PDF.MaxPages {
+			continue
+		}
+		wg.Add(1)
+		go func(pageIdx int) {
+			defer wg.Done()
+			pg := fmt.Sprintf("%d", pageIdx+1)
+			prefix := filepath.Join(tmpDir, fmt.Sprintf("page-%03d", pageIdx))
+			cmd := exec.Command("pdftoppm", "-png", "-r",
+				fmt.Sprintf("%d", s.cfg.PDF.DPI),
+				"-f", pg, "-l", pg, tmp.Name(), prefix)
+			if err := cmd.Run(); err != nil {
+				log.Printf("[enrichPDF] pdftoppm page %d failed: %v", pageIdx+1, err)
+				return
+			}
+			rendered, _ := filepath.Glob(prefix + "*.png")
+			if len(rendered) == 0 {
+				return
+			}
+			regions, err := s.groundedOCR(rendered[0])
+			if err != nil {
+				log.Printf("[enrichPDF] grounded OCR page %d failed: %v", pageIdx+1, err)
+				return
+			}
+			if len(regions) > 0 {
+				results <- pageResult{pageNum: pageIdx + 1, regions: regions}
+			}
+		}(pi)
+	}
+	wg.Wait()
+	close(results)
+
+	// Build regions JSON for the Python helper
+	pagesMap := make(map[string][]ocrRegion)
+	for pr := range results {
+		pagesMap[fmt.Sprintf("%d", pr.pageNum)] = pr.regions
+	}
+
+	if len(pagesMap) == 0 {
+		log.Printf("[enrichPDF] no regions detected on any page")
+		return data, nil
+	}
+
+	regionsData := struct {
+		DPI   int                      `json:"dpi"`
+		Pages map[string][]ocrRegion   `json:"pages"`
+	}{
+		DPI:   s.cfg.PDF.DPI,
+		Pages: pagesMap,
+	}
+	regionsJSON, err := json.Marshal(regionsData)
+	if err != nil {
+		return nil, err
+	}
+	regionsFile := filepath.Join(tmpDir, "regions.json")
+	if err := os.WriteFile(regionsFile, regionsJSON, 0644); err != nil {
+		return nil, err
+	}
+
+	// Call Python helper
+	outPath := filepath.Join(tmpDir, "enriched.pdf")
+	cmd := exec.Command("python3", "/usr/local/bin/taki-embed-ocr.py",
+		tmp.Name(), outPath, regionsFile)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("taki-embed-ocr.py failed: %v: %s", err, stderr.String())
+	}
+
+	enriched, err := os.ReadFile(outPath)
+	if err != nil {
+		return nil, err
+	}
+
+	totalRegions := 0
+	for _, r := range pagesMap {
+		totalRegions += len(r)
+	}
+	log.Printf("[enrichPDF] enriched %d pages, %d text regions", len(pagesMap), totalRegions)
+	return enriched, nil
+}
+
+func (s *Server) handleEnrichPDF(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		http.Error(w, "PUT or POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.ocrPDF {
+		http.Error(w, "TAKI_OCR_PDF not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if len(body) < 5 || string(body[:5]) != "%PDF-" {
+		http.Error(w, "not a PDF", http.StatusBadRequest)
+		return
+	}
+
+	enriched, err := s.enrichPDF(body)
+	if err != nil {
+		log.Printf("[enrichPDF] error: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(enriched)))
+	w.Header().Set("X-Taki-Method", "enrich-pdf")
+	w.Write(enriched)
+}
+
 // ── Image extraction (LLM Vision) ───────────────────────────
 
 func (s *Server) extractImage(data []byte, ct string) (string, string) {
@@ -3046,6 +3252,7 @@ func main() {
 
 	http.HandleFunc("/tika/text", srv.handleTikaText)
 	http.HandleFunc("/rmeta/text", srv.handleRmetaText)
+	http.HandleFunc("/taki/enrich-pdf", srv.handleEnrichPDF)
 	http.HandleFunc("/embed", srv.handleEmbed)
 	http.HandleFunc("/schema", srv.handleSchema)
 	http.HandleFunc("/test", srv.handleTest)
