@@ -50,36 +50,24 @@ def _draw_invisible_text(page, nx0, ny0, nx1, ny1, text, page_width, page_height
     descender = getattr(font, "descender", -0.299)
     extent_em = max(0.01, ascender - descender)
 
-    # Multi-line splitting: if bbox is tall relative to page (>7%)
-    # and has multi-line aspect ratio, split into sub-lines
-    norm_height = ny1 - ny0
-    aspect = box_height / max(0.01, box_width)
-    words = text.split()
-    if norm_height > 0.07 and aspect > 0.20 and len(words) >= 2:
-        n_lines = 3 if norm_height > 0.13 else 2
-        n_lines = min(n_lines, len(words))
-        slice_h = (ny1 - ny0) / n_lines
-        for i in range(n_lines):
-            start = round(i * len(words) / n_lines)
-            end = round((i + 1) * len(words) / n_lines)
-            line_text = " ".join(words[start:end])
-            if line_text:
-                _draw_invisible_text(
-                    page,
-                    nx0, ny0 + i * slice_h,
-                    nx1, ny0 + (i + 1) * slice_h,
-                    line_text, page_width, page_height,
-                )
+    # Primary: size font so natural text width matches box width.
+    # This gives correct selection width — the key constraint.
+    natural_at_1pt = font.text_length(text, fontsize=1.0)
+    if natural_at_1pt <= 0:
         return
+    fontsize_by_width = box_width / natural_at_1pt
 
-    fontsize = max(3.0, min(72.0, box_height / extent_em))
+    # Secondary: cap fontsize by box height so text doesn't bleed vertically.
+    fontsize_by_height = box_height / extent_em
+    fontsize = max(3.0, min(fontsize_by_width, fontsize_by_height))
 
+    # With width-fitted fontsize, scale_x should be ~1.0 (no stretching needed).
     natural_width = font.text_length(text, fontsize=fontsize)
     if natural_width <= 0:
         return
-
-    target_width = max(1.0, box_width * 0.98)
-    scale_x = target_width / natural_width
+    scale_x = (box_width * 0.98) / natural_width
+    # Clamp: never stretch beyond 1.3x to avoid selection overflow
+    scale_x = min(scale_x, 1.3)
 
     baseline = fitz.Point(pdf_rect.x0, pdf_rect.y1 + descender * fontsize)
     morph = (baseline, fitz.Matrix(scale_x, 1.0))
