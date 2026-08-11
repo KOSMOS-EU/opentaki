@@ -1832,7 +1832,7 @@ const groundedOCRPrompt = `Detect all text regions on this scanned document page
 // groundedOCR sends a page image to the VLM and returns positioned text regions.
 // Retries once on JSON parse failure (VLM hallucination).
 func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		raw := s.llmDescribe(imagePath, groundedOCRPrompt)
 		if raw == "" {
 			if attempt == 0 {
