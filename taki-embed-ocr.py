@@ -66,8 +66,8 @@ def _draw_invisible_text(page, nx0, ny0, nx1, ny1, text, page_width, page_height
     if natural_width <= 0:
         return
     scale_x = (box_width * 0.98) / natural_width
-    # Clamp: never stretch beyond 1.3x to avoid selection overflow
-    scale_x = min(scale_x, 1.3)
+    # Clamp: limit stretch to avoid selection overflow on short text
+    scale_x = min(scale_x, 2.5)
 
     # Top-align: place glyph tops at bbox top (y0), not bottoms at bbox bottom
     baseline = fitz.Point(pdf_rect.x0, pdf_rect.y0 + ascender * fontsize)
