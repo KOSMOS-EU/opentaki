@@ -69,7 +69,8 @@ def _draw_invisible_text(page, nx0, ny0, nx1, ny1, text, page_width, page_height
     # Clamp: never stretch beyond 1.3x to avoid selection overflow
     scale_x = min(scale_x, 1.3)
 
-    baseline = fitz.Point(pdf_rect.x0, pdf_rect.y1 + descender * fontsize)
+    # Top-align: place glyph tops at bbox top (y0), not bottoms at bbox bottom
+    baseline = fitz.Point(pdf_rect.x0, pdf_rect.y0 + ascender * fontsize)
     morph = (baseline, fitz.Matrix(scale_x, 1.0))
 
     page.insert_text(
@@ -106,16 +107,11 @@ def embed_ocr(input_path: str, output_path: str, regions_path: str) -> None:
         page_width = page.rect.width
         page_height = page.rect.height
 
-        # Get actual image dimensions for precise coordinate conversion
+        # Get regions from page data
         if isinstance(page_data, dict):
             regions = page_data.get("regions", [])
-            img_w = page_data.get("image_width", page_width * dpi / 72.0)
-            img_h = page_data.get("image_height", page_height * dpi / 72.0)
         else:
-            # Legacy format: page_data is a list of regions
             regions = page_data
-            img_w = page_width * dpi / 72.0
-            img_h = page_height * dpi / 72.0
 
         for region in regions:
             bbox = region.get("bbox_2d", region.get("bbox"))
@@ -123,11 +119,11 @@ def embed_ocr(input_path: str, output_path: str, regions_path: str) -> None:
             if not bbox or not text:
                 continue
 
-            # Normalize to 0-1 using actual image dimensions
-            nx0 = bbox[0] / img_w
-            ny0 = bbox[1] / img_h
-            nx1 = bbox[2] / img_w
-            ny1 = bbox[3] / img_h
+            # Qwen-VL returns bbox_2d in [0, 999] range (normalized to 1000)
+            nx0 = bbox[0] / 1000.0
+            ny0 = bbox[1] / 1000.0
+            nx1 = bbox[2] / 1000.0
+            ny1 = bbox[3] / 1000.0
 
             # Clamp
             nx0 = max(0.0, min(1.0, nx0))
