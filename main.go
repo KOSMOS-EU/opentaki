@@ -1891,8 +1891,10 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 	defer os.RemoveAll(tmpDir)
 
 	type pageResult struct {
-		pageNum int // 1-based
-		regions []ocrRegion
+		pageNum    int // 1-based
+		regions    []ocrRegion
+		imgWidth   int
+		imgHeight  int
 	}
 
 	results := make(chan pageResult, len(weakPages))
@@ -1918,23 +1920,35 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 			if len(rendered) == 0 {
 				return
 			}
+			// Read actual image dimensions for precise coordinate mapping
+			imgW, imgH := pngDimensions(rendered[0])
 			regions, err := s.groundedOCR(rendered[0])
 			if err != nil {
 				log.Printf("[enrichPDF] grounded OCR page %d failed: %v", pageIdx+1, err)
 				return
 			}
 			if len(regions) > 0 {
-				results <- pageResult{pageNum: pageIdx + 1, regions: regions}
+				results <- pageResult{pageNum: pageIdx + 1, regions: regions,
+					imgWidth: imgW, imgHeight: imgH}
 			}
 		}(pi)
 	}
 	wg.Wait()
 	close(results)
 
-	// Build regions JSON for the Python helper
-	pagesMap := make(map[string][]ocrRegion)
+	// Build regions JSON for the Python helper (new format with image dimensions)
+	type pageEntry struct {
+		ImageWidth  int         `json:"image_width"`
+		ImageHeight int         `json:"image_height"`
+		Regions     []ocrRegion `json:"regions"`
+	}
+	pagesMap := make(map[string]pageEntry)
 	for pr := range results {
-		pagesMap[fmt.Sprintf("%d", pr.pageNum)] = pr.regions
+		pagesMap[fmt.Sprintf("%d", pr.pageNum)] = pageEntry{
+			ImageWidth:  pr.imgWidth,
+			ImageHeight: pr.imgHeight,
+			Regions:     pr.regions,
+		}
 	}
 
 	if len(pagesMap) == 0 {
@@ -1944,7 +1958,7 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 
 	regionsData := struct {
 		DPI   int                      `json:"dpi"`
-		Pages map[string][]ocrRegion   `json:"pages"`
+		Pages map[string]pageEntry     `json:"pages"`
 	}{
 		DPI:   s.cfg.PDF.DPI,
 		Pages: pagesMap,
@@ -1975,10 +1989,27 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 
 	totalRegions := 0
 	for _, r := range pagesMap {
-		totalRegions += len(r)
+		totalRegions += len(r.Regions)
 	}
 	log.Printf("[enrichPDF] enriched %d pages, %d text regions", len(pagesMap), totalRegions)
 	return enriched, nil
+}
+
+// pngDimensions reads width and height from a PNG file header.
+func pngDimensions(path string) (int, int) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0
+	}
+	defer f.Close()
+	// PNG IHDR: bytes 16-19 = width (big-endian), 20-23 = height
+	buf := make([]byte, 24)
+	if _, err := f.Read(buf); err != nil {
+		return 0, 0
+	}
+	w := int(buf[16])<<24 | int(buf[17])<<16 | int(buf[18])<<8 | int(buf[19])
+	h := int(buf[20])<<24 | int(buf[21])<<16 | int(buf[22])<<8 | int(buf[23])
+	return w, h
 }
 
 func (s *Server) handleEnrichPDF(w http.ResponseWriter, r *http.Request) {
