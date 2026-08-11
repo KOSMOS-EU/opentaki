@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1618,9 +1619,27 @@ func (s *Server) extract(body []byte, ct string) (string, string) {
 // ── PDF extraction ───────────────────────────────────────────
 
 func (s *Server) extractPDF(data []byte) (string, string) {
-	text := s.pdftotext(data)
-	if s.isGoodText(text, data) {
+	tmp, err := os.CreateTemp("", "taki-*.pdf")
+	if err != nil {
+		return "[extraction failed]", "error"
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Write(data)
+	tmp.Close()
+
+	pageCount := s.pdfPageCount(tmp.Name())
+
+	text := s.pdftextAll(tmp.Name())
+	if s.isGoodText(text, pageCount) {
 		return text, "pdftotext"
+	}
+	// Per-page check: some pages may have text (e.g. scanner OCR on page 1)
+	// while others are pure image scans. Only OCR the weak pages.
+	if pageCount >= 2 {
+		hybrid := s.hybridExtract(tmp.Name(), pageCount)
+		if hybrid != "" {
+			return hybrid, "pdftotext+llm_ocr"
+		}
 	}
 	llmText := s.llmOCR(data)
 	if llmText != "" {
@@ -1632,31 +1651,115 @@ func (s *Server) extractPDF(data []byte) (string, string) {
 	return "[extraction failed]", "error"
 }
 
-func (s *Server) pdftotext(data []byte) string {
-	tmp, err := os.CreateTemp("", "taki-*.pdf")
-	if err != nil {
-		return ""
+func (s *Server) pdfPageCount(path string) int {
+	cmd := exec.Command("pdfinfo", path)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Run()
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.HasPrefix(line, "Pages:") {
+			n, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Pages:")))
+			return n
+		}
 	}
-	defer os.Remove(tmp.Name())
-	tmp.Write(data)
-	tmp.Close()
+	return 1
+}
 
-	cmd := exec.Command("pdftotext", "-layout", tmp.Name(), "-")
+func (s *Server) pdftextAll(path string) string {
+	cmd := exec.Command("pdftotext", "-layout", path, "-")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Run()
 	return strings.TrimSpace(out.String())
 }
 
-func (s *Server) isGoodText(text string, pdfData []byte) bool {
+func (s *Server) pdftextPage(path string, page int) string {
+	pg := fmt.Sprintf("%d", page)
+	cmd := exec.Command("pdftotext", "-layout", "-f", pg, "-l", pg, path, "-")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Run()
+	return strings.TrimSpace(out.String())
+}
+
+func (s *Server) isGoodText(text string, pageCount int) bool {
 	if len(text) < s.cfg.Fallback.MinChars {
 		return false
 	}
-	pages := bytes.Count(pdfData, []byte("/Type /Page"))
-	if pages < 1 {
-		pages = 1
+	if pageCount < 1 {
+		pageCount = 1
 	}
-	return len(text)/pages >= s.cfg.Fallback.MinCharsPerPage
+	return len(text)/pageCount >= s.cfg.Fallback.MinCharsPerPage
+}
+
+// hybridExtract checks each page individually. Pages with enough text
+// keep their pdftotext result; pages below the threshold get LLM-OCR.
+func (s *Server) hybridExtract(pdfPath string, pageCount int) string {
+	pageTexts := make([]string, pageCount)
+	var weakPages []int
+	for i := 0; i < pageCount; i++ {
+		t := s.pdftextPage(pdfPath, i+1)
+		pageTexts[i] = t
+		if len(t) < s.cfg.Fallback.MinCharsPerPage {
+			weakPages = append(weakPages, i)
+		}
+	}
+
+	if len(weakPages) == 0 || len(weakPages) == pageCount {
+		return "" // all good or all weak — let caller handle
+	}
+
+	log.Printf("[extractPDF] hybrid: %d/%d pages need OCR", len(weakPages), pageCount)
+
+	tmpDir, err := os.MkdirTemp("", "taki-ocr-*")
+	if err != nil {
+		return ""
+	}
+	defer os.RemoveAll(tmpDir)
+
+	var wg sync.WaitGroup
+	ocrResults := make(map[int]string)
+	var mu sync.Mutex
+
+	for _, pi := range weakPages {
+		wg.Add(1)
+		go func(pageIdx int) {
+			defer wg.Done()
+			pg := fmt.Sprintf("%d", pageIdx+1)
+			prefix := filepath.Join(tmpDir, fmt.Sprintf("page-%03d", pageIdx))
+			cmd := exec.Command("pdftoppm", "-png", "-r",
+				fmt.Sprintf("%d", s.cfg.PDF.DPI),
+				"-f", pg, "-l", pg, pdfPath, prefix)
+			if err := cmd.Run(); err != nil {
+				return
+			}
+			rendered, _ := filepath.Glob(prefix + "*.png")
+			if len(rendered) == 0 {
+				return
+			}
+			text := s.llmDescribe(rendered[0],
+				"Extract all text from this scanned document page. "+
+					"Return the complete text content, preserving structure. "+
+					"If it's a form or contract, extract structured fields.")
+			mu.Lock()
+			ocrResults[pageIdx] = text
+			mu.Unlock()
+		}(pi)
+	}
+	wg.Wait()
+
+	var parts []string
+	for i := 0; i < pageCount; i++ {
+		if ocr, ok := ocrResults[i]; ok && ocr != "" {
+			parts = append(parts, ocr)
+		} else if pageTexts[i] != "" {
+			parts = append(parts, pageTexts[i])
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func (s *Server) llmOCR(data []byte) string {
@@ -1851,14 +1954,9 @@ func (s *Server) extractSpreadsheet(data []byte) (string, string) {
 func (s *Server) extractPresentation(data []byte) (string, string) {
 	// 1. Collabora → PDF → pdftotext
 	if pdfData, ok := s.convertViaCollaboraRaw(data, "pdf"); ok {
-		text := s.pdftotext(pdfData)
-		if text != "" {
-			return text, "collabora_pdf"
-		}
-		// Scan-slides: LLM OCR
-		llmText := s.llmOCR(pdfData)
-		if llmText != "" {
-			return llmText, "collabora_pdf_ocr"
+		text, method := s.extractPDF(pdfData)
+		if text != "" && text != "[extraction failed]" {
+			return text, "collabora_" + method
 		}
 	}
 	// 2. pandoc (PPTX only, limited)
