@@ -1168,6 +1168,14 @@ func (s *Server) extractDocMeta(body []byte, ct string, fulltext string) *takiDo
 	// Apply field rules (deterministic template overrides)
 	applyFieldRules(*dm, s.cfg.DocMeta.fieldRules)
 
+	// Sanitize doc.title — must not contain path separators (/ or \)
+	// as it is used as filename in WebDAV MOVE operations
+	if title := dmGetStr(*dm, "doc.title"); title != "" {
+		title = strings.ReplaceAll(title, "/", " - ")
+		title = strings.ReplaceAll(title, "\\", " - ")
+		dmSet(*dm, "doc.title", title)
+	}
+
 	if s.cfg.DocMeta.ModelVersion != "" {
 		(*dm)["model"] = s.cfg.DocMeta.ModelVersion
 	}
