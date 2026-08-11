@@ -1830,25 +1830,37 @@ type ocrRegion struct {
 const groundedOCRPrompt = `Detect all text regions on this scanned document page. Return a JSON array of objects, each with bbox_2d (pixel coordinates [x1,y1,x2,y2]) and text. Return ONLY the JSON array, no explanation, no markdown fences.`
 
 // groundedOCR sends a page image to the VLM and returns positioned text regions.
+// Retries once on JSON parse failure (VLM hallucination).
 func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
-	raw := s.llmDescribe(imagePath, groundedOCRPrompt)
-	if raw == "" {
-		return nil, fmt.Errorf("empty LLM response")
-	}
-	// Strip markdown fences if present
-	raw = strings.TrimSpace(raw)
-	if strings.HasPrefix(raw, "```") {
-		lines := strings.Split(raw, "\n")
-		if len(lines) > 2 {
-			raw = strings.Join(lines[1:len(lines)-1], "\n")
+	for attempt := 0; attempt < 2; attempt++ {
+		raw := s.llmDescribe(imagePath, groundedOCRPrompt)
+		if raw == "" {
+			if attempt == 0 {
+				log.Printf("[groundedOCR] empty response, retrying")
+				continue
+			}
+			return nil, fmt.Errorf("empty LLM response")
 		}
-	}
+		// Strip markdown fences if present
+		raw = strings.TrimSpace(raw)
+		if strings.HasPrefix(raw, "```") {
+			lines := strings.Split(raw, "\n")
+			if len(lines) > 2 {
+				raw = strings.Join(lines[1:len(lines)-1], "\n")
+			}
+		}
 
-	var regions []ocrRegion
-	if err := json.Unmarshal([]byte(raw), &regions); err != nil {
-		return nil, fmt.Errorf("JSON parse error: %v (raw: %.200s)", err, raw)
+		var regions []ocrRegion
+		if err := json.Unmarshal([]byte(raw), &regions); err != nil {
+			if attempt == 0 {
+				log.Printf("[groundedOCR] JSON parse failed, retrying: %v", err)
+				continue
+			}
+			return nil, fmt.Errorf("JSON parse error: %v (raw: %.200s)", err, raw)
+		}
+		return regions, nil
 	}
-	return regions, nil
+	return nil, fmt.Errorf("groundedOCR failed after retries")
 }
 
 // enrichPDF takes a PDF, finds pages without text, runs grounded OCR on them,
