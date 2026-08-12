@@ -1999,6 +1999,17 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	// Log region counts per page for debugging
+	for pg, entry := range pagesMap {
+		nonZero := 0
+		for _, r := range entry.Regions {
+			if r.BboxD2 != [4]int{} {
+				nonZero++
+			}
+		}
+		log.Printf("[enrichPDF] page %s: %d regions, %d with bbox", pg, len(entry.Regions), nonZero)
+	}
+
 	// Call Python helper
 	outPath := filepath.Join(tmpDir, "enriched.pdf")
 	cmd := exec.Command("python3", "/usr/local/bin/taki-embed-ocr.py",
