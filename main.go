@@ -1861,11 +1861,25 @@ func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
 
 		var regions []ocrRegion
 		if err := json.Unmarshal([]byte(raw), &regions); err != nil {
-			if attempt == 0 {
-				log.Printf("[groundedOCR] JSON parse failed, retrying: %v", err)
+			if attempt < 2 {
+				log.Printf("[groundedOCR] JSON parse failed (attempt %d), retrying: %v", attempt+1, err)
 				continue
 			}
 			return nil, fmt.Errorf("JSON parse error: %v (raw: %.200s)", err, raw)
+		}
+		// Check for empty-text regions (backend returned bboxes but no OCR text)
+		withText := 0
+		for _, r := range regions {
+			if r.Text != "" {
+				withText++
+			}
+		}
+		if len(regions) > 0 && withText == 0 {
+			if attempt < 2 {
+				log.Printf("[groundedOCR] %d regions but all empty text (attempt %d), retrying", len(regions), attempt+1)
+				continue
+			}
+			return nil, fmt.Errorf("all %d regions have empty text", len(regions))
 		}
 		return regions, nil
 	}
