@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net/http"
 	"net/mail"
@@ -2222,8 +2223,10 @@ func extractEXIF(data []byte) map[string]string {
 	}
 
 	if lat, long, err := x.LatLong(); err == nil {
-		meta["geo:lat"] = fmt.Sprintf("%f", lat)
-		meta["geo:long"] = fmt.Sprintf("%f", long)
+		if !math.IsNaN(lat) && !math.IsNaN(long) {
+			meta["geo:lat"] = fmt.Sprintf("%f", lat)
+			meta["geo:long"] = fmt.Sprintf("%f", long)
+		}
 	}
 
 	return meta
