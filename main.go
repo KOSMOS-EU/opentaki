@@ -1822,9 +1822,18 @@ func (s *Server) llmOCR(data []byte) string {
 // ── PDF OCR enrichment (TAKI_OCR_PDF) ────────────────────────
 
 // ocrRegion is a text region with bounding box from grounded VLM OCR.
+// VLM may return bbox_2d or bbox — we accept both.
 type ocrRegion struct {
 	BboxD2 [4]int  `json:"bbox_2d"`
+	Bbox   [4]int  `json:"bbox"`
 	Text   string  `json:"text"`
+}
+
+func (r ocrRegion) Box() [4]int {
+	if r.BboxD2 != [4]int{} {
+		return r.BboxD2
+	}
+	return r.Bbox
 }
 
 const groundedOCRPrompt = `Detect all text regions on this scanned document page. Return a JSON array of objects, each with bbox_2d (pixel coordinates [x1,y1,x2,y2]) and text. Return ONLY the JSON array, no explanation, no markdown fences.`
@@ -1956,6 +1965,12 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 	}
 	pagesMap := make(map[string]pageEntry)
 	for pr := range results {
+		// Normalize: ensure bbox_2d is always populated (VLM may return bbox instead)
+		for i := range pr.regions {
+			if pr.regions[i].BboxD2 == [4]int{} && pr.regions[i].Bbox != [4]int{} {
+				pr.regions[i].BboxD2 = pr.regions[i].Bbox
+			}
+		}
 		pagesMap[fmt.Sprintf("%d", pr.pageNum)] = pageEntry{
 			ImageWidth:  pr.imgWidth,
 			ImageHeight: pr.imgHeight,
