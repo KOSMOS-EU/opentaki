@@ -2010,6 +2010,12 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 		log.Printf("[enrichPDF] page %s: %d regions, %d with bbox", pg, len(entry.Regions), nonZero)
 	}
 
+	// Debug: save regions.json to workdir if available
+	if s.workDir != "" {
+		debugPath := filepath.Join(s.workDir, "enrich-regions.json")
+		os.WriteFile(debugPath, regionsJSON, 0644)
+	}
+
 	// Call Python helper
 	outPath := filepath.Join(tmpDir, "enriched.pdf")
 	cmd := exec.Command("python3", "/usr/local/bin/taki-embed-ocr.py",
