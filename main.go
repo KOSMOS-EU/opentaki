@@ -1842,13 +1842,13 @@ const groundedOCRPrompt = `Detect all text regions on this scanned document page
 // Retries once on JSON parse failure (VLM hallucination).
 func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
 	for attempt := 0; attempt < 3; attempt++ {
-		raw := s.llmDescribe(imagePath, groundedOCRPrompt)
+		raw, backend := s.llmDescribeWithBackend(imagePath, groundedOCRPrompt)
 		if raw == "" {
-			if attempt == 0 {
-				log.Printf("[groundedOCR] empty response, retrying")
+			if attempt < 2 {
+				log.Printf("[groundedOCR] empty response (attempt %d, backend=%s), retrying", attempt+1, backend)
 				continue
 			}
-			return nil, fmt.Errorf("empty LLM response")
+			return nil, fmt.Errorf("empty LLM response (backend=%s)", backend)
 		}
 		// Strip markdown fences if present
 		raw = strings.TrimSpace(raw)
@@ -1862,10 +1862,10 @@ func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
 		var regions []ocrRegion
 		if err := json.Unmarshal([]byte(raw), &regions); err != nil {
 			if attempt < 2 {
-				log.Printf("[groundedOCR] JSON parse failed (attempt %d), retrying: %v", attempt+1, err)
+				log.Printf("[groundedOCR] JSON parse failed (attempt %d, backend=%s), retrying: %v", attempt+1, backend, err)
 				continue
 			}
-			return nil, fmt.Errorf("JSON parse error: %v (raw: %.200s)", err, raw)
+			return nil, fmt.Errorf("JSON parse error (backend=%s): %v (raw: %.200s)", backend, err, raw)
 		}
 		// Check for empty-text regions (backend returned bboxes but no OCR text)
 		withText := 0
@@ -1876,10 +1876,10 @@ func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
 		}
 		if len(regions) > 0 && withText == 0 {
 			if attempt < 2 {
-				log.Printf("[groundedOCR] %d regions but all empty text (attempt %d), retrying", len(regions), attempt+1)
+				log.Printf("[groundedOCR] %d regions but all empty text (attempt %d, backend=%s), retrying", len(regions), attempt+1, backend)
 				continue
 			}
-			return nil, fmt.Errorf("all %d regions have empty text", len(regions))
+			return nil, fmt.Errorf("all %d regions have empty text (backend=%s)", len(regions), backend)
 		}
 		return regions, nil
 	}
@@ -2706,9 +2706,15 @@ func min(a, b int) int {
 // ── LLM helpers ──────────────────────────────────────────────
 
 func (s *Server) llmDescribe(imagePath, prompt string) string {
+	result, _ := s.llmDescribeWithBackend(imagePath, prompt)
+	return result
+}
+
+// llmDescribeWithBackend returns the LLM response and the backend that served it.
+func (s *Server) llmDescribeWithBackend(imagePath, prompt string) (string, string) {
 	imgData, err := os.ReadFile(imagePath)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 
 	ext := strings.ToLower(filepath.Ext(imagePath))
@@ -2721,7 +2727,11 @@ func (s *Server) llmDescribe(imagePath, prompt string) string {
 	}
 
 	b64 := base64.StdEncoding.EncodeToString(imgData)
-	return s.llmVision("data:"+mediaType+";base64,"+b64, prompt)
+	content := []contentBlock{
+		{Type: "text", Text: prompt},
+		{Type: "image_url", ImageURL: &imageURL{URL: "data:" + mediaType + ";base64," + b64}},
+	}
+	return s.llmCompleteWithBackend([]chatMessage{{Role: "user", Content: content}})
 }
 
 func (s *Server) llmVision(dataURL, prompt string) string {
@@ -2789,10 +2799,21 @@ func (s *Server) llmQueueStats() (int, time.Duration) {
 }
 
 func (s *Server) llmCompleteOpts(messages []chatMessage, rf *responseFormat) string {
-	return s.llmCompleteOptsTrace(messages, rf, nil, "")
+	result, _ := s.llmCompleteOptsBackend(messages, rf, nil, "")
+	return result
+}
+
+// llmCompleteWithBackend returns the result and the x-backend header.
+func (s *Server) llmCompleteWithBackend(messages []chatMessage) (string, string) {
+	return s.llmCompleteOptsBackend(messages, nil, nil, "")
 }
 
 func (s *Server) llmCompleteOptsTrace(messages []chatMessage, rf *responseFormat, tc *traceCtx, label string) string {
+	result, _ := s.llmCompleteOptsBackend(messages, rf, tc, label)
+	return result
+}
+
+func (s *Server) llmCompleteOptsBackend(messages []chatMessage, rf *responseFormat, tc *traceCtx, label string) (string, string) {
 	s.llmSem <- struct{}{}        // acquire slot
 	defer func() { <-s.llmSem }() // release slot
 	t := s.llmTrackStart()
@@ -2809,7 +2830,6 @@ func (s *Server) llmCompleteOptsTrace(messages []chatMessage, rf *responseFormat
 	jsonData, _ := json.Marshal(reqBody)
 	url := strings.TrimRight(s.cfg.LLM.APIBase, "/") + "/chat/completions"
 
-	// Debug: log LLM request
 	if tc != nil && tc.enabled {
 		tc.logLLM(label, reqBody, nil)
 	}
@@ -2825,58 +2845,54 @@ func (s *Server) llmCompleteOptsTrace(messages []chatMessage, rf *responseFormat
 				time.Sleep(backoff[attempt])
 				continue
 			}
-			return ""
+			return "", ""
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
+		backend := resp.Header.Get("X-Backend")
+
 		var chatResp chatResponse
 		if err := json.Unmarshal(respBody, &chatResp); err != nil {
-			log.Printf("LLM response parse error (HTTP %d, attempt %d/%d): %v (raw: %.300s)",
-				resp.StatusCode, attempt+1, maxRetries, err, string(respBody))
+			log.Printf("LLM response parse error (HTTP %d, attempt %d/%d, backend=%s): %v (raw: %.300s)",
+				resp.StatusCode, attempt+1, maxRetries, backend, err, string(respBody))
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
 			}
-			return ""
-		}
-
-		if backend := resp.Header.Get("X-Backend"); backend != "" {
-			log.Printf("LLM backend: %s", backend)
+			return "", backend
 		}
 
 		if len(chatResp.Choices) > 0 {
 			result := stripThinkTags(chatResp.Choices[0].Message.Content)
-			// Debug: log LLM response (overwrite the nil response from above)
 			if tc != nil && tc.enabled {
 				tc.writeJSON(fmt.Sprintf("llm/%02d_%s_response.json", tc.llmSeq, label),
-					map[string]interface{}{"status": resp.StatusCode, "content": result})
+					map[string]interface{}{"status": resp.StatusCode, "content": result, "backend": backend})
 			}
-			return result
+			return result, backend
 		}
 
-		// Server error or rate limit — retry with backoff
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			log.Printf("LLM HTTP %d (attempt %d/%d), retrying in %v (raw: %.200s)",
-				resp.StatusCode, attempt+1, maxRetries, backoff[attempt], string(respBody))
+			log.Printf("LLM HTTP %d (attempt %d/%d, backend=%s), retrying in %v",
+				resp.StatusCode, attempt+1, maxRetries, backend, backoff[attempt])
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
 			}
-			return ""
+			return "", backend
 		}
 
-		// 2xx but no choices — LLM returned empty, retry
 		if attempt < maxRetries-1 {
-			log.Printf("LLM empty response (attempt %d/%d), retrying in %v", attempt+1, maxRetries, backoff[attempt])
+			log.Printf("LLM empty response (attempt %d/%d, backend=%s), retrying in %v",
+				attempt+1, maxRetries, backend, backoff[attempt])
 			time.Sleep(backoff[attempt])
 			continue
 		}
 
-		return ""
+		return "", backend
 	}
-	return ""
+	return "", ""
 }
 
 func stripThinkTags(s string) string {
