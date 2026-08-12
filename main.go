@@ -37,6 +37,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	goexif "github.com/rwcarlsen/goexif/exif"
 	"gopkg.in/yaml.v3"
 )
 
@@ -332,6 +333,33 @@ type takiResponse struct {
 	Audio    *takiAudio    `json:"X-TAKI:audio,omitempty"`
 	Transcr  string        `json:"X-TAKI:transcription,omitempty"`
 	DocMeta  *takiDocMeta  `json:"X-TAKI:docmeta,omitempty"`
+
+	// EXIF metadata (images only)
+	Image    *takiImage    `json:"X-TAKI:image,omitempty"`
+	Photo    *takiPhoto    `json:"X-TAKI:photo,omitempty"`
+	Location *takiLocation `json:"X-TAKI:location,omitempty"`
+}
+
+type takiImage struct {
+	Width  int32 `json:"width,omitempty"`
+	Height int32 `json:"height,omitempty"`
+}
+
+type takiPhoto struct {
+	CameraMake           string  `json:"cameraMake,omitempty"`
+	CameraModel          string  `json:"cameraModel,omitempty"`
+	FNumber              float64 `json:"fNumber,omitempty"`
+	FocalLength          float64 `json:"focalLength,omitempty"`
+	ISO                  int32   `json:"iso,omitempty"`
+	Orientation          int32   `json:"orientation,omitempty"`
+	TakenDateTime        string  `json:"takenDateTime,omitempty"`
+	ExposureNumerator    float64 `json:"exposureNumerator,omitempty"`
+	ExposureDenominator  float64 `json:"exposureDenominator,omitempty"`
+}
+
+type takiLocation struct {
+	Latitude  float64 `json:"latitude,omitempty"`
+	Longitude float64 `json:"longitude,omitempty"`
 }
 
 type takiRouting struct {
@@ -642,6 +670,14 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 
+		// EXIF metadata for images
+		if strings.HasPrefix(ct, "image/") {
+			exifMeta := extractEXIF(body)
+			if len(exifMeta) > 0 {
+				resp.Image, resp.Photo, resp.Location = exifToStructs(exifMeta)
+			}
+		}
+
 		// DocMeta extraction — structured metadata (BEFORE general enrichment)
 		if routedFeatures["docmeta"] && s.cfg.DocMeta.Enabled {
 			resp.DocMeta = s.extractDocMeta(body, ct, text)
@@ -715,10 +751,11 @@ func (s *Server) handleRmetaText(w http.ResponseWriter, r *http.Request) {
 			"X-TAKI:method":  method,
 		}
 
-		// Add basic Tika-compatible metadata for images
+		// Add Tika-compatible EXIF metadata for images
 		if strings.HasPrefix(ct, "image/") {
-			// Tika returns tiff:ImageWidth etc — we could parse from image
-			// but for now just pass content
+			for k, v := range extractEXIF(body) {
+				meta[k] = v
+			}
 		}
 
 		json.NewEncoder(w).Encode(tikaMetaResponse{meta})
@@ -2103,6 +2140,158 @@ func (s *Server) handleEnrichPDF(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(enriched)))
 	w.Header().Set("X-Taki-Method", "enrich-pdf")
 	w.Write(enriched)
+}
+
+// ── EXIF metadata extraction ─────────────────────────────────
+
+// extractEXIF returns Tika-compatible metadata keys from JPEG/TIFF EXIF headers.
+func extractEXIF(data []byte) map[string]string {
+	meta := make(map[string]string)
+	x, err := goexif.Decode(bytes.NewReader(data))
+	if err != nil {
+		return meta
+	}
+
+	getInt := func(field goexif.FieldName) (int, bool) {
+		tag, err := x.Get(field)
+		if err != nil {
+			return 0, false
+		}
+		v, err := tag.Int(0)
+		if err != nil {
+			return 0, false
+		}
+		return v, true
+	}
+
+	getRat := func(field goexif.FieldName) (float64, bool) {
+		tag, err := x.Get(field)
+		if err != nil {
+			return 0, false
+		}
+		num, den, err := tag.Rat2(0)
+		if err != nil || den == 0 {
+			return 0, false
+		}
+		return float64(num) / float64(den), true
+	}
+
+	getString := func(field goexif.FieldName) (string, bool) {
+		tag, err := x.Get(field)
+		if err != nil {
+			return "", false
+		}
+		return strings.Trim(tag.String(), "\""), true
+	}
+
+	if v, ok := getInt(goexif.ImageWidth); ok {
+		meta["tiff:ImageWidth"] = fmt.Sprintf("%d", v)
+	} else if v, ok := getInt(goexif.PixelXDimension); ok {
+		meta["tiff:ImageWidth"] = fmt.Sprintf("%d", v)
+	}
+	if v, ok := getInt(goexif.ImageLength); ok {
+		meta["tiff:ImageLength"] = fmt.Sprintf("%d", v)
+	} else if v, ok := getInt(goexif.PixelYDimension); ok {
+		meta["tiff:ImageLength"] = fmt.Sprintf("%d", v)
+	}
+
+	if v, ok := getString(goexif.Make); ok {
+		meta["tiff:Make"] = v
+	}
+	if v, ok := getString(goexif.Model); ok {
+		meta["tiff:Model"] = v
+	}
+	if v, ok := getRat(goexif.FNumber); ok {
+		meta["exif:FNumber"] = fmt.Sprintf("%.1f", v)
+	}
+	if v, ok := getRat(goexif.FocalLength); ok {
+		meta["exif:FocalLength"] = fmt.Sprintf("%.1f", v)
+	}
+	if v, ok := getInt(goexif.ISOSpeedRatings); ok {
+		meta["Base ISO"] = fmt.Sprintf("%d", v)
+	}
+	if v, ok := getInt(goexif.Orientation); ok {
+		meta["tiff:Orientation"] = fmt.Sprintf("%d", v)
+	}
+	if v, ok := getRat(goexif.ExposureTime); ok {
+		meta["exif:ExposureTime"] = fmt.Sprintf("%g", v)
+	}
+
+	if t, err := x.DateTime(); err == nil {
+		meta["exif:DateTimeOriginal"] = t.Format("2006-01-02T15:04:05")
+	}
+
+	if lat, long, err := x.LatLong(); err == nil {
+		meta["geo:lat"] = fmt.Sprintf("%f", lat)
+		meta["geo:long"] = fmt.Sprintf("%f", long)
+	}
+
+	return meta
+}
+
+// exifToStructs converts the flat Tika-compatible EXIF map to structured types.
+func exifToStructs(meta map[string]string) (*takiImage, *takiPhoto, *takiLocation) {
+	var img *takiImage
+	var photo *takiPhoto
+	var loc *takiLocation
+
+	if w, ok := meta["tiff:ImageWidth"]; ok {
+		if img == nil { img = &takiImage{} }
+		fmt.Sscanf(w, "%d", &img.Width)
+	}
+	if h, ok := meta["tiff:ImageLength"]; ok {
+		if img == nil { img = &takiImage{} }
+		fmt.Sscanf(h, "%d", &img.Height)
+	}
+
+	if v, ok := meta["tiff:Make"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		photo.CameraMake = v
+	}
+	if v, ok := meta["tiff:Model"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		photo.CameraModel = v
+	}
+	if v, ok := meta["exif:FNumber"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		fmt.Sscanf(v, "%f", &photo.FNumber)
+	}
+	if v, ok := meta["exif:FocalLength"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		fmt.Sscanf(v, "%f", &photo.FocalLength)
+	}
+	if v, ok := meta["Base ISO"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		fmt.Sscanf(v, "%d", &photo.ISO)
+	}
+	if v, ok := meta["tiff:Orientation"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		fmt.Sscanf(v, "%d", &photo.Orientation)
+	}
+	if v, ok := meta["exif:DateTimeOriginal"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		photo.TakenDateTime = v
+	}
+	if v, ok := meta["exif:ExposureTime"]; ok {
+		if photo == nil { photo = &takiPhoto{} }
+		var et float64
+		fmt.Sscanf(v, "%g", &et)
+		if et > 0 {
+			photo.ExposureNumerator = 1
+			photo.ExposureDenominator = 1 / et
+		}
+	}
+
+	if lat, ok := meta["geo:lat"]; ok {
+		if loc == nil { loc = &takiLocation{} }
+		fmt.Sscanf(lat, "%f", &loc.Latitude)
+	}
+	if lng, ok := meta["geo:long"]; ok {
+		if loc == nil { loc = &takiLocation{} }
+		fmt.Sscanf(lng, "%f", &loc.Longitude)
+	}
+
+	return img, photo, loc
 }
 
 // ── Image extraction (LLM Vision) ───────────────────────────
