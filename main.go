@@ -2828,6 +2828,10 @@ func (s *Server) llmCompleteOptsTrace(messages []chatMessage, rf *responseFormat
 			return ""
 		}
 
+		if backend := resp.Header.Get("X-Backend"); backend != "" {
+			log.Printf("LLM backend: %s", backend)
+		}
+
 		if len(chatResp.Choices) > 0 {
 			result := stripThinkTags(chatResp.Choices[0].Message.Content)
 			// Debug: log LLM response (overwrite the nil response from above)
