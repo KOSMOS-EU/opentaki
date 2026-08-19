@@ -2354,6 +2354,7 @@ func saveLayer(dir string, l *pdfLayer) {
 	if err != nil {
 		return
 	}
+	os.MkdirAll(dir, 0755)
 	if err := os.WriteFile(filepath.Join(dir, l.SourceSHA256+".json"), data, 0644); err != nil {
 		log.Printf("[layers] save failed: %v", err)
 	}

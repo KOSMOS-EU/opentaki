@@ -7,7 +7,7 @@ COPY *.go ./
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /open_taki .
 
 FROM docker.io/library/alpine:3.20
-RUN apk add --no-cache poppler-utils pandoc python3 py3-pip \
+RUN apk add --no-cache curl poppler-utils pandoc python3 py3-pip \
     && pip install --no-cache-dir --break-system-packages pymupdf
 # Office conversion: add collabora as sidecar container
 # Audio/video: add ffmpeg if whisper is configured
