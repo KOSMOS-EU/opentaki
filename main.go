@@ -1887,10 +1887,21 @@ func (s *Server) llmOCR(data []byte) string {
 // ocrRegion is a text region with bounding box from grounded VLM OCR.
 // VLM may return bbox_2d or bbox — we accept both.
 type ocrRegion struct {
-	BboxD2 [4]int `json:"bbox_2d"`
-	Bbox   [4]int `json:"bbox"`
-	Text   string `json:"text"`
-	Conf   int    `json:"conf"` // 0-100; 0 = not provided
+	BboxD2      [4]int  `json:"bbox_2d"`
+	Bbox         [4]int `json:"bbox"`
+	Text         string `json:"text"`
+	TextContent  string `json:"text_content"`
+	Conf         int    `json:"conf"` // 0-100; 0 = not provided
+}
+
+// TextOf returns the region text. Some VLMs report the key as
+// `text_content` instead of `text` (observed with thinking-off mode),
+// so both are accepted.
+func (r ocrRegion) TextOf() string {
+	if r.Text != "" {
+		return r.Text
+	}
+	return r.TextContent
 }
 
 func (r ocrRegion) Box() [4]int {
@@ -1934,7 +1945,7 @@ func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
 		// Check for empty-text regions (backend returned bboxes but no OCR text)
 		withText := 0
 		for _, r := range regions {
-			if r.Text != "" {
+			if r.TextOf() != "" {
 				withText++
 			}
 		}
@@ -2021,7 +2032,7 @@ func hasLetterOrDigit(s string) bool {
 func (s *Server) filterRegions(regions []ocrRegion, imgW, imgH int) []ocrLayerRegion {
 	var out []ocrLayerRegion
 	for _, r := range regions {
-		text := strings.TrimSpace(r.Text)
+		text := strings.TrimSpace(r.TextOf())
 		if len(text) < 2 || !hasLetterOrDigit(text) {
 			continue
 		}
