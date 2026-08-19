@@ -17,8 +17,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -36,6 +38,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	goexif "github.com/rwcarlsen/goexif/exif"
@@ -202,6 +205,10 @@ type Server struct {
 	// PDF OCR enrichment (TAKI_OCR_PDF env). When set, /taki/enrich-pdf
 	// adds invisible text layers to scanned PDF pages via grounded VLM OCR.
 	ocrPDF bool
+
+	// OCR layer filters and cache (TAKI_LAYER_CONF_MIN / TAKI_LAYER_CACHE_MAX)
+	layerConfMin  int // drop VLM regions with self-reported conf below this
+	layerCacheMax int // max cached OCR layers (LRU by mtime)
 }
 
 // traceCtx carries per-request debug context through the pipeline.
@@ -558,13 +565,31 @@ func NewServer(cfg Config) *Server {
 	if ocrPDF {
 		log.Printf("  OCR-PDF enrichment: enabled")
 	}
+	layerConfMin := 40
+	if v := os.Getenv("TAKI_LAYER_CONF_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			layerConfMin = n
+		}
+	}
+	layerCacheMax := 500
+	if v := os.Getenv("TAKI_LAYER_CACHE_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			layerCacheMax = n
+		}
+	}
+	if workDir != "" {
+		log.Printf("  Layer cache: %s/layers (conf min %d, max %d entries)",
+			workDir, layerConfMin, layerCacheMax)
+	}
 	return &Server{
-		cfg:         cfg,
-		methodStats: make(map[string]*methodStat),
-		client:  client,
-		llmSem:  make(chan struct{}, maxConcurrent),
-		workDir: workDir,
-		ocrPDF:  ocrPDF,
+		cfg:           cfg,
+		methodStats:   make(map[string]*methodStat),
+		client:        client,
+		llmSem:        make(chan struct{}, maxConcurrent),
+		workDir:       workDir,
+		ocrPDF:        ocrPDF,
+		layerConfMin:  layerConfMin,
+		layerCacheMax: layerCacheMax,
 	}
 }
 
@@ -1862,9 +1887,10 @@ func (s *Server) llmOCR(data []byte) string {
 // ocrRegion is a text region with bounding box from grounded VLM OCR.
 // VLM may return bbox_2d or bbox — we accept both.
 type ocrRegion struct {
-	BboxD2 [4]int  `json:"bbox_2d"`
-	Bbox   [4]int  `json:"bbox"`
-	Text   string  `json:"text"`
+	BboxD2 [4]int `json:"bbox_2d"`
+	Bbox   [4]int `json:"bbox"`
+	Text   string `json:"text"`
+	Conf   int    `json:"conf"` // 0-100; 0 = not provided
 }
 
 func (r ocrRegion) Box() [4]int {
@@ -1874,7 +1900,7 @@ func (r ocrRegion) Box() [4]int {
 	return r.Bbox
 }
 
-const groundedOCRPrompt = `Detect all text regions on this scanned document page. Return a JSON array of objects, each with bbox_2d (pixel coordinates [x1,y1,x2,y2]) and text. Return ONLY the JSON array, no explanation, no markdown fences.`
+const groundedOCRPrompt = `Detect all text regions on this scanned document page. Return a JSON array of objects, each with bbox_2d ([x1,y1,x2,y2] in the normalized 0-1000 coordinate space of this image, where (0,0) is the top-left and (1000,1000) the bottom-right corner), text (the exact text, in reading order), and conf (your confidence in the text, 0-100). Return ONLY the JSON array, no explanation, no markdown fences.`
 
 // groundedOCR sends a page image to the VLM and returns positioned text regions.
 // Retries once on JSON parse failure (VLM hallucination).
@@ -1924,15 +1950,109 @@ func (s *Server) groundedOCR(imagePath string) ([]ocrRegion, error) {
 	return nil, fmt.Errorf("groundedOCR failed after retries")
 }
 
-// enrichPDF takes a PDF, finds pages without text, runs grounded OCR on them,
-// and embeds invisible text layers via the Python helper.
-func (s *Server) enrichPDF(data []byte) ([]byte, error) {
-	tmp, err := os.CreateTemp("", "taki-enrich-*.pdf")
+// ── Canonical OCR layer (taki-ocr-layer/1) ───────────────────
+
+// OCRLayerFormat identifies the canonical layer format (v1).
+const OCRLayerFormat = "taki-ocr-layer/1"
+
+// ocrLayerRegion is one positioned text region. Bbox is [x0,y0,x1,y1] as
+// 0-1 floats relative to the visible (rotation-applied) page — independent
+// of the render DPI used for OCR.
+type ocrLayerRegion struct {
+	Bbox [4]float64 `json:"bbox"`
+	Text string     `json:"text"`
+	Conf int        `json:"conf"` // 0-100; 0 = model did not report
+}
+
+type ocrLayerPage struct {
+	Index   int              `json:"index"` // 0-based
+	Size    [2]float64       `json:"size"`  // visible page (w,h) in points
+	Regions []ocrLayerRegion `json:"regions"`
+}
+
+// pdfLayer is the content-addressed OCR artifact for one source PDF
+// (key = sha256 of the original bytes). Only pages that received at least
+// one region are listed.
+type pdfLayer struct {
+	Format       string         `json:"format"`
+	Engine       string         `json:"engine"`
+	Created      string         `json:"created"`
+	SourceSHA256 string         `json:"source_sha256"` // set before caching
+	PageCount    int            `json:"page_count"`
+	Pages        []ocrLayerPage `json:"pages"`
+}
+
+// normalizeBbox converts a VLM bbox to 0-1 floats of the visible page.
+// Values <= 1000 are the VLM's [0..1000] convention; larger values are
+// pixel coordinates of the rendered page (imgW x imgH).
+func normalizeBbox(box [4]int, imgW, imgH int) [4]float64 {
+	maxV := box[0]
+	for _, v := range box[1:] {
+		if v > maxV {
+			maxV = v
+		}
+	}
+	var out [4]float64
+	if maxV > 1000 && imgW > 0 && imgH > 0 {
+		out[0] = float64(box[0]) / float64(imgW)
+		out[1] = float64(box[1]) / float64(imgH)
+		out[2] = float64(box[2]) / float64(imgW)
+		out[3] = float64(box[3]) / float64(imgH)
+	} else {
+		for i, v := range box {
+			out[i] = float64(v) / 1000.0
+		}
+	}
+	return out
+}
+
+func hasLetterOrDigit(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterRegions drops OCR noise: text without letters/digits, short
+// fragments, low-confidence regions (when the model reported confidence),
+// and degenerate boxes.
+func (s *Server) filterRegions(regions []ocrRegion, imgW, imgH int) []ocrLayerRegion {
+	var out []ocrLayerRegion
+	for _, r := range regions {
+		text := strings.TrimSpace(r.Text)
+		if len(text) < 2 || !hasLetterOrDigit(text) {
+			continue
+		}
+		if r.Conf > 0 && r.Conf < s.layerConfMin {
+			continue
+		}
+		box := r.Box()
+		if box == [4]int{} {
+			continue
+		}
+		bb := normalizeBbox(box, imgW, imgH)
+		if bb[2] <= bb[0] || bb[3] <= bb[1] {
+			continue
+		}
+		out = append(out, ocrLayerRegion{Bbox: bb, Text: text, Conf: r.Conf})
+	}
+	return out
+}
+
+// ocrPDFPages finds pages without text and runs grounded VLM OCR on them.
+// Returns a layer with zero pages when the PDF already has text.
+func (s *Server) ocrPDFPages(data []byte) (*pdfLayer, error) {
+	tmp, err := os.CreateTemp("", "taki-ocr-*.pdf")
 	if err != nil {
 		return nil, err
 	}
 	defer os.Remove(tmp.Name())
-	tmp.Write(data)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return nil, err
+	}
 	tmp.Close()
 
 	pageCount := s.pdfPageCount(tmp.Name())
@@ -1940,7 +2060,8 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("cannot determine page count")
 	}
 
-	// Find weak pages
+	// Find weak pages (ocrStrategy: auto — pages with existing text are
+	// skipped, so extraction and search results are not doubled up)
 	var weakPages []int
 	for i := 0; i < pageCount; i++ {
 		t := s.pdftextPage(tmp.Name(), i+1)
@@ -1949,25 +2070,32 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 		}
 	}
 
-	if len(weakPages) == 0 {
-		log.Printf("[enrichPDF] all %d pages have text, nothing to enrich", pageCount)
-		return data, nil // already good
+	layer := &pdfLayer{
+		Format:    OCRLayerFormat,
+		Engine:    "opentaki/grounded-vlm",
+		Created:   time.Now().UTC().Format(time.RFC3339),
+		PageCount: pageCount,
 	}
 
-	log.Printf("[enrichPDF] %d/%d pages need OCR", len(weakPages), pageCount)
+	if len(weakPages) == 0 {
+		log.Printf("[ocrPDFPages] all %d pages have text, nothing to OCR", pageCount)
+		return layer, nil // already good
+	}
+
+	log.Printf("[ocrPDFPages] %d/%d pages need OCR", len(weakPages), pageCount)
 
 	// Render weak pages to PNG and run grounded OCR
-	tmpDir, err := os.MkdirTemp("", "taki-enrich-ocr-*")
+	tmpDir, err := os.MkdirTemp("", "taki-ocr-tmp-*")
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(tmpDir)
 
 	type pageResult struct {
-		pageNum    int // 1-based
-		regions    []ocrRegion
-		imgWidth   int
-		imgHeight  int
+		pageIdx int // 0-based
+		regions []ocrLayerRegion
+		wPt     float64 // visible page size in points
+		hPt     float64
 	}
 
 	results := make(chan pageResult, len(weakPages))
@@ -1986,109 +2114,107 @@ func (s *Server) enrichPDF(data []byte) ([]byte, error) {
 				fmt.Sprintf("%d", s.cfg.PDF.DPI),
 				"-f", pg, "-l", pg, tmp.Name(), prefix)
 			if err := cmd.Run(); err != nil {
-				log.Printf("[enrichPDF] pdftoppm page %d failed: %v", pageIdx+1, err)
+				log.Printf("[ocrPDFPages] pdftoppm page %d failed: %v", pageIdx+1, err)
 				return
 			}
 			rendered, _ := filepath.Glob(prefix + "*.png")
 			if len(rendered) == 0 {
 				return
 			}
-			// Read actual image dimensions for precise coordinate mapping
+			// Rendered pixel size → visible page size in points
+			// (pdftoppm applies /Rotate; 1pt = DPI/72 px)
 			imgW, imgH := pngDimensions(rendered[0])
-			regions, err := s.groundedOCR(rendered[0])
+			wPt := float64(imgW) * 72.0 / float64(s.cfg.PDF.DPI)
+			hPt := float64(imgH) * 72.0 / float64(s.cfg.PDF.DPI)
+			raw, err := s.groundedOCR(rendered[0])
 			if err != nil {
-				log.Printf("[enrichPDF] grounded OCR page %d failed: %v", pageIdx+1, err)
+				log.Printf("[ocrPDFPages] grounded OCR page %d failed: %v", pageIdx+1, err)
 				return
 			}
+			regions := s.filterRegions(raw, imgW, imgH)
 			if len(regions) > 0 {
-				results <- pageResult{pageNum: pageIdx + 1, regions: regions,
-					imgWidth: imgW, imgHeight: imgH}
+				results <- pageResult{pageIdx: pageIdx, regions: regions, wPt: wPt, hPt: hPt}
 			}
 		}(pi)
 	}
 	wg.Wait()
 	close(results)
 
-	// Build regions JSON for the Python helper (new format with image dimensions)
-	type pageEntry struct {
-		ImageWidth  int         `json:"image_width"`
-		ImageHeight int         `json:"image_height"`
-		Regions     []ocrRegion `json:"regions"`
-	}
-	pagesMap := make(map[string]pageEntry)
 	for pr := range results {
-		// Normalize: ensure bbox_2d is always populated (VLM may return bbox instead)
-		for i := range pr.regions {
-			if pr.regions[i].BboxD2 == [4]int{} && pr.regions[i].Bbox != [4]int{} {
-				pr.regions[i].BboxD2 = pr.regions[i].Bbox
-			}
-		}
-		pagesMap[fmt.Sprintf("%d", pr.pageNum)] = pageEntry{
-			ImageWidth:  pr.imgWidth,
-			ImageHeight: pr.imgHeight,
-			Regions:     pr.regions,
+		layer.Pages = append(layer.Pages, ocrLayerPage{
+			Index:   pr.pageIdx,
+			Size:    [2]float64{pr.wPt, pr.hPt},
+			Regions: pr.regions,
+		})
+	}
+	sort.Slice(layer.Pages, func(i, j int) bool {
+		return layer.Pages[i].Index < layer.Pages[j].Index
+	})
+
+	totalRegions := 0
+	for _, p := range layer.Pages {
+		totalRegions += len(p.Regions)
+		log.Printf("[ocrPDFPages] page %d: %d regions", p.Index+1, len(p.Regions))
+	}
+	log.Printf("[ocrPDFPages] %d pages, %d text regions", len(layer.Pages), totalRegions)
+
+	// Debug: dump the layer to the work dir
+	if s.workDir != "" {
+		if layerJSON, err := json.Marshal(layer); err == nil {
+			os.WriteFile(filepath.Join(s.workDir, "ocr-layer.json"), layerJSON, 0644)
 		}
 	}
 
-	if len(pagesMap) == 0 {
-		log.Printf("[enrichPDF] no regions detected on any page")
+	return layer, nil
+}
+
+// embedLayer writes invisible text layers into the PDF via the Python
+// helper (PyMuPDF, render_mode=3) and returns the layered bytes.
+func (s *Server) embedLayer(data []byte, layer *pdfLayer) ([]byte, error) {
+	if len(layer.Pages) == 0 {
 		return data, nil
 	}
-
-	regionsData := struct {
-		DPI   int                      `json:"dpi"`
-		Pages map[string]pageEntry     `json:"pages"`
-	}{
-		DPI:   s.cfg.PDF.DPI,
-		Pages: pagesMap,
-	}
-	regionsJSON, err := json.Marshal(regionsData)
+	tmpDir, err := os.MkdirTemp("", "taki-embed-*")
 	if err != nil {
 		return nil, err
 	}
-	regionsFile := filepath.Join(tmpDir, "regions.json")
-	if err := os.WriteFile(regionsFile, regionsJSON, 0644); err != nil {
+	defer os.RemoveAll(tmpDir)
+
+	inPath := filepath.Join(tmpDir, "input.pdf")
+	if err := os.WriteFile(inPath, data, 0644); err != nil {
+		return nil, err
+	}
+	layerJSON, err := json.Marshal(layer)
+	if err != nil {
+		return nil, err
+	}
+	layerFile := filepath.Join(tmpDir, "layer.json")
+	if err := os.WriteFile(layerFile, layerJSON, 0644); err != nil {
 		return nil, err
 	}
 
-	// Log region counts per page for debugging
-	for pg, entry := range pagesMap {
-		nonZero := 0
-		for _, r := range entry.Regions {
-			if r.BboxD2 != [4]int{} {
-				nonZero++
-			}
-		}
-		log.Printf("[enrichPDF] page %s: %d regions, %d with bbox", pg, len(entry.Regions), nonZero)
-	}
-
-	// Debug: save regions.json to workdir if available
-	if s.workDir != "" {
-		debugPath := filepath.Join(s.workDir, "enrich-regions.json")
-		os.WriteFile(debugPath, regionsJSON, 0644)
-	}
-
-	// Call Python helper
-	outPath := filepath.Join(tmpDir, "enriched.pdf")
-	cmd := exec.Command("python3", "/usr/local/bin/taki-embed-ocr.py",
-		tmp.Name(), outPath, regionsFile)
+	outPath := filepath.Join(tmpDir, "output.pdf")
+	cmd := exec.Command("python3", "/usr/local/bin/taki-embed-ocr.py", inPath, outPath, layerFile)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("taki-embed-ocr.py failed: %v: %s", err, stderr.String())
 	}
+	return os.ReadFile(outPath)
+}
 
-	enriched, err := os.ReadFile(outPath)
+// enrichPDF takes a PDF, finds pages without text, runs grounded OCR on
+// them, and embeds invisible text layers via the Python helper.
+// Stateless: no skip checks, no caching (that is /taki/remount-pdf).
+func (s *Server) enrichPDF(data []byte) ([]byte, error) {
+	layer, err := s.ocrPDFPages(data)
 	if err != nil {
 		return nil, err
 	}
-
-	totalRegions := 0
-	for _, r := range pagesMap {
-		totalRegions += len(r.Regions)
+	if len(layer.Pages) == 0 {
+		return data, nil
 	}
-	log.Printf("[enrichPDF] enriched %d pages, %d text regions", len(pagesMap), totalRegions)
-	return enriched, nil
+	return s.embedLayer(data, layer)
 }
 
 // pngDimensions reads width and height from a PNG file header.
@@ -2140,6 +2266,266 @@ func (s *Server) handleEnrichPDF(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(enriched)))
 	w.Header().Set("X-Taki-Method", "enrich-pdf")
+	w.Write(enriched)
+}
+
+// ── OCR layer remount (content-addressed cache) ──────────────
+
+// remountMaxUpload bounds /taki/remount-pdf request bodies. The OpenCloud
+// side enforces the actual write-back cap; this only protects Taka itself.
+const remountMaxUpload = 200 << 20 // 200 MB
+
+func sha256hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// pdfCheckResult is the output of taki-pdf-check.py — structural facts
+// about a PDF before deciding whether it may be modified at all.
+type pdfCheckResult struct {
+	OK        bool         `json:"ok"`
+	NeedsPass bool         `json:"needs_pass"` // user-password encryption
+	Signed    bool         `json:"signed"`     // signature field (/Sig)
+	PdfAPart  int          `json:"pdfa_part"`  // 0 = not PDF/A
+	PageCount int          `json:"page_count"`
+	Pages     [][2]float64 `json:"pages"` // visible (rotation-applied) size, points
+}
+
+// pdfCheck runs the Python helper; nil means the helper itself failed
+// (fail-closed: callers must reject the PDF).
+func (s *Server) pdfCheck(path string) *pdfCheckResult {
+	cmd := exec.Command("python3", "/usr/local/bin/taki-pdf-check.py", path)
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("[pdfCheck] helper failed: %v: %s", err, stderr.String())
+		return nil
+	}
+	var res pdfCheckResult
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		log.Printf("[pdfCheck] invalid JSON: %v (out: %.200s)", err, out.String())
+		return nil
+	}
+	return &res
+}
+
+func layerCachePath(workDir string) string {
+	if workDir == "" {
+		return ""
+	}
+	return filepath.Join(workDir, "layers")
+}
+
+func loadLayer(dir, sha string) (*pdfLayer, bool) {
+	if dir == "" || sha == "" {
+		return nil, false
+	}
+	path := filepath.Join(dir, sha+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var l pdfLayer
+	if err := json.Unmarshal(data, &l); err != nil || l.Format != OCRLayerFormat {
+		log.Printf("[layers] dropping invalid cache entry %s: %v", sha, err)
+		os.Remove(path)
+		return nil, false
+	}
+	return &l, true
+}
+
+func saveLayer(dir string, l *pdfLayer) {
+	if dir == "" || l.SourceSHA256 == "" {
+		return
+	}
+	data, err := json.Marshal(l)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, l.SourceSHA256+".json"), data, 0644); err != nil {
+		log.Printf("[layers] save failed: %v", err)
+	}
+}
+
+// pruneLayerCache keeps at most layerCacheMax entries (oldest by mtime).
+func (s *Server) pruneLayerCache(dir string) {
+	if dir == "" || s.layerCacheMax < 1 {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type entry struct {
+		name string
+		mt   time.Time
+	}
+	var list []entry
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		list = append(list, entry{e.Name(), info.ModTime()})
+	}
+	if len(list) <= s.layerCacheMax {
+		return
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].mt.Before(list[j].mt) })
+	for i := 0; i < len(list)-s.layerCacheMax; i++ {
+		os.Remove(filepath.Join(dir, list[i].name))
+	}
+}
+
+// validateLayer checks a cached layer against the PDF at hand before
+// re-embedding it. False = layer must not be reused (page count/size
+// mismatch, or a page now carries visible text — re-embedding would
+// double the layer).
+func (s *Server) validateLayer(l *pdfLayer, check *pdfCheckResult, pdfPath string) bool {
+	if !check.OK || l.PageCount != check.PageCount {
+		return false
+	}
+	for _, p := range l.Pages {
+		if p.Index < 0 || p.Index >= len(check.Pages) {
+			return false
+		}
+		if sz := check.Pages[p.Index]; sz[0] > 0 && sz[1] > 0 {
+			if math.Abs(sz[0]-p.Size[0]) > 2 || math.Abs(sz[1]-p.Size[1]) > 2 {
+				return false
+			}
+		}
+		if len(s.pdftextPage(pdfPath, p.Index+1)) >= s.cfg.Fallback.MinCharsPerPage {
+			return false
+		}
+	}
+	return true
+}
+
+// skipRemount rejects the PDF with 409 + X-Taki-Skip reason.
+func skipRemount(w http.ResponseWriter, reason string) {
+	w.Header().Set("X-Taki-Skip", reason)
+	http.Error(w, "skipped: "+reason, http.StatusConflict)
+}
+
+// handleRemountPDF handles POST/PUT /taki/remount-pdf.
+//
+// Body: the original (scanned) PDF. Response: the same PDF with invisible
+// OCR text layers embedded — OpenCloud stores the result as a new file
+// revision.
+//
+// Content-addressed: layers are cached under <workDir>/layers/<sha256>.json,
+// so remounting an already-OCR'd original is a pure mount (no VLM calls).
+//
+// Response headers:
+//
+//	X-Taki-Layer: hit | miss | empty
+//	X-Taki-Skip:  encrypted | signed | pdfa1  (409 only)
+func (s *Server) handleRemountPDF(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		http.Error(w, "POST or PUT required", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.ocrPDF {
+		http.Error(w, "TAKI_OCR_PDF not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, remountMaxUpload))
+	defer r.Body.Close()
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if len(body) < 5 || string(body[:5]) != "%PDF-" {
+		http.Error(w, "not a PDF", http.StatusBadRequest)
+		return
+	}
+
+	tmp, err := os.CreateTemp("", "taki-remount-*.pdf")
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	tmp.Close()
+
+	// Skip checks (fail-closed): helper failure → 500, dangerous PDF → 409.
+	check := s.pdfCheck(tmp.Name())
+	if check == nil {
+		http.Error(w, "pdf check failed", http.StatusInternalServerError)
+		return
+	}
+	switch {
+	case check.NeedsPass:
+		skipRemount(w, "encrypted")
+		return
+	case check.Signed:
+		skipRemount(w, "signed")
+		return
+	case check.PdfAPart == 1:
+		skipRemount(w, "pdfa1")
+		return
+	}
+
+	dir := layerCachePath(s.workDir)
+	sha := sha256hex(body)
+
+	var layer *pdfLayer
+	hit := false
+	if cached, ok := loadLayer(dir, sha); ok {
+		if s.validateLayer(cached, check, tmp.Name()) {
+			layer = cached
+			hit = true
+			log.Printf("[remount-pdf] layer cache hit %s (%d pages)", sha[:12], len(layer.Pages))
+		} else {
+			log.Printf("[remount-pdf] layer cache entry %s stale, re-OCRing", sha[:12])
+			os.Remove(filepath.Join(dir, sha+".json"))
+		}
+	}
+	if layer == nil {
+		fresh, err := s.ocrPDFPages(body)
+		if err != nil {
+			log.Printf("[remount-pdf] OCR failed: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if len(fresh.Pages) == 0 {
+			// PDF already has text — nothing to mount.
+			w.Header().Set("Content-Type", "application/pdf")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("X-Taki-Layer", "empty")
+			w.Write(body)
+			return
+		}
+		fresh.SourceSHA256 = sha
+		layer = fresh
+		saveLayer(dir, layer)
+		s.pruneLayerCache(dir)
+	}
+
+	enriched, err := s.embedLayer(body, layer)
+	if err != nil {
+		log.Printf("[remount-pdf] embed failed: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if hit {
+		w.Header().Set("X-Taki-Layer", "hit")
+	} else {
+		w.Header().Set("X-Taki-Layer", "miss")
+	}
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(enriched)))
+	w.Header().Set("X-Taki-Method", "remount-pdf")
 	w.Write(enriched)
 }
 
@@ -3554,6 +3940,7 @@ func main() {
 	http.HandleFunc("/tika/text", srv.handleTikaText)
 	http.HandleFunc("/rmeta/text", srv.handleRmetaText)
 	http.HandleFunc("/taki/enrich-pdf", srv.handleEnrichPDF)
+	http.HandleFunc("/taki/remount-pdf", srv.handleRemountPDF)
 	http.HandleFunc("/embed", srv.handleEmbed)
 	http.HandleFunc("/schema", srv.handleSchema)
 	http.HandleFunc("/test", srv.handleTest)
