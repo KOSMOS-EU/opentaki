@@ -56,6 +56,9 @@ type Config struct {
 		TimeoutS      int    `yaml:"timeout_s"`      // HTTP timeout in seconds (default: 1800)
 		MaxConcurrent int    `yaml:"max_concurrent"`  // max parallel LLM calls (default: 8)
 	} `yaml:"llm"`
+	OCR struct {
+		Model string `yaml:"model"` // OCR stage model (grounded bbox OCR + VLM text OCR); empty = llm.model
+	} `yaml:"ocr"`
 	Whisper struct {
 		APIBase string `yaml:"api_base"`
 		Model   string `yaml:"model"`
@@ -3328,7 +3331,8 @@ func (s *Server) llmDescribeWithBackend(imagePath, prompt string) (string, strin
 		{Type: "text", Text: prompt},
 		{Type: "image_url", ImageURL: &imageURL{URL: "data:" + mediaType + ";base64," + b64}},
 	}
-	return s.llmCompleteWithBackend([]chatMessage{{Role: "user", Content: content}})
+	// OCR stage (grounded bbox OCR, VLM text OCR, CAD reading) — uses ocr.model
+	return s.llmCompleteOCRWithBackend([]chatMessage{{Role: "user", Content: content}})
 }
 
 func (s *Server) llmVision(dataURL, prompt string) string {
@@ -3405,19 +3409,39 @@ func (s *Server) llmCompleteWithBackend(messages []chatMessage) (string, string)
 	return s.llmCompleteOptsBackend(messages, nil, nil, "")
 }
 
+// ocrModel returns the model for the OCR stage (grounded bbox OCR + VLM
+// text OCR). An empty ocr.model falls back to llm.model.
+func (s *Server) ocrModel() string {
+	if s.cfg.OCR.Model != "" {
+		return s.cfg.OCR.Model
+	}
+	return s.cfg.LLM.Model
+}
+
+// llmCompleteOCRWithBackend is the OCR-stage entry point. Uses ocr.model
+// (fallback llm.model). All llmDescribe* calls (page OCR, grounded bbox
+// OCR, CAD vision) go through here.
+func (s *Server) llmCompleteOCRWithBackend(messages []chatMessage) (string, string) {
+	return s.llmCompleteOptsBackendModel(messages, nil, nil, "", s.ocrModel())
+}
+
 func (s *Server) llmCompleteOptsTrace(messages []chatMessage, rf *responseFormat, tc *traceCtx, label string) string {
 	result, _ := s.llmCompleteOptsBackend(messages, rf, tc, label)
 	return result
 }
 
 func (s *Server) llmCompleteOptsBackend(messages []chatMessage, rf *responseFormat, tc *traceCtx, label string) (string, string) {
+	return s.llmCompleteOptsBackendModel(messages, rf, tc, label, s.cfg.LLM.Model)
+}
+
+func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *responseFormat, tc *traceCtx, label, model string) (string, string) {
 	s.llmSem <- struct{}{}        // acquire slot
 	defer func() { <-s.llmSem }() // release slot
 	t := s.llmTrackStart()
 	defer s.llmTrackDone(t)
 
 	reqBody := chatRequest{
-		Model:          s.cfg.LLM.Model,
+		Model:          model,
 		MaxTokens:      s.cfg.LLM.MaxTokens,
 		Temp:           0.0,
 		Messages:       messages,
@@ -3611,6 +3635,31 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		})
 	} else {
 		results = append(results, subsystem{Name: "llm", Status: "disabled"})
+	}
+
+	// 1b. OCR stage model (only when it differs from the LLM model)
+	if ocrM := s.ocrModel(); ocrM != s.cfg.LLM.Model {
+		t0 := time.Now()
+		ocrStatus := "ok"
+		ocrDetail := fmt.Sprintf("%s (model: %s)", s.cfg.LLM.APIBase, ocrM)
+		body := fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}`, ocrM)
+		req, _ := http.NewRequest("POST", s.cfg.LLM.APIBase+"/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := testClient.Do(req)
+		if err != nil {
+			ocrStatus = "failed"
+			ocrDetail = err.Error()
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				ocrStatus = "failed"
+				ocrDetail = fmt.Sprintf("HTTP %d from %s", resp.StatusCode, s.cfg.LLM.APIBase)
+			}
+		}
+		results = append(results, subsystem{
+			Name: "ocr", Status: ocrStatus, Detail: ocrDetail,
+			Latency: fmt.Sprintf("%dms", time.Since(t0).Milliseconds()),
+		})
 	}
 
 	// 2. Embedding
@@ -3940,6 +3989,11 @@ func main() {
 
 	log.Printf("open_taki %s starting on %s", version, cfg.Listen)
 	log.Printf("  LLM:       %s (model: %s)", cfg.LLM.APIBase, cfg.LLM.Model)
+	ocrModel := cfg.LLM.Model
+	if cfg.OCR.Model != "" {
+		ocrModel = cfg.OCR.Model
+	}
+	log.Printf("  OCR:       model: %s", ocrModel)
 	if cfg.Collabora.URL != "" {
 		log.Printf("  Collabora: %s (office conversion)", cfg.Collabora.URL)
 	} else {

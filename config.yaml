@@ -2,10 +2,17 @@
 listen: ":9998"
 
 # LLM Backend (microllm or direct vLLM)
+# model = meta stage: DocMeta, Summary, Entities, Store-Detect, Rescue, Chat
 llm:
   api_base: "http://localhost:8012/v1"
   model: "local"
   max_tokens: 4096
+
+# OCR stage model (grounded bbox OCR + VLM text OCR)
+# Empty = use llm.model. Point this at a fast vision model that does
+# bboxes well (e.g. a 27B) while meta runs on the quality model (e.g. 122B).
+ocr:
+  model: ""
 
 # Collabora — office document conversion (DOC, XLS, PPT, ODT, ODS, ODP)
 # If not set, only pandoc-supported formats work (DOCX, ODT, EPUB, RTF)
