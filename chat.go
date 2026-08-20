@@ -600,6 +600,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"Pfade sind immer relativ zum Ordner (leerer Pfad = der Ordner selbst). "+
 			"Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast. "+
 			"Lies nur Dateien, die für die Frage relevant sind. "+
+			"Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort "+
+			"explizit, dass dieses Dokument nur teilweise ausgewertet wurde. "+
 			"Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.",
 		folder)
 
