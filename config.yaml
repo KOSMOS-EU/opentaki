@@ -62,7 +62,8 @@ chat:
   max_iterations: 8        # max. Tool-Schritte pro Frage
   default_model: ""        # default: llm.model
   max_file_chars: 60000    # read_file-Kappung
-  max_listings: 100        # max. Einträge pro list_directory
+  max_listings: 100        # max. Einträge im rekursiven list_directory
+  list_depth: 3            # max. Verzeichnisebenen im rekursiven list_directory
 
 # Routing (active with X-Taki-Protocol: v2)
 routing:

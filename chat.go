@@ -4,7 +4,8 @@ package main
 //
 // Das Modell beschafft sich den Dokumenteninhalt selbst über Tools:
 //
-//	list_directory(path) → WebDAV PROPFIND depth=1 (Dateien + Unterverzeichnisse)
+//	list_directory(path) → WebDAV PROPFIND depth=1, rekursiv (BFS, begrenzt:
+//	                       list_depth Ebenen, max_listings Einträge gesamt)
 //	read_file(path)      → WebDAV GET + s.extract (pdf/office/svg/text/…)
 //	read_image(path)     → WebDAV GET + VLM-Beschreibung
 //
@@ -36,7 +37,8 @@ type ChatConfig struct {
 	MaxIterations int    `yaml:"max_iterations"` // default 8
 	DefaultModel  string `yaml:"default_model"`  // default: llm.model
 	MaxFileChars  int    `yaml:"max_file_chars"` // default 60000
-	MaxListings   int    `yaml:"max_listings"`   // max. Einträge pro Listing, default 100
+	MaxListings   int    `yaml:"max_listings"`   // max. Einträge im rekursiven Listing, default 100
+	ListDepth     int    `yaml:"list_depth"`     // max. Verzeichnisebenen im rekursiven Listing, default 3
 }
 
 func (c *ChatConfig) applyDefaults(cfg *Config) {
@@ -48,6 +50,9 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 	}
 	if c.MaxListings < 1 {
 		c.MaxListings = 100
+	}
+	if c.ListDepth < 1 {
+		c.ListDepth = 3
 	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = cfg.LLM.Model
@@ -71,7 +76,7 @@ func (s *Server) chatTools() []toolDefinition {
 	return []toolDefinition{
 		{Type: "function", Function: toolFunction{
 			Name:        "list_directory",
-			Description: "Listet den Inhalt eines Verzeichnisses im geteilten Ordner: Unterverzeichnisse (mit /) und Dateinamen. Liefert KEINE Dateiinhalte. Leerer Pfad = der geteilte Ordner selbst.",
+			Description: "Listet den Inhalt eines Verzeichnisses im geteilten Ordner REKURSIV (begrenzt durch Tiefe und Eintragszahl, Kürzungen werden angegeben): Unterverzeichnisse (mit /) und Dateien, jeweils mit relativem Pfad — der Pfad ist direkt als read_file-/read_image-Pfad nutzbar. Liefert KEINE Dateiinhalte. Leerer Pfad = der geteilte Ordner selbst.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad relativ zum geteilten Ordner, leer = Basisordner"}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
@@ -202,18 +207,22 @@ func (s *Server) llmChatTools(model string, messages []chatToolMessage, tools []
 const maxShareBytes = 200 * 1024 * 1024 // 200MB, deckt sich mit /tika/text
 
 type shareWebDav struct {
-	client *http.Client
-	base   string // http://<opencloud>/dav/public-files/<token>
-	passwd string // Share-Password (nie loggen)
+	client   *http.Client
+	base     string // http://<opencloud>/dav/public-files/<token>
+	basePath string // /dav/public-files/<token> (path-only, für Href-Vergleiche)
+	token    string // Share-Token (nie loggen)
+	passwd   string // Share-Password (nie loggen)
 }
 
 func newShareWebDav(s *Server, token, password string) *shareWebDav {
-	base := strings.TrimRight(s.cfg.OpenCloud.URL, "/") +
-		"/dav/public-files/" + url.PathEscape(token)
+	basePath := "/dav/public-files/" + url.PathEscape(token)
+	base := strings.TrimRight(s.cfg.OpenCloud.URL, "/") + basePath
 	return &shareWebDav{
-		client: &http.Client{Timeout: 10 * time.Minute},
-		base:   base,
-		passwd: password,
+		client:   &http.Client{Timeout: 10 * time.Minute},
+		base:     base,
+		basePath: basePath,
+		token:    token,
+		passwd:   password,
 	}
 }
 
@@ -221,7 +230,12 @@ func (d *shareWebDav) urlFor(relPath string) string {
 	if relPath == "" {
 		return d.base + "/"
 	}
-	return d.base + "/" + strings.TrimLeft(relPath, "/")
+	// Segmente explizit escapen (Leerzeichen, ',', '#', '?' … in Dateinamen)
+	seg := strings.Split(strings.TrimLeft(relPath, "/"), "/")
+	for i, s := range seg {
+		seg[i] = url.PathEscape(s)
+	}
+	return d.base + "/" + strings.Join(seg, "/")
 }
 
 func (d *shareWebDav) do(method, u string, depth int, body []byte) (*http.Response, error) {
@@ -268,10 +282,21 @@ func shareAuthError(resp *http.Response) (string, bool) {
 	return "", false
 }
 
-// propfind listet einen Ordner. Liefert Namen + isDir, ohne Inhalte.
-func (d *shareWebDav) propfind(relPath string) ([]string, []string, error) {
-	var dirs, files []string
+// listingEntry ist ein Eintrag in einem Verzeichnis (Name relativ zum
+// gelisteten Ordner, isDir laut resourcetype bzw. Href-Endschiff).
+type listingEntry struct {
+	Name  string
+	IsDir bool
+}
 
+// propfind listet einen Ordner (Depth: 1). Liefert die Kind-Einträge, ohne
+// die Collection selbst.
+//
+// Wichtig (Reva/OC10-Konvention, RFC 4918 §9.1): Collection-Hrefs ENDEN AUF
+// "/". D.h. der letzte Pfad-Segment ist bei Verzeichnissen leer — der Name
+// kommt aus dem Href OHNE den abschließenden Slash, das isDir-Signal ist der
+// Slash selbst (zusätzlich resourcetype/collection aus der Antwort).
+func (d *shareWebDav) propfind(relPath string) ([]listingEntry, error) {
 	body := []byte(`<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop>
@@ -282,15 +307,15 @@ func (d *shareWebDav) propfind(relPath string) ([]string, []string, error) {
 
 	resp, err := d.do("PROPFIND", d.urlFor(relPath), 1, body)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if msg, ok := shareAuthError(resp); ok {
-		return nil, nil, fmt.Errorf("%s", msg)
+		return nil, fmt.Errorf("%s", msg)
 	}
 	if resp.StatusCode != 207 {
-		return nil, nil, fmt.Errorf("PROPFIND: unerwarteter HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("PROPFIND: unerwarteter HTTP %d", resp.StatusCode)
 	}
 
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
@@ -308,38 +333,115 @@ func (d *shareWebDav) propfind(relPath string) ([]string, []string, error) {
 		} `xml:"response"`
 	}
 	if err := xml.Unmarshal(data, &ms); err != nil {
-		return nil, nil, fmt.Errorf("PROPFIND-Antwort nicht lesbar: %v", err)
+		return nil, fmt.Errorf("PROPFIND-Antwort nicht lesbar: %v", err)
 	}
 
-	reqURL := d.urlFor(relPath)
+	// Href der Collection selbst, in der Form wie Reva antwortet:
+	// path-only (kein Scheme/Host), escaped, Collection mit trailing "/".
+	selfRef := path.Join(d.basePath, strings.TrimLeft(relPath, "/")) + "/"
+
+	var entries []listingEntry
 	for _, r := range ms.Responses {
-		if r.Href == reqURL {
+		isDir := strings.HasSuffix(r.Href, "/")
+
+		// Href unescape (Reva: net.EncodePath = url.EscapedPath)
+		href := r.Href
+		if u, err := url.PathUnescape(href); err == nil {
+			href = u
+		}
+		hrefClean := path.Clean(href)
+		if hrefClean == path.Clean(selfRef) {
 			continue // die Collection selbst
 		}
-		name := r.Href
-		if i := strings.LastIndex(name, "/"); i >= 0 {
-			name = name[i+1:]
-		}
-		if name == "" {
+		name := path.Base(strings.TrimSuffix(href, "/"))
+		if name == "" || name == "." {
 			continue
 		}
-		if u, err := url.PathUnescape(name); err == nil {
-			name = u
-		}
-		isDir := false
-		for _, ps := range r.Propstat {
-			if ps.Prop.ResourceType.Collection != nil {
-				isDir = true
-				break
+		if !isDir {
+			// Fallback: resourcetype aus der Antwort (falls kein Href-Slash)
+			for _, ps := range r.Propstat {
+				if ps.Prop.ResourceType.Collection != nil {
+					isDir = true
+					break
+				}
 			}
 		}
-		if isDir {
-			dirs = append(dirs, name)
-		} else {
-			files = append(files, name)
+		entries = append(entries, listingEntry{Name: name, IsDir: isDir})
+	}
+	return entries, nil
+}
+
+// walkEntry ist ein Eintrag im rekursiven Listing (Pfad relativ zur
+// Share-Root — direkt als read_file-Pfad verwendbar).
+type walkEntry struct {
+	Rel   string
+	IsDir bool
+}
+
+// propfindTree wandert begrenzten rekursiv (BFS) ab rootRel ab:
+//
+//   - maxDepth:    Anzahl der Verzeichnisebenen, die UNTERHALB von rootRel
+//     gelistet werden (rootRel selbst = Ebene 0).
+//   - maxEntries:  Obergrenze für die Gesamtzahl der gelisteten Einträge.
+//
+// depthCut  = es existieren Verzeichnisse auf der maxDepth-Ebene, deren Inhalt
+//             nicht gelistet wurde;
+// entryCut  = die Eintragsgrenze (oder die PROPFIND-Sicherungsgrenze) wurde
+//             erreicht — es gibt weitere Einträge.
+func (d *shareWebDav) propfindTree(rootRel string, maxDepth, maxEntries int) ([]walkEntry, bool, bool, error) {
+	const maxCalls = 60 // Sicherung gegen pathologische Verzeichnisbäume
+	type qitem struct {
+		rel   string
+		depth int
+	}
+	joinRel := func(parent, child string) string {
+		if parent == "" {
+			return child
+		}
+		return parent + "/" + child
+	}
+
+	var entries []walkEntry
+	var depthCut, entryCut bool
+	calls := 0
+	queue := []qitem{{rel: rootRel, depth: 0}}
+
+	for len(queue) > 0 {
+		it := queue[0]
+		queue = queue[1:]
+
+		if it.depth >= maxDepth {
+			depthCut = true // existiert, wurde aber nicht ausgewertet
+			continue
+		}
+		calls++
+		if calls > maxCalls {
+			entryCut = true
+			break
+		}
+		kids, err := d.propfind(it.rel)
+		if err != nil {
+			if it.rel == rootRel {
+				return nil, false, false, err
+			}
+			continue // nicht listbares Unterverzeichnis — überspringen
+		}
+		for _, k := range kids {
+			if len(entries) >= maxEntries {
+				entryCut = true
+				break
+			}
+			child := joinRel(it.rel, k.Name)
+			entries = append(entries, walkEntry{Rel: child, IsDir: k.IsDir})
+			if k.IsDir {
+				queue = append(queue, qitem{rel: child, depth: it.depth + 1})
+			}
+		}
+		if entryCut {
+			break
 		}
 	}
-	return dirs, files, nil
+	return entries, depthCut, entryCut, nil
 }
 
 // getfile lädt eine Datei (max. maxShareBytes) und liefert Bytes + Content-Type.
@@ -402,13 +504,13 @@ func (s *Server) runChatTool(d *shareWebDav, name, argsJSON string) (string, too
 
 	switch name {
 	case "list_directory":
-		dirs, files, err := d.propfind(relPath)
+		maxDepth := s.cfg.Chat.ListDepth
+		entries, depthCut, entryCut, err := d.propfindTree(relPath, maxDepth, s.cfg.Chat.MaxListings)
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: " + err.Error(), trace
 		}
-		max := s.cfg.Chat.MaxListings
 		var sb strings.Builder
 		sb.WriteString("Inhalt von ")
 		if relPath == "" {
@@ -416,31 +518,27 @@ func (s *Server) runChatTool(d *shareWebDav, name, argsJSON string) (string, too
 		} else {
 			sb.WriteString(relPath)
 		}
-		sb.WriteString(":\n")
-		shown := 0
-		for _, dir := range dirs {
-			if shown >= max {
-				break
-			}
-			sb.WriteString("  " + dir + "/\n")
-			shown++
-		}
-		for _, f := range files {
-			if shown >= max {
-				break
-			}
-			sb.WriteString("  " + f + "\n")
-			shown++
-		}
-		total := len(dirs) + len(files)
-		if shown == 0 {
+		sb.WriteString(fmt.Sprintf(" (rekursiv, max. Tiefe %d):\n", maxDepth))
+		if len(entries) == 0 {
 			sb.WriteString("  (leerer Ordner)\n")
 		}
-		if total > max {
-			sb.WriteString(fmt.Sprintf("  … nur %d von %d Einträgen gezeigt (Listing gekürzt)\n", max, total))
+		for _, e := range entries {
+			line := "  " + e.Rel
+			if e.IsDir {
+				line += "/"
+			}
+			sb.WriteString(line + "\n")
+		}
+		if entryCut {
+			sb.WriteString(fmt.Sprintf("  … Listing gekürzt: max. %d Einträge — es gibt WEITERE Dateien/Verzeichnisse. "+
+				"Falls die Frage darauf ankommt, liste ein bestimmtes Unterverzeichnis einzeln auf.\n", s.cfg.Chat.MaxListings))
+		}
+		if depthCut {
+			sb.WriteString(fmt.Sprintf("  … Verzeichnisse tiefer als Ebene %d wurden NICHT gelistet.\n", maxDepth))
 		}
 		trace.Method = "propfind"
 		trace.Chars = len(sb.String())
+		trace.Truncated = entryCut || depthCut
 		trace.MS = time.Since(start).Milliseconds()
 		return sb.String(), trace
 
@@ -450,6 +548,11 @@ func (s *Server) runChatTool(d *shareWebDav, name, argsJSON string) (string, too
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: " + err.Error(), trace
+		}
+		if len(data) == 0 {
+			trace.Method = "empty"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Die Datei existiert, ist aber leer (0 Bytes).", trace
 		}
 		text, method := s.extract(data, ct)
 		if strings.HasPrefix(method, "error") || text == "" {
