@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -77,7 +78,7 @@ func (s *Server) chatTools() []toolDefinition {
 	return []toolDefinition{
 		{Type: "function", Function: toolFunction{
 			Name:        "list_directory",
-			Description: "Listet den Inhalt eines Verzeichnisses im geteilten Ordner REKURSIV (begrenzt durch Tiefe und Eintragszahl, Kürzungen werden angegeben): Unterverzeichnisse (mit /) und Dateien, jeweils mit relativem Pfad — der Pfad ist direkt als read_file-/read_image-Pfad nutzbar. Liefert KEINE Dateiinhalte. Leerer Pfad = der geteilte Ordner selbst.",
+			Description: "Listet den Inhalt eines Verzeichnisses im geteilten Ordner REKURSIV (begrenzt durch Tiefe und Eintragszahl, Kürzungen werden angegeben): Unterverzeichnisse (mit /) und Dateien, jeweils mit relativem Pfad (direkt als read_file-/read_image-Pfad nutzbar), Datum (JJJJ-MM-TT) und bei Dateien der Größe. Liefert KEINE Dateiinhalte. Leerer Pfad = der geteilte Ordner selbst.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad relativ zum geteilten Ordner, leer = Basisordner"}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
@@ -89,6 +90,11 @@ func (s *Server) chatTools() []toolDefinition {
 			Name:        "read_image",
 			Description: "Liest eine Bilddatei (jpg, png, …) und liefert eine detaillierte Beschreibung inkl. aller lesbaren Texte (VLM). Pfade relativ zum geteilten Ordner.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Bilddatei relativ zum geteilten Ordner"}},"required":["path"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "read_metadata",
+			Description: "Liefert die KI-Metadaten eines Dokuments (Dokumenttyp, Betreff, Datum, Referenz, Absender/Empfänger, Beträge, Tags) OHNE den Dateiinhalt zu laden — zum schnellen Drüberschauen und um zu entscheiden, welche Dateien man mit read_file im Detail lesen muss. Liefert Werte nur, wenn die Datei bereits von der KI angereichert wurde; sonst Hinweis. Pfade relativ zum geteilten Ordner.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"}},"required":["path"]}`),
 		}},
 	}
 }
@@ -485,6 +491,74 @@ func (d *shareWebDav) propfindTree(rootRel string, maxDepth, maxEntries int) ([]
 	return entries, depthCut, entryCut, nil
 }
 
+// propfindMeta holt die Arbitrary-Metadaten (KI-Enrichment) einer Datei:
+// PROPFIND Depth 0 mit allprop. Reva liefert alle XAttr-Metadaten als
+// <oc:doc.type>, <oc:sender.company>, … (Namespace http://owncloud.org/ns).
+// Schema-agnostisch: alles im oc:-Namespace mit Punkt im Namen (doc.*,
+// sender.*, amounts.*, libre.graph.*, …) sowie summary/subject/tags.
+func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
+	body := []byte(`<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:allprop/></d:propfind>`)
+
+	resp, err := d.do("PROPFIND", d.urlFor(relPath), 0, body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if msg, ok := shareAuthError(resp); ok {
+		return nil, fmt.Errorf("%s", msg)
+	}
+	if resp.StatusCode != 207 {
+		return nil, fmt.Errorf("PROPFIND: unerwarteter HTTP %d", resp.StatusCode)
+	}
+
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+
+	const ocNS = "http://owncloud.org/ns"
+	wantBare := map[string]bool{"summary": true, "subject": true, "tags": true}
+	meta := map[string]string{}
+
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok || start.Name.Space != ocNS {
+			continue
+		}
+		if !strings.Contains(start.Name.Local, ".") && !wantBare[start.Name.Local] {
+			continue
+		}
+		// Elementinhalt lesen (bis zum passenden EndElement)
+		var val string
+		depth := 1
+		for depth > 0 {
+			t, err := dec.Token()
+			if err != nil {
+				depth = 0
+				break
+			}
+			switch tt := t.(type) {
+			case xml.StartElement:
+				depth++
+			case xml.EndElement:
+				depth--
+			case xml.CharData:
+				if depth == 1 {
+					val += string(tt)
+				}
+			}
+		}
+		if v := strings.TrimSpace(val); v != "" {
+			meta[start.Name.Local] = v
+		}
+	}
+	return meta, nil
+}
+
 // getfile lädt eine Datei (max. maxShareBytes) und liefert Bytes + Content-Type.
 func (d *shareWebDav) getfile(relPath string) ([]byte, string, error) {
 	resp, err := d.do("GET", d.urlFor(relPath), -1, nil)
@@ -644,6 +718,34 @@ func (s *Server) runChatTool(d *shareWebDav, name, argsJSON string) (string, too
 		trace.MS = time.Since(start).Milliseconds()
 		return text, trace
 
+	case "read_metadata":
+		meta, err := d.propfindMeta(relPath)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		var sb strings.Builder
+		sb.WriteString("KI-Metadaten von ")
+		sb.WriteString(relPath)
+		sb.WriteString(":\n")
+		if len(meta) == 0 {
+			sb.WriteString("  (keine — die Datei wurde vermutlich noch nicht von der KI angereichert)\n")
+		} else {
+			keys := make([]string, 0, len(meta))
+			for k := range meta {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				sb.WriteString("  " + k + " = " + meta[k] + "\n")
+			}
+		}
+		trace.Method = "propfind"
+		trace.Chars = len(sb.String())
+		trace.MS = time.Since(start).Milliseconds()
+		return sb.String(), trace
+
 	default:
 		trace.Error = "unbekanntes Tool"
 		trace.MS = time.Since(start).Milliseconds()
@@ -746,6 +848,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	sysPrompt := fmt.Sprintf(
 		"Du bist ein Assistent, der mit dem Inhalt des Cloud-Ordners „%s“ arbeitet. "+
 			"Du kannst dessen Inhalte mit den Tools list_directory (Verzeichnisinhalt), "+
+			"read_metadata (KI-Metadaten ohne Dateilesen), "+
 			"read_file (Dateitext, auch PDF/Office/SVG) und read_image (Bildbeschreibung) lesen. "+
 			"Pfade sind immer relativ zum Ordner (leerer Pfad = der Ordner selbst). "+
 			"Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast. "+
