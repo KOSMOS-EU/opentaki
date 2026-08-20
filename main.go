@@ -82,6 +82,10 @@ type Config struct {
 	} `yaml:"fallback"`
 	Routing RoutingConfig `yaml:"routing"`
 	DocMeta DocMetaConfig `yaml:"docmeta"`
+	OpenCloud struct {
+		URL string `yaml:"url"` // Pod-Mode: http://127.0.0.1:9200
+	} `yaml:"opencloud"`
+	Chat ChatConfig `yaml:"chat"`
 }
 
 // DocMetaConfig controls structured metadata extraction from documents.
@@ -525,16 +529,19 @@ func loadConfig(path string) Config {
 	cfg.DocMeta.ModelVersion = "qwen3-doctype-1.0"
 	cfg.DocMeta.RescuePass = true
 	cfg.DocMeta.RequiredFields = []string{"doc.date", "sender.company"}
+	cfg.OpenCloud.URL = "http://127.0.0.1:9200"
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("config %s not found, using defaults", path)
+		cfg.Chat.applyDefaults(&cfg)
 		cfg.loadDocMetaFiles(filepath.Dir(path))
 		return cfg
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("config parse error: %v", err)
 	}
+	cfg.Chat.applyDefaults(&cfg)
 	cfg.loadDocMetaFiles(filepath.Dir(path))
 	return cfg
 }
@@ -3946,6 +3953,7 @@ func main() {
 	if cfg.DocMeta.Enabled {
 		log.Printf("  DocMeta:   enabled (model=%s, rescue=%v, required=%v)", cfg.DocMeta.ModelVersion, cfg.DocMeta.RescuePass, cfg.DocMeta.RequiredFields)
 	}
+	log.Printf("  Chat:      /chat/ask (opencloud=%s, model=%s, max_iter=%d)", cfg.OpenCloud.URL, cfg.Chat.DefaultModel, cfg.Chat.MaxIterations)
 
 	srv := NewServer(cfg)
 
@@ -3955,6 +3963,8 @@ func main() {
 	http.HandleFunc("/taki/remount-pdf", srv.handleRemountPDF)
 	http.HandleFunc("/embed", srv.handleEmbed)
 	http.HandleFunc("/schema", srv.handleSchema)
+	http.HandleFunc("/chat/ask", srv.handleChatAsk)
+	http.HandleFunc("/chat/tools", srv.handleChatTools)
 	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/stats", srv.handleStats)
 	http.HandleFunc("/tika", srv.handleHealth)

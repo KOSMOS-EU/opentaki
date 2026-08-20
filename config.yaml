@@ -51,6 +51,19 @@ docmeta:
   prompt_file: ""        # default: /etc/open_taki/docmeta_prompt.txt
   rescue_prompt_file: "" # default: /etc/open_taki/docmeta_rescue_prompt.txt
 
+# OpenCloud (nur für den Ordner-Chat /chat/ask — WebDAV Public-Link-Shares)
+# Pod-Mode: opencloud + tika teilen den Netz-Namespace => 127.0.0.1
+opencloud:
+  url: "http://127.0.0.1:9200"
+
+# Ordner-Chat (POST /chat/ask): Tool-Loop, Modell liest Dateien selbst
+# über einen ephemeralen Public-Link-Share (view, password, 1h)
+chat:
+  max_iterations: 8        # max. Tool-Schritte pro Frage
+  default_model: ""        # default: llm.model
+  max_file_chars: 60000    # read_file-Kappung
+  max_listings: 100        # max. Einträge pro list_directory
+
 # Routing (active with X-Taki-Protocol: v2)
 routing:
   vector: always
