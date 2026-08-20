@@ -31,8 +31,11 @@ Also writes an additive XMP marker (taki namespace, previous taki
 block replaced) so the layered document carries its origin:
 engine, layer version, source sha256, page count, created.
 
-Text is embedded as invisible (render_mode=3). Original page content
-is preserved without re-rasterization.
+Text is embedded as invisible (render_mode=3). The output is an
+incremental (append-only) save: the original PDF bytes are kept
+untouched — only the overlay (text + XMP marker) is appended. A full
+re-save (garbage=4) would re-encode embedded images, which must not
+happen for verified replacement scans.
 """
 
 import json
@@ -195,7 +198,11 @@ def embed_ocr(input_path: str, output_path: str, layer_path: str) -> None:
         shutil.copy2(input_path, output_path)
         return
 
-    doc = fitz.open(input_path)
+    # Copy the original to the output path byte-for-byte, then append the
+    # overlay via an incremental save. The original bytes (scan images,
+    # structure, metadata) are never re-encoded or rewritten.
+    shutil.copy2(input_path, output_path)
+    doc = fitz.open(output_path)
 
     for page_idx, regions in _iter_pages(layer):
         if page_idx < 0 or page_idx >= len(doc):
@@ -209,7 +216,7 @@ def embed_ocr(input_path: str, output_path: str, layer_path: str) -> None:
 
     _write_xmp_marker(doc, layer)
 
-    doc.save(output_path, garbage=4, deflate=True)
+    doc.saveIncr()
     doc.close()
 
 
