@@ -792,6 +792,9 @@ type chatAskRequest struct {
 		Share      chatAskShare `json:"share"`
 		FolderName string       `json:"folder_name"`
 	} `json:"context"`
+	// Stream: live Fortschritt per Server-Sent-Events
+	// (start/phase/tool/error/done). Default false = finale JSON-Antwort.
+	Stream bool `json:"stream"`
 }
 
 type chatAskResponse struct {
@@ -873,12 +876,39 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	answer := ""
 	iterations := 0
 
-	log.Printf("chat/ask: folder=%q model=%s messages=%d", folder, model, len(req.Messages))
+	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v", folder, model, len(req.Messages), req.Stream)
+
+	// Stream: Live-Fortschritt per SSE. Client-Disconnect bricht die
+	// Iterationen ab. Nicht-flushbarer Writer → Fallback auf JSON-Antwort.
+	stream := false
+	var fl http.Flusher
+	if req.Stream {
+		if f, ok := w.(http.Flusher); ok {
+			stream = true
+			fl = f
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.WriteHeader(http.StatusOK)
+			if err := sseEvent(w, fl, "start", map[string]string{"model": model, "folder": folder}); err != nil {
+				return
+			}
+		}
+	}
 
 	for i := 0; i < s.cfg.Chat.MaxIterations; i++ {
 		iterations = i + 1
+		if stream {
+			if err := sseEvent(w, fl, "phase", map[string]string{"phase": "thinking", "iteration": strconv.Itoa(iterations)}); err != nil {
+				return
+			}
+		}
 		msg, finishReason, err := s.llmChatTools(model, messages, tools)
 		if err != nil {
+			if stream {
+				sseEvent(w, fl, "error", map[string]string{"error": err.Error()})
+				return
+			}
 			writeChatError(w, http.StatusBadGateway, err.Error())
 			return
 		}
@@ -902,6 +932,20 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			toolTrace = append(toolTrace, trace)
 			log.Printf("chat/ask: tool=%s path=%q ms=%d chars=%d truncated=%v err=%q",
 				tc.Function.Name, trace.Path, trace.MS, trace.Chars, trace.Truncated, trace.Error)
+			if stream {
+				if err := sseEvent(w, fl, "tool", map[string]interface{}{
+					"index":     len(toolTrace),
+					"tool":      tc.Function.Name,
+					"path":      trace.Path,
+					"method":    trace.Method,
+					"chars":     trace.Chars,
+					"truncated": trace.Truncated,
+					"error":     trace.Error,
+					"ms":        trace.MS,
+				}); err != nil {
+					return
+				}
+			}
 			messages = append(messages, chatToolMessage{
 				Role:       "tool",
 				Content:    strPtr(result),
@@ -927,6 +971,12 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		Iterations: iterations,
 		Model:      model,
 	}
+	if stream {
+		if err := sseEvent(w, fl, "done", resp); err != nil {
+			return
+		}
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -936,4 +986,18 @@ func writeChatError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(chatAskResponse{Error: msg})
+}
+
+// sseEvent schreibt ein Server-Sent-Events-Frame und flusht es sofort.
+// Fehler = Client hat die Verbindung geschlossen → aufrufende Seite bricht ab.
+func sseEvent(w http.ResponseWriter, fl http.Flusher, name string, data interface{}) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, payload); err != nil {
+		return err
+	}
+	fl.Flush()
+	return nil
 }
