@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -270,6 +271,20 @@ func safeRelPath(p string) (string, error) {
 	return path.Clean(p), nil
 }
 
+// humanSize rendert eine Byte-Zahl lesbar (0 = "0 B", z.B. auch für leere Dateien).
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return strconv.FormatInt(n, 10) + " B"
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
 // shareAuthError erkennt Share-Auth-/Scope-Fehler (401 = password/abgelaufen,
 // 404 = außerhalb des Share-Scope oder nicht vorhanden).
 func shareAuthError(resp *http.Response) (string, bool) {
@@ -287,6 +302,8 @@ func shareAuthError(resp *http.Response) (string, bool) {
 type listingEntry struct {
 	Name  string
 	IsDir bool
+	MTime string // "2006-01-02" (UTC), "" wenn unbekannt
+	Size  int64  // Bytes (0 für Verzeichnisse/unbekannt)
 }
 
 // propfind listet einen Ordner (Depth: 1). Liefert die Kind-Einträge, ohne
@@ -302,6 +319,8 @@ func (d *shareWebDav) propfind(relPath string) ([]listingEntry, error) {
   <d:prop>
     <d:displayname/>
     <d:resourcetype/>
+    <d:getlastmodified/>
+    <d:getcontentlength/>
   </d:prop>
 </d:propfind>`)
 
@@ -328,6 +347,8 @@ func (d *shareWebDav) propfind(relPath string) ([]listingEntry, error) {
 					ResourceType struct {
 						Collection *struct{} `xml:"collection"`
 					} `xml:"resourcetype"`
+					GetLastModified  string `xml:"getlastmodified"`
+					GetContentLength string `xml:"getcontentlength"`
 				} `xml:"prop"`
 			} `xml:"propstat"`
 		} `xml:"response"`
@@ -366,7 +387,25 @@ func (d *shareWebDav) propfind(relPath string) ([]listingEntry, error) {
 				}
 			}
 		}
-		entries = append(entries, listingEntry{Name: name, IsDir: isDir})
+		// Datum/Größe (Reva: RFC1123 / Dezimal-Bytes; fehlt bei Verzeichnissen)
+		var mtimeRaw, sizeRaw string
+		for _, ps := range r.Propstat {
+			if mtimeRaw == "" {
+				mtimeRaw = ps.Prop.GetLastModified
+			}
+			if sizeRaw == "" {
+				sizeRaw = ps.Prop.GetContentLength
+			}
+		}
+		var mdate string
+		if t, err := time.Parse(time.RFC1123, mtimeRaw); err == nil {
+			mdate = t.UTC().Format("2006-01-02")
+		}
+		var size int64
+		if n, err := strconv.ParseInt(sizeRaw, 10, 64); err == nil {
+			size = n
+		}
+		entries = append(entries, listingEntry{Name: name, IsDir: isDir, MTime: mdate, Size: size})
 	}
 	return entries, nil
 }
@@ -376,6 +415,8 @@ func (d *shareWebDav) propfind(relPath string) ([]listingEntry, error) {
 type walkEntry struct {
 	Rel   string
 	IsDir bool
+	MTime string
+	Size  int64
 }
 
 // propfindTree wandert begrenzten rekursiv (BFS) ab rootRel ab:
@@ -432,7 +473,7 @@ func (d *shareWebDav) propfindTree(rootRel string, maxDepth, maxEntries int) ([]
 				break
 			}
 			child := joinRel(it.rel, k.Name)
-			entries = append(entries, walkEntry{Rel: child, IsDir: k.IsDir})
+			entries = append(entries, walkEntry{Rel: child, IsDir: k.IsDir, MTime: k.MTime, Size: k.Size})
 			if k.IsDir {
 				queue = append(queue, qitem{rel: child, depth: it.depth + 1})
 			}
@@ -526,6 +567,12 @@ func (s *Server) runChatTool(d *shareWebDav, name, argsJSON string) (string, too
 			line := "  " + e.Rel
 			if e.IsDir {
 				line += "/"
+			}
+			if e.MTime != "" {
+				line += "  " + e.MTime
+			}
+			if !e.IsDir && e.Size > 0 {
+				line += "  " + humanSize(e.Size)
 			}
 			sb.WriteString(line + "\n")
 		}
