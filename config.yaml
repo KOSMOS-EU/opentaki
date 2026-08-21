@@ -66,10 +66,10 @@ opencloud:
 # Ordner-Chat (POST /chat/ask): Tool-Loop, Modell liest Dateien selbst
 # über einen ephemeralen Public-Link-Share (view, password, 1h)
 chat:
-  max_iterations: 8        # max. Tool-Schritte pro Frage
+  max_iterations: 20       # max. Tool-Schritte pro Frage
   default_model: ""        # default: llm.model
   max_file_chars: 60000    # read_file-Kappung
-  max_listings: 100        # max. Einträge im rekursiven list_directory
+  max_listings: 300        # max. Einträge im rekursiven list_directory
   list_depth: 3            # max. Verzeichnisebenen im rekursiven list_directory
 
 # Routing (active with X-Taki-Protocol: v2)
