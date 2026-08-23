@@ -1261,6 +1261,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"max. 100) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern). "+
 			"Zeige in der Frage eine kurze Beispiel-Auswahl aus dem, was du schon gesehen "+
 			"hast (max. 10 Einträge), damit der User echte Begriffe und Namen sehen kann. "+
+			"„Alle“ oder „komplett“ in der User-Frage beschreiben das Suchziel (finde alle "+
+			"passenden Treffer), nicht die Genehmigung, eine unvollständige Treffermenge "+
+			"komplett zu durchlaufen — eine solche Genehmigung zählt nur, wenn der User sie "+
+			"nach Kenntnis der Anzahl (found) ausdrücklich erteilt hat. "+
 			"Nach 3 Suchversuchen ohne Treffer frage den User ebenfalls, statt weiter zu "+
 			"raten. Wenn der User im Verlauf bereits eine solche Vorgabe gemacht hat, frage "+
 			"nicht erneut. "+
