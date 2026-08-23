@@ -124,13 +124,13 @@ func (s *Server) chatTools() []toolDefinition {
 		}},
 		{Type: "function", Function: toolFunction{
 			Name:        "search_item",
-			Description: "Sucht nach DATEIEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als read_file-Pfad nutzbar), Datum und Größe. Liefert KEINE Dateiinhalte. Bei großen Ordnern VORZIEHEN vor list_directory, um gezielt Dateien zu finden.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Dateinamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"}},"required":["pattern"]}`),
+			Description: "Sucht nach DATEIEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als read_file-Pfad nutzbar), Datum und Größe. Liefert KEINE Dateiinhalte. Bei großen Ordnern VORZIEHEN vor list_directory, um gezielt Dateien zu finden. Mit dem optionalen extra-Parameter lassen sich Treffer zusätzlich nach Dateityp, Tag und KI-Metadaten eingrenzen.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Dateinamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft. Beispiele: \"metadata.doc.type:rechnung\" (KI-Dokumenttyp), \"mediatype:pdf\" (Dateityp), \"metadata.doc.date:*2025*\" (Dokumentenjahr), \"tag:privat\" (Tag). Wildcards OHNE Anführungszeichen. Metadaten-Felder nur bei KI-angereicherten Dateien."}},"required":["pattern"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
 			Name:        "search_dir",
-			Description: "Sucht nach VERZEICHNISSEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als list_directory-/read_file-Pfad nutzbar) und Datum. Zum Finden des richtigen Unterverzeichnisses.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"}},"required":["pattern"]}`),
+			Description: "Sucht nach VERZEICHNISSEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als list_directory-/read_file-Pfad nutzbar) und Datum. Zum Finden des richtigen Unterverzeichnisses. Optional: extra-Parameter wie bei search_item (AND-Verknüpfung).",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft (wie bei search_item)."}},"required":["pattern"]}`),
 		}},
 	}
 }
@@ -683,11 +683,21 @@ func stripScopePrefix(hitPath, scopeFolder string) string {
 	return hitPath // außerhalb des Scope (serverseitig ausgeschlossen)
 }
 
+// buildSearchQuery komponiert die KQL-Suchabfrage: Name-Teilstring
+// (+ optionaler extra-Filter per AND) + Scope (Resource-ID).
+func buildSearchQuery(pattern, extra, scopeID string) string {
+	q := `name:"*` + escapeBlevePattern(pattern) + `*"`
+	if extra = strings.TrimSpace(extra); extra != "" {
+		q += ` AND (` + extra + `)`
+	}
+	return q + ` scope:` + scopeID
+}
+
 // search führt eine WebDAV-REPORT-Suche aus, auf den geteilten Ordner
 // beschränkt (scope: Resource-ID). Liefert Treffer (Pfade relativ zur
 // Space-Root) + Gesamtzahl (Content-Range, 0 wenn nicht bekannt).
-func (u *userWebDav) search(pattern string, limit int) ([]searchHit, int, error) {
-	blevePattern := `name:"*` + escapeBlevePattern(pattern) + `*" scope:` + u.scopeID
+func (u *userWebDav) search(pattern, extra string, limit int) ([]searchHit, int, error) {
+	blevePattern := buildSearchQuery(pattern, extra, u.scopeID)
 	body := fmt.Sprintf(
 		`<?xml version="1.0" encoding="utf-8"?>\n<oc:search-files xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">\n  <oc:search>\n    <oc:pattern>%s</oc:pattern>\n    <oc:limit>%d</oc:limit>\n  </oc:search>\n</oc:search-files>`,
 		escapeXML(blevePattern), limit)
@@ -805,6 +815,7 @@ type toolTrace struct {
 	Tool      string `json:"tool"`
 	Path      string `json:"path,omitempty"`
 	Pattern   string `json:"pattern,omitempty"`
+	Extra     string `json:"extra,omitempty"`
 	Method    string `json:"method,omitempty"`
 	Chars     int    `json:"chars"`
 	Truncated bool   `json:"truncated,omitempty"`
@@ -822,6 +833,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 	var args struct {
 		Path    string `json:"path"`
 		Pattern string `json:"pattern"`
+		Extra   string `json:"extra"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
@@ -849,14 +861,16 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			return "Fehler: Suche ist für diesen Ordner nicht verfügbar.", trace
 		}
 		pattern := strings.TrimSpace(args.Pattern)
+		extra := strings.TrimSpace(args.Extra)
 		trace.Pattern = pattern
+		trace.Extra = extra
 		if len(pattern) < 2 {
 			trace.Error = "Pattern zu kurz"
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Such-Pattern braucht mindestens 2 Zeichen.", trace
 		}
 		maxResults := s.cfg.Chat.Search.MaxResults
-		hits, total, err := u.search(pattern, maxResults*3)
+		hits, total, err := u.search(pattern, extra, maxResults*3)
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
@@ -867,7 +881,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			kind = "Ordner-Suche"
 		}
 		var sb strings.Builder
-		sb.WriteString(kind + " „" + pattern + "“ in diesem Ordner:\n")
+		sb.WriteString(kind + " „" + pattern + "“")
+		if extra != "" {
+			sb.WriteString(" (Filter: " + extra + ")")
+		}
+		sb.WriteString(" in diesem Ordner:\n")
 		shown := 0
 		for _, hit := range hits {
 			if hit.IsDir != (name == "search_dir") {
@@ -1161,7 +1179,13 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	if searchAvailable {
 		searchTools = "Bei großen Ordnern: erst mit search_item (Dateien) oder search_dir (Verzeichnisse) " +
 			"suchen, statt alles aufzulisten. Suchtreffer sind mit read_file lesbar " +
-			"(Pfad relativ zum Ordner). "
+			"(Pfad relativ zum Ordner). " +
+			"Strukturierte Suche: der optionale extra-Parameter verknüpft eine zusätzliche " +
+			"Bedingung mit AND, z. B. extra=\"metadata.doc.type:rechnung\" (KI-Dokumenttyp), " +
+			"extra=\"mediatype:pdf\" (Dateityp), extra=\"metadata.doc.date:*2025*\" (Dokumentenjahr), " +
+			"extra=\"tag:privat\" (Tag) — Wildcards OHNE Anführungszeichen. Metadaten-Felder " +
+			"(doc.type, doc.date, doc.title, doc.subject, sender.name, amounts.total) existieren " +
+			"nur bei KI-angereicherten Dateien. "
 	}
 	sysPrompt := fmt.Sprintf(
 		"Du bist ein Assistent, der mit dem Inhalt des Cloud-Ordners „%s“ arbeitet. "+
@@ -1275,14 +1299,15 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		for _, tc := range msg.ToolCalls {
 			result, trace := s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
 			toolTrace = append(toolTrace, trace)
-			log.Printf("chat/ask: tool=%s path=%q pattern=%q ms=%d chars=%d truncated=%v err=%q",
-				tc.Function.Name, trace.Path, trace.Pattern, trace.MS, trace.Chars, trace.Truncated, trace.Error)
+			log.Printf("chat/ask: tool=%s path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
+				tc.Function.Name, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
 			if stream {
 				if err := sse.event("tool", map[string]interface{}{
 					"index":     len(toolTrace),
 					"tool":      tc.Function.Name,
 					"path":      trace.Path,
 					"pattern":   trace.Pattern,
+					"extra":     trace.Extra,
 					"method":    trace.Method,
 					"chars":     trace.Chars,
 					"truncated": trace.Truncated,

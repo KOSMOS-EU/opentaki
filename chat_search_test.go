@@ -26,6 +26,34 @@ func TestStripScopePrefix(t *testing.T) {
 	}
 }
 
+func TestBuildSearchQuery(t *testing.T) {
+	cases := []struct {
+		name, pattern, extra, scopeID, want string
+	}{
+		{"nur-pattern", "Rechnung", "", "a$b", `name:"*Rechnung*" scope:a$b`},
+		{"mit-extra", "Rechnung", "metadata.doc.type:rechnung", "a$b",
+			`name:"*Rechnung*" AND (metadata.doc.type:rechnung) scope:a$b`},
+		{"extra-mit-quotes", "Rechnung", `metadata.doc.type:"kosten bescheid"`, "a$b",
+			`name:"*Rechnung*" AND (metadata.doc.type:"kosten bescheid") scope:a$b`},
+		{"extra-wildcard", "2025", "metadata.doc.date:*2025*", "a$b",
+			`name:"*2025*" AND (metadata.doc.date:*2025*) scope:a$b`},
+		{"extra-or-group", "2025", `metadata.doc.date:*2025* OR tag:privat`, "a$b",
+			`name:"*2025*" AND (metadata.doc.date:*2025* OR tag:privat) scope:a$b`},
+		{"extra-whitespace", "Rechnung", "  mediatype:pdf  ", "a$b",
+			`name:"*Rechnung*" AND (mediatype:pdf) scope:a$b`},
+		{"extra-leer-nach-trim", "Rechnung", "   ", "a$b", `name:"*Rechnung*" scope:a$b`},
+		{"pattern-escaped", `An " Quote`, "tag:x", "a$b",
+			`name:"*An \" Quote*" AND (tag:x) scope:a$b`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildSearchQuery(tc.pattern, tc.extra, tc.scopeID); got != tc.want {
+				t.Errorf("buildSearchQuery(%q, %q, %q) = %q, want %q", tc.pattern, tc.extra, tc.scopeID, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEscapeBlevePattern(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"einfach", "einfach"},
