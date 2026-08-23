@@ -1185,7 +1185,9 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"extra=\"mediatype:pdf\" (Dateityp), extra=\"metadata.doc.date:*2025*\" (Dokumentenjahr), " +
 			"extra=\"tag:privat\" (Tag) — Wildcards OHNE Anführungszeichen. Metadaten-Felder " +
 			"(doc.type, doc.date, doc.title, doc.subject, sender.name, amounts.total) existieren " +
-			"nur bei KI-angereicherten Dateien. "
+			"nur bei KI-angereicherten Dateien. Metadaten-Werte sind exakt indiziert: ein Wert " +
+			"ohne Wildcard muss stimmen, mit Wildcard (*wert*) matcht er als Substring im " +
+			"gesamten Feldwert. Mehrwort-Begriffe in extra gehören in Anführungszeichen. "
 	}
 	sysPrompt := fmt.Sprintf(
 		"Du bist ein Assistent, der mit dem Inhalt des Cloud-Ordners „%s“ arbeitet. "+
@@ -1203,6 +1205,17 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools "+
 			"in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander "+
 			"in separaten Schritten. "+
+			"Beurteile vor großem Arbeitsaufwand, ob die Aufgabe in überschaubarem Rahmen "+
+			"erledigbar ist (Faustregel: das Listing zeigt deutlich mehr als 50 Dateien, oder "+
+			"du hast bereits 3 Suchversuche ohne Treffer unternommen). Wenn nicht, iteriere "+
+			"nicht blind weiter — beende deinen Turn mit einer kurzen, konkreten Frage an den "+
+			"User und biete an: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), "+
+			"(2) limitieren (bestimmter Unterordner, Dateityp, Ergebnislimit) oder (3) alles "+
+			"durchlaufen lassen (kann mehrere Minuten dauern). Zur Unterstützung zeige in der "+
+			"Frage eine kurze Beispiel-Auswahl aus dem, was du schon gesehen hast (max. 10 "+
+			"Einträge, z. B. erste Zeilen eines Listings oder Treffer einer lockeren "+
+			"Namenssuche), damit der User echte Begriffe und Namen sehen kann. Wenn der User "+
+			"im Verlauf bereits eine solche Vorgabe gemacht hat, frage nicht erneut. "+
 			"Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort "+
 			"explizit, dass dieses Dokument nur teilweise ausgewertet wurde. "+
 			"Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.",
@@ -1219,9 +1232,14 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	d := newShareWebDav(s, req.Context.Share.Token, req.Context.Share.Password)
-	toolTrace := make([]toolTrace, 0, 8)
+	toolTraces := make([]toolTrace, 0, 8)
 	answer := ""
 	iterations := 0
+	// Loop-Schutz: Tool-Calls mit identischen Parametern werden nicht
+	// erneut ausgeführt — sie liefern per Definition dasselbe Ergebnis.
+	// stattdessen erhält das Modell einen Hinweis, die Parameter zu
+	// ändern oder den User zu fragen.
+	seenToolCalls := map[string]int{}
 
 	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v search=%v", folder, model, len(req.Messages), req.Stream, searchAvailable)
 
@@ -1297,13 +1315,26 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, tc := range msg.ToolCalls {
-			result, trace := s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
-			toolTrace = append(toolTrace, trace)
+			callKey := tc.Function.Name + "\x00" + strings.TrimSpace(tc.Function.Arguments)
+			var result string
+			var trace toolTrace
+			if prevChars, alreadyRun := seenToolCalls[callKey]; alreadyRun {
+				result = fmt.Sprintf("Wiederholung: Dieser Tool-Call (tool=%s, identische Parameter) "+
+					"wurde bereits ausgeführt und bringt kein neues Ergebnis (letzte Ausführung: "+
+					"%d Zeichen). Ändere die Parameter (z. B. anderes Pattern, anderes extra, "+
+					"anderer Pfad) oder beende den Turn mit einer Antwort bzw. Frage an den User.",
+					tc.Function.Name, prevChars)
+				trace = toolTrace{Tool: tc.Function.Name, Method: "duplicate", Chars: len(result)}
+			} else {
+				result, trace = s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
+				seenToolCalls[callKey] = len(result)
+			}
+			toolTraces = append(toolTraces, trace)
 			log.Printf("chat/ask: tool=%s path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
 				tc.Function.Name, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
 			if stream {
 				if err := sse.event("tool", map[string]interface{}{
-					"index":     len(toolTrace),
+					"index":     len(toolTraces),
 					"tool":      tc.Function.Name,
 					"path":      trace.Path,
 					"pattern":   trace.Pattern,
@@ -1338,7 +1369,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 
 	resp := chatAskResponse{
 		Answer:     answer,
-		ToolTrace:  toolTrace,
+		ToolTrace:  toolTraces,
 		Iterations: iterations,
 		Model:      model,
 	}
