@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,6 +42,19 @@ type ChatConfig struct {
 	MaxFileChars  int    `yaml:"max_file_chars"` // default 60000
 	MaxListings   int    `yaml:"max_listings"`   // max. Einträge im rekursiven Listing, default 100
 	ListDepth     int    `yaml:"list_depth"`     // max. Verzeichnisebenen im rekursiven Listing, default 3
+	Search        ChatSearchConfig    `yaml:"search"`
+	Heartbeat     ChatHeartbeatConfig `yaml:"heartbeat"`
+}
+
+// ChatSearchConfig steuert die WebDAV-REPORT-Suche (yaml: chat.search:)
+type ChatSearchConfig struct {
+	WebDavURL  string `yaml:"webdav_url"`  // Default http://127.0.0.1:9115
+	MaxResults int    `yaml:"max_results"` // Default 20, Cap 100
+}
+
+// ChatHeartbeatConfig steuert den SSE-Heartbeat (yaml: chat.heartbeat:)
+type ChatHeartbeatConfig struct {
+	IntervalSeconds int `yaml:"interval_seconds"` // Default 20, <5 = aus
 }
 
 func (c *ChatConfig) applyDefaults(cfg *Config) {
@@ -58,6 +72,18 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = cfg.LLM.Model
+	}
+	if c.Search.WebDavURL == "" {
+		c.Search.WebDavURL = "http://127.0.0.1:9115"
+	}
+	if c.Search.MaxResults < 1 {
+		c.Search.MaxResults = 20
+	}
+	if c.Search.MaxResults > 100 {
+		c.Search.MaxResults = 100
+	}
+	if c.Heartbeat.IntervalSeconds < 5 {
+		c.Heartbeat.IntervalSeconds = 20
 	}
 }
 
@@ -95,6 +121,16 @@ func (s *Server) chatTools() []toolDefinition {
 			Name:        "read_metadata",
 			Description: "Liefert die KI-Metadaten eines Dokuments (Dokumenttyp, Betreff, Datum, Referenz, Absender/Empfänger, Beträge, Tags) OHNE den Dateiinhalt zu laden — zum schnellen Drüberschauen und um zu entscheiden, welche Dateien man mit read_file im Detail lesen muss. Liefert Werte nur, wenn die Datei bereits von der KI angereichert wurde; sonst Hinweis. Pfade relativ zum geteilten Ordner.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"}},"required":["path"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "search_item",
+			Description: "Sucht nach DATEIEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als read_file-Pfad nutzbar), Datum und Größe. Liefert KEINE Dateiinhalte. Bei großen Ordnern VORZIEHEN vor list_directory, um gezielt Dateien zu finden.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Dateinamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"}},"required":["pattern"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "search_dir",
+			Description: "Sucht nach VERZEICHNISSEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als list_directory-/read_file-Pfad nutzbar) und Datum. Zum Finden des richtigen Unterverzeichnisses.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"}},"required":["pattern"]}`),
 		}},
 	}
 }
@@ -584,11 +620,191 @@ func (d *shareWebDav) getfile(relPath string) ([]byte, string, error) {
 	return data, resp.Header.Get("Content-Type"), nil
 }
 
+// ── WebDAV-Client (User-JWT, Search) ─────────────────────────
+//
+// Der Proxy (OIDC-gate) prägt pro Request einen User-Reva-JWT und übergibt
+// ihn an Taki als x-access-token. Damit kann Taki den webdav-Service DIREKT
+// (pod-intern, nicht über den Proxy) für die REPORT-Suche nutzen. Der JWT
+// gilt 1 Tag; wird nie geloggt. Der Scope (Resource-ID + Ordner-Pfad) kommt
+// vom Client und verengt die serverseitig bereits user-gefilterte Suche —
+// er ist KEIN Privilege-Eskalationshebel.
+
+type searchHit struct {
+	SpaceID string // <storageid>$<spaceid>[!<opaqueid>]
+	Path    string // relativ zur Space-Root
+	IsDir   bool
+	MTime   string // "2006-01-02" (UTC), "" wenn unbekannt
+	Size    int64
+}
+
+type userWebDav struct {
+	client    *http.Client
+	base      string // http://127.0.0.1:9115
+	jwt       string // User-Reva-JWT (nie loggen)
+	scopeID   string // <storageid>$<spaceid>!<opaqueid>, "" = keine Suche
+	scopePath string // geteilter Ordner relativ zur Space-Root, "" = Root
+}
+
+func newUserWebDav(s *Server, jwt string) *userWebDav {
+	return &userWebDav{
+		client: &http.Client{Timeout: 30 * time.Second},
+		base:   strings.TrimRight(s.cfg.Chat.Search.WebDavURL, "/"),
+		jwt:    jwt,
+	}
+}
+
+// escapeBlevePattern escapiert Bleve-Spezialzeichen — das Pattern wird als
+// Phrase in Anführungszeichen an Bleve übergeben.
+func escapeBlevePattern(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
+}
+
+// escapeXML escapiert XML-Reservatezeichen (&, <, >).
+func escapeXML(s string) string {
+	var sb strings.Builder
+	_ = xml.EscapeText(&sb, []byte(s))
+	return sb.String()
+}
+
+// stripScopePrefix übersetzt einen Treffer-Pfad (relativ zur Space-Root) in
+// einen Pfad relativ zum geteilten Ordner (konsistent mit read_file).
+func stripScopePrefix(hitPath, scopeFolder string) string {
+	prefix := strings.TrimSuffix(strings.TrimPrefix(scopeFolder, "/"), "/")
+	if prefix == "" || prefix == "." {
+		return hitPath
+	}
+	if hitPath == prefix {
+		return ""
+	}
+	if strings.HasPrefix(hitPath, prefix+"/") {
+		return hitPath[len(prefix)+1:]
+	}
+	return hitPath // außerhalb des Scope (serverseitig ausgeschlossen)
+}
+
+// search führt eine WebDAV-REPORT-Suche aus, auf den geteilten Ordner
+// beschränkt (scope: Resource-ID). Liefert Treffer (Pfade relativ zur
+// Space-Root) + Gesamtzahl (Content-Range, 0 wenn nicht bekannt).
+func (u *userWebDav) search(pattern string, limit int) ([]searchHit, int, error) {
+	blevePattern := `name:"*` + escapeBlevePattern(pattern) + `*" scope:` + u.scopeID
+	body := fmt.Sprintf(
+		`<?xml version="1.0" encoding="utf-8"?>\n<oc:search-files xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">\n  <oc:search>\n    <oc:pattern>%s</oc:pattern>\n    <oc:limit>%d</oc:limit>\n  </oc:search>\n</oc:search-files>`,
+		escapeXML(blevePattern), limit)
+	req, err := http.NewRequest("REPORT", u.base+"/dav/spaces", strings.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
+	req.Header.Set("Depth", "0")
+	req.Header.Set("x-access-token", u.jwt)
+
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("Suche nicht möglich: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
+		return nil, 0, fmt.Errorf("Suche nicht möglich (HTTP %d)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusMultiStatus {
+		return nil, 0, fmt.Errorf("Suche: unerwarteter HTTP %d", resp.StatusCode)
+	}
+
+	// Gesamtzahl aus Content-Range: rows 0-N/Total (nur bei >0 Treffern)
+	total := 0
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		if idx := strings.LastIndex(cr, "/"); idx >= 0 && idx+1 < len(cr) {
+			if n, err := strconv.Atoi(cr[idx+1:]); err == nil {
+				total = n
+			}
+		}
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	if err != nil {
+		return nil, 0, err
+	}
+	return parseSearchResponse(raw), total, nil
+}
+
+type searchResponse struct {
+	XMLName xml.Name             `xml:"multistatus"`
+	Rests   []searchResponseRest `xml:"response"`
+}
+
+type searchResponseRest struct {
+	Href  string           `xml:"href"`
+	Props []searchPropstat `xml:"propstat"`
+}
+
+type searchPropstat struct {
+	Prop searchProp `xml:"prop"`
+}
+
+type searchProp struct {
+	// Pointer statt bool: Go setzt bool-Felder nur aus Zeichendaten,
+	// <d:collection/> ist aber ein leeres Element → Präsenz prüfen.
+	Collection    *struct{} `xml:"resourcetype>collection"`
+	LastModified  string    `xml:"getlastmodified"` // RFC1123
+	ContentLength string    `xml:"getcontentlength"`
+	DirSize       string    `xml:"size"`
+}
+
+// parseSearchResponse zerlegt die 207-MULTISTATUS-Antwort in Treffer.
+// Href-Format: /dav/spaces/<storageid>$<spaceid>[!<opaqueid>]/<Space-Root-relativer-Pfad>
+func parseSearchResponse(raw []byte) []searchHit {
+	var rsp searchResponse
+	if err := xml.Unmarshal(raw, &rsp); err != nil {
+		log.Printf("chat/search: Antwort nicht parsebar: %v", err)
+		return nil
+	}
+	const hrefPrefix = "/dav/spaces/"
+	hits := make([]searchHit, 0, len(rsp.Rests))
+	for _, rest := range rsp.Rests {
+		if !strings.HasPrefix(rest.Href, hrefPrefix) {
+			continue
+		}
+		restPath := rest.Href[len(hrefPrefix):]
+		slash := strings.Index(restPath, "/")
+		if slash < 0 {
+			continue // Space-Root selbst, kein Eintrag
+		}
+		hitPath, err := url.PathUnescape(restPath[slash+1:])
+		if err != nil {
+			continue
+		}
+		hit := searchHit{
+			SpaceID: restPath[:slash],
+			Path:    strings.TrimPrefix(hitPath, "/"),
+		}
+		for _, ps := range rest.Props {
+			if ps.Prop.Collection != nil {
+				hit.IsDir = true
+			}
+			if v := ps.Prop.LastModified; v != "" {
+				if t, err := http.ParseTime(v); err == nil {
+					hit.MTime = t.UTC().Format("2006-01-02")
+				}
+			}
+			if v := ps.Prop.ContentLength; v != "" {
+				hit.Size, _ = strconv.ParseInt(v, 10, 64)
+			} else if v := ps.Prop.DirSize; v != "" {
+				hit.Size, _ = strconv.ParseInt(v, 10, 64)
+			}
+		}
+		hits = append(hits, hit)
+	}
+	return hits
+}
+
 // ── Tool-Ausführung ──────────────────────────────────────────
 
 type toolTrace struct {
 	Tool      string `json:"tool"`
 	Path      string `json:"path,omitempty"`
+	Pattern   string `json:"pattern,omitempty"`
 	Method    string `json:"method,omitempty"`
 	Chars     int    `json:"chars"`
 	Truncated bool   `json:"truncated,omitempty"`
@@ -597,27 +813,96 @@ type toolTrace struct {
 }
 
 // runChatTool führt einen Tool-Call aus und liefert (tool-Result, Trace).
-func (s *Server) runChatTool(d *shareWebDav, name, argsJSON string) (string, toolTrace) {
+// u (userWebDav) darf fehlen, wenn der Request kein User-JWT mitschickt —
+// die Such-Tools melden dann "Suche nicht verfügbar".
+func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON string) (string, toolTrace) {
 	start := time.Now()
 	trace := toolTrace{Tool: name}
 
 	var args struct {
-		Path string `json:"path"`
+		Path    string `json:"path"`
+		Pattern string `json:"pattern"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
 		trace.MS = time.Since(start).Milliseconds()
 		return "Fehler: ungültige Tool-Argumente: " + err.Error(), trace
 	}
-	relPath, err := safeRelPath(args.Path)
-	if err != nil {
-		trace.Error = err.Error()
-		trace.MS = time.Since(start).Milliseconds()
-		return "Fehler: " + err.Error(), trace
+	isSearch := name == "search_item" || name == "search_dir"
+	relPath := ""
+	if !isSearch {
+		cleanPath, err := safeRelPath(args.Path)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		relPath = cleanPath
 	}
 	trace.Path = relPath
 
 	switch name {
+	case "search_item", "search_dir":
+		if u == nil || u.scopeID == "" {
+			trace.Error = "Suche nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Suche ist für diesen Ordner nicht verfügbar.", trace
+		}
+		pattern := strings.TrimSpace(args.Pattern)
+		trace.Pattern = pattern
+		if len(pattern) < 2 {
+			trace.Error = "Pattern zu kurz"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Such-Pattern braucht mindestens 2 Zeichen.", trace
+		}
+		maxResults := s.cfg.Chat.Search.MaxResults
+		hits, total, err := u.search(pattern, maxResults*3)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		kind := "Datei-Suche"
+		if name == "search_dir" {
+			kind = "Ordner-Suche"
+		}
+		var sb strings.Builder
+		sb.WriteString(kind + " „" + pattern + "“ in diesem Ordner:\n")
+		shown := 0
+		for _, hit := range hits {
+			if hit.IsDir != (name == "search_dir") {
+				continue
+			}
+			shown++
+			if shown > maxResults {
+				break
+			}
+			rel := stripScopePrefix(hit.Path, u.scopePath)
+			line := "  " + rel
+			if hit.IsDir {
+				line += "/"
+			}
+			if hit.MTime != "" {
+				line += "  " + hit.MTime
+			}
+			if !hit.IsDir && hit.Size > 0 {
+				line += "  " + humanSize(hit.Size)
+			}
+			sb.WriteString(line + "\n")
+		}
+		if shown == 0 {
+			sb.WriteString("  (keine Treffer — anderes Pattern versuchen)\n")
+		}
+		if total > maxResults {
+			sb.WriteString(fmt.Sprintf("  … Treffer gekürzt: max. %d, Gesamtzahl %d. "+
+				"Pattern eingrenzen oder ein Unterverzeichnis direkt auflisten.\n", maxResults, total))
+			trace.Truncated = true
+		}
+		trace.Method = "report"
+		trace.Chars = len(sb.String())
+		trace.MS = time.Since(start).Milliseconds()
+		return sb.String(), trace
+
 	case "list_directory":
 		maxDepth := s.cfg.Chat.ListDepth
 		entries, depthCut, entryCut, err := d.propfindTree(relPath, maxDepth, s.cfg.Chat.MaxListings)
@@ -791,6 +1076,13 @@ type chatAskRequest struct {
 	Context struct {
 		Share      chatAskShare `json:"share"`
 		FolderName string       `json:"folder_name"`
+		// Scope: der geteilte Ordner als Resource-ID (
+		// <storageid>$<spaceid>!<opaqueid>) + Pfad relativ zur Space-Root.
+		// Beide optional — ohne Scope keine Such-Tools.
+		Scope struct {
+			ResourceID string `json:"resource_id"`
+			Path       string `json:"path"`
+		} `json:"scope"`
 	} `json:"context"`
 	// Stream: live Fortschritt per Server-Sent-Events
 	// (start/phase/tool/error/done). Default false = finale JSON-Antwort.
@@ -843,16 +1135,40 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 
 	tools := s.chatTools()
 
+	// User-JWT (vom Proxy als x-access-token, Bearer-Fallback für
+	// Direkt-Tests) → WebDAV-REPORT-Suche auf den mitgeschickten Scope.
+	jwt := r.Header.Get("x-access-token")
+	if jwt == "" {
+		const bearerPrefix = "Bearer "
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, bearerPrefix) {
+			jwt = strings.TrimPrefix(h, bearerPrefix)
+		}
+	}
+	var u *userWebDav
+	if jwt != "" {
+		u = newUserWebDav(s, jwt)
+		u.scopeID = req.Context.Scope.ResourceID
+		u.scopePath = req.Context.Scope.Path
+	}
+	searchAvailable := u != nil && u.scopeID != ""
+
 	// System-Prompt (serverseitig, deterministisch)
 	folder := req.Context.FolderName
 	if folder == "" {
 		folder = "der geteilte Ordner"
+	}
+	searchTools := ""
+	if searchAvailable {
+		searchTools = "Bei großen Ordnern: erst mit search_item (Dateien) oder search_dir (Verzeichnisse) " +
+			"suchen, statt alles aufzulisten. Suchtreffer sind mit read_file lesbar " +
+			"(Pfad relativ zum Ordner). "
 	}
 	sysPrompt := fmt.Sprintf(
 		"Du bist ein Assistent, der mit dem Inhalt des Cloud-Ordners „%s“ arbeitet. "+
 			"Du kannst dessen Inhalte mit den Tools list_directory (Verzeichnisinhalt), "+
 			"read_metadata (KI-Metadaten ohne Dateilesen), "+
 			"read_file (Dateitext, auch PDF/Office/SVG) und read_image (Bildbeschreibung) lesen. "+
+			"%s"+
 			"Pfade sind immer relativ zum Ordner (leerer Pfad = der Ordner selbst). "+
 			"Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast. "+
 			"Lies nur Dateien, die für die Frage relevant sind. "+
@@ -866,7 +1182,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort "+
 			"explizit, dass dieses Dokument nur teilweise ausgewertet wurde. "+
 			"Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.",
-		folder)
+		folder, searchTools)
 
 	messages := make([]chatToolMessage, 0, len(req.Messages)+4)
 	messages = append(messages, chatToolMessage{Role: "system", Content: strPtr(sysPrompt)})
@@ -883,37 +1199,59 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	answer := ""
 	iterations := 0
 
-	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v", folder, model, len(req.Messages), req.Stream)
+	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v search=%v", folder, model, len(req.Messages), req.Stream, searchAvailable)
 
 	// Stream: Live-Fortschritt per SSE. Client-Disconnect bricht die
 	// Iterationen ab. Nicht-flushbarer Writer → Fallback auf JSON-Antwort.
+	// Der Heartbeat (SSE-Kommentar ": ping") hält die Verbindung über
+	// Traefik-Idle-Timeouts am Leben, während das Modell wartet.
 	stream := false
-	var fl http.Flusher
+	var sse *sseStream
 	if req.Stream {
 		if f, ok := w.(http.Flusher); ok {
 			stream = true
-			fl = f
+			sse = &sseStream{w: w, fl: f}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(http.StatusOK)
-			if err := sseEvent(w, fl, "start", map[string]string{"model": model, "folder": folder}); err != nil {
+			if err := sse.event("start", map[string]string{"model": model, "folder": folder}); err != nil {
 				return
 			}
+			heartbeatDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(time.Duration(s.cfg.Chat.Heartbeat.IntervalSeconds) * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						sse.ping()
+					case <-heartbeatDone:
+						return
+					}
+				}
+			}()
+			defer close(heartbeatDone)
 		}
 	}
 
 	for i := 0; i < s.cfg.Chat.MaxIterations; i++ {
 		iterations = i + 1
+		// Toter Client: abgebrochene Verbindung soll keine LLM-Iterationen
+		// mehr verbrennen.
+		if r.Context().Err() != nil {
+			log.Printf("chat/ask: Client-Verbindung abgebrochen, Abbruch nach %d Iteration(en)", iterations-1)
+			return
+		}
 		if stream {
-			if err := sseEvent(w, fl, "phase", map[string]string{"phase": "thinking", "iteration": strconv.Itoa(iterations)}); err != nil {
+			if err := sse.event("phase", map[string]string{"phase": "thinking", "iteration": strconv.Itoa(iterations)}); err != nil {
 				return
 			}
 		}
 		msg, finishReason, err := s.llmChatTools(model, messages, tools)
 		if err != nil {
 			if stream {
-				sseEvent(w, fl, "error", map[string]string{"error": err.Error()})
+				sse.event("error", map[string]string{"error": err.Error()})
 				return
 			}
 			writeChatError(w, http.StatusBadGateway, err.Error())
@@ -935,15 +1273,16 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, tc := range msg.ToolCalls {
-			result, trace := s.runChatTool(d, tc.Function.Name, tc.Function.Arguments)
+			result, trace := s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
 			toolTrace = append(toolTrace, trace)
-			log.Printf("chat/ask: tool=%s path=%q ms=%d chars=%d truncated=%v err=%q",
-				tc.Function.Name, trace.Path, trace.MS, trace.Chars, trace.Truncated, trace.Error)
+			log.Printf("chat/ask: tool=%s path=%q pattern=%q ms=%d chars=%d truncated=%v err=%q",
+				tc.Function.Name, trace.Path, trace.Pattern, trace.MS, trace.Chars, trace.Truncated, trace.Error)
 			if stream {
-				if err := sseEvent(w, fl, "tool", map[string]interface{}{
+				if err := sse.event("tool", map[string]interface{}{
 					"index":     len(toolTrace),
 					"tool":      tc.Function.Name,
 					"path":      trace.Path,
+					"pattern":   trace.Pattern,
 					"method":    trace.Method,
 					"chars":     trace.Chars,
 					"truncated": trace.Truncated,
@@ -979,7 +1318,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		Model:      model,
 	}
 	if stream {
-		if err := sseEvent(w, fl, "done", resp); err != nil {
+		if err := sse.event("done", resp); err != nil {
 			return
 		}
 		return
@@ -995,16 +1334,36 @@ func writeChatError(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(chatAskResponse{Error: msg})
 }
 
-// sseEvent schreibt ein Server-Sent-Events-Frame und flusht es sofort.
+// sseStream serialisiert alle SSE-Write (Event-Daten + Heartbeat-Goroutine).
+type sseStream struct {
+	w  http.ResponseWriter
+	fl http.Flusher
+	mu sync.Mutex
+}
+
+// event schreibt einen SSE-Frame und flusht ihn sofort.
 // Fehler = Client hat die Verbindung geschlossen → aufrufende Seite bricht ab.
-func sseEvent(w http.ResponseWriter, fl http.Flusher, name string, data interface{}) error {
+func (s *sseStream) event(name string, data interface{}) error {
 	payload, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, payload); err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", name, payload); err != nil {
 		return err
 	}
-	fl.Flush()
+	s.fl.Flush()
 	return nil
+}
+
+// ping schreibt einen SSE-Kommentar-Frame — von allen Client-Parsers
+// ignoriert, hält aber die TCP-Verbindung über Reverse-Proxy-Idle-Timeouts
+// am Leben. Bei totem Client fehlerstill (Goroutine endet ohnehin beim
+// Request-Ende).
+func (s *sseStream) ping() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprint(s.w, ": ping\n\n")
+	s.fl.Flush()
 }
