@@ -1125,6 +1125,34 @@ func (s *Server) handleChatTools(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(s.chatTools())
 }
 
+// truncateChars kürzt einen String auf n Runes, mit Kürzungs-Hinweis.
+func truncateChars(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + " … (gekürzt)"
+}
+
+// loopBreakAnswer baut die finale Antwort nach einem serverseitigen
+// Loop-Abbruch: Grund + Zwischenergebnis (falls vorhanden) + die drei
+// Fortsetzungs-Optionen für den User.
+func loopBreakAnswer(reason, lastTool, lastResult string) string {
+	s := "Abbruch: Die Bearbeitung wurde gestoppt, weil " + reason + ".\n"
+	if lastResult != "" {
+		toolNote := ""
+		if lastTool != "" {
+			toolNote = " (" + lastTool + ")"
+		}
+		s += "\nZwischenergebnis" + toolNote + ":\n" + lastResult + "\n"
+	}
+	s += "\nSo kannst du weitermachen:\n" +
+		"1) Konkretisieren: präzisere Begriffe, Dokumenttyp (z. B. Rechnung, Bescheid) oder Zeitraum angeben.\n" +
+		"2) Limitieren: auf einen bestimmten Unterordner, Dateityp oder eine Ergebnisanzahl beschränken.\n" +
+		"3) Durchlaufen lassen: ich bewerte den Ordner komplett — das kann mehrere Minuten dauern."
+	return s
+}
+
 // handleChatAsk: POST /chat/ask — Tool-Loop gegen den ephemeralen Share.
 func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1240,6 +1268,13 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	// stattdessen erhält das Modell einen Hinweis, die Parameter zu
 	// ändern oder den User zu fragen.
 	seenToolCalls := map[string]int{}
+	// Nach 3 aufeinanderfolgenden Duplikaten bricht der Loop
+	// serverseitig ab — unabhängig vom Modell-Verhalten. Das letzte
+	// tatsächlich ausgeführte Tool + sein (gekürztes) Ergebnis werden
+	// im Abbruch-Report als Zwischenergebnis gemeldet.
+	consecutiveDuplicates := 0
+	lastRealTool := ""
+	lastRealResult := ""
 
 	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v search=%v", folder, model, len(req.Messages), req.Stream, searchAvailable)
 
@@ -1319,6 +1354,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			var result string
 			var trace toolTrace
 			if prevChars, alreadyRun := seenToolCalls[callKey]; alreadyRun {
+				consecutiveDuplicates++
 				result = fmt.Sprintf("Wiederholung: Dieser Tool-Call (tool=%s, identische Parameter) "+
 					"wurde bereits ausgeführt und bringt kein neues Ergebnis (letzte Ausführung: "+
 					"%d Zeichen). Ändere die Parameter (z. B. anderes Pattern, anderes extra, "+
@@ -1326,8 +1362,13 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					tc.Function.Name, prevChars)
 				trace = toolTrace{Tool: tc.Function.Name, Method: "duplicate", Chars: len(result)}
 			} else {
+				consecutiveDuplicates = 0
 				result, trace = s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
 				seenToolCalls[callKey] = len(result)
+				if result != "" {
+					lastRealTool = tc.Function.Name
+					lastRealResult = truncateChars(result, 1500)
+				}
 			}
 			toolTraces = append(toolTraces, trace)
 			log.Printf("chat/ask: tool=%s path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
@@ -1355,6 +1396,15 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
+		// Serverseitiger Abbruch: das Modell wiederholt sich und liefert
+		// kein neues Ergebnis. Statt blind weiterzulaufen (970 Iterationen
+		// im August-Fall) antworten mit Zwischenergebnis + Optionen.
+		if consecutiveDuplicates >= 3 {
+			log.Printf("chat/ask: loop-break nach %d aufeinanderfolgenden Duplikaten (iteration %d)", consecutiveDuplicates, iterations)
+			answer = loopBreakAnswer("die gleiche Anfrage wiederholt lieferte kein neues Ergebnis (Wiederholungsschleife)", lastRealTool, lastRealResult)
+			break
+		}
+
 		// Wenn das Modell nach dem letzten Tool-Block nichts mehr sagt
 		// und Iterationen aufgebraucht sind, Antwort unten zusammenführen.
 		if content != "" && len(msg.ToolCalls) == 0 {
@@ -1364,7 +1414,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if answer == "" && iterations > 0 {
-		answer = "Maximalzahl an Tool-Schritten erreicht, ohne finale Antwort. Bitte Frage konkreter stellen."
+		answer = loopBreakAnswer("die Maximalzahl an Iterationen erreicht wurde", lastRealTool, lastRealResult)
 	}
 
 	resp := chatAskResponse{
