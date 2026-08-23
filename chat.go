@@ -1293,7 +1293,15 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	lastRealTool := ""
 	lastRealResult := ""
 
-	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v search=%v", folder, model, len(req.Messages), req.Stream, searchAvailable)
+	lastUserQuestion := ""
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			lastUserQuestion = req.Messages[i].Content
+			break
+		}
+	}
+	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v search=%v question=%q",
+		folder, model, len(req.Messages), req.Stream, searchAvailable, truncateChars(lastUserQuestion, 200))
 
 	// Stream: Live-Fortschritt per SSE. Client-Disconnect bricht die
 	// Iterationen ab. Nicht-flushbarer Writer → Fallback auf JSON-Antwort.
@@ -1387,8 +1395,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					lastRealResult = truncateChars(result, 1500)
 				}
 			}
-			log.Printf("chat/ask: tool=%s path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
-				tc.Function.Name, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
+			// args = die exakte Anfrage (auch bei Duplikaten, die runChatTool
+			// nie erreichen und daher leere trace-Felder haben).
+			log.Printf("chat/ask: tool=%s args=%q path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
+				tc.Function.Name, tc.Function.Arguments, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
 			// Duplikate erreichen nur Modell (als Hint) und Journal —
 			// nicht den UI-Trace, um verwirrende Wiedereinträge zu vermeiden.
 			if trace.Method != "duplicate" {
