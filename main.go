@@ -1902,6 +1902,9 @@ func (s *Server) llmOCR(data []byte) string {
 // /tika/pdf2chat prepares a PDF for LLM chat (called by microllm):
 // per-page text with [Seite N/M] markers, weak (scanned) pages rescued
 // as PNG images and/or LLM-described, weak pages OCR'd into the text.
+// Embedded raster figures (diagrams, tables, charts inside the text
+// flow — common in exported, non-scanned PDFs) are rescued as images
+// on every page, deduplicated across pages by content hash.
 
 func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
@@ -1912,6 +1915,9 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	rescueImages := q.Get("images") == "1"
 	describe := q.Get("describe") == "1"
+	// ocr=0: skip OCR of weak pages (vision clients read the scan image
+	// themselves, no text needed); default 1 keeps old behavior.
+	ocr := q.Get("ocr") != "0"
 	dpi := s.cfg.PDF.DPI
 	if v, err := strconv.Atoi(q.Get("dpi")); err == nil && v >= 50 && v <= 300 {
 		dpi = v
@@ -1935,15 +1941,18 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 	// turn, and extraction (OCR, description) is the expensive part.
 	var cacheKey string
 	if s.workDir != "" {
-		imagesFlag, describeFlag := 0, 0
+		imagesFlag, describeFlag, ocrFlag := 0, 0, 0
 		if rescueImages {
 			imagesFlag = 1
 		}
 		if describe {
 			describeFlag = 1
 		}
-		cacheKey = fmt.Sprintf("%s.i%d.d%d.p%d.r%d.json",
-			sha256hex(body), imagesFlag, describeFlag, maxPages, dpi)
+		if ocr {
+			ocrFlag = 1
+		}
+		cacheKey = fmt.Sprintf("%s.i%d.d%d.o%d.p%d.r%d.json",
+			sha256hex(body), imagesFlag, describeFlag, ocrFlag, maxPages, dpi)
 		cachedPath := filepath.Join(s.workDir, "pdf2chat", cacheKey)
 		if cached, err := os.ReadFile(cachedPath); err == nil {
 			var cachedResult map[string]interface{}
@@ -1972,9 +1981,9 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type pageResult struct {
-		text  string
-		image []byte
-		desc  string
+		text   string
+		images []pdf2chatImage
+		descs  []string
 	}
 	results := make([]pageResult, processed)
 	renderDir, renderErr := os.MkdirTemp("", "taki-pdf2chat-img-*")
@@ -1986,9 +1995,17 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 	const ocrPrompt = "Extract all text from this scanned document page. " +
 		"Return the complete text content, preserving structure. " +
 		"If it's a form or contract, extract structured fields."
-	const describePrompt = "Describe this document page for an AI assistant: " +
-		"figures, tables, diagrams, charts, and any non-text content. " +
-		"Be specific and concise."
+	// figurePrompt describes one embedded figure in the context of the
+	// surrounding page text, so the model can link figure to text.
+	const figurePrompt = "Describe this figure from a document page for an AI assistant: " +
+		"what it shows (diagram, table, chart, photo, screenshot) and how it " +
+		"relates to the surrounding text. Be specific and concise.\n\n" +
+		"Surrounding page text:\n%s"
+
+	// Deduplicate embedded figures across pages (the same figure often
+	// appears on several pages, e.g. a repeated diagram).
+	seenImageHashes := map[string]bool{}
+	var imageHashMu sync.Mutex
 
 	var wg sync.WaitGroup
 	for i := 0; i < processed; i++ {
@@ -1998,24 +2015,60 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 			pageNum := idx + 1
 			res := &results[idx]
 			res.text = s.pdftextPage(tmp.Name(), pageNum)
-			if len(res.text) >= s.cfg.Fallback.MinCharsPerPage {
-				return // page has real text
-			}
-			// Weak page (scan/figure): render once, reuse for rescue + OCR.
-			rendered := s.pdfPageToImageDPI(body, pageNum, dpi)
-			if rendered == nil || renderDir == "" {
-				return
-			}
-			renderPath := filepath.Join(renderDir, fmt.Sprintf("page-%03d.png", pageNum))
-			os.WriteFile(renderPath, rendered, 0644)
 			if rescueImages {
-				res.image = rendered
-				if describe {
-					res.desc = s.llmDescribe(renderPath, describePrompt)
+				res.images = append(res.images,
+					s.rescueEmbeddedImages(tmp.Name(), renderDir,
+						pageNum, seenImageHashes, &imageHashMu)...)
+			}
+			if len(res.text) < s.cfg.Fallback.MinCharsPerPage {
+				// Weak page: reuse a rescued full-page image (a scan),
+				// otherwise render the page once (image rescue + OCR share it).
+				scanPath := ""
+				for _, im := range res.images {
+					if im.kind == "scan" {
+						scanPath = im.path
+						break
+					}
+				}
+				if scanPath == "" {
+					rendered := s.pdfPageToImageDPI(body, pageNum, dpi)
+					if rendered == nil || renderDir == "" {
+						return
+					}
+					scanPath = filepath.Join(renderDir, fmt.Sprintf("page-%03d.png", pageNum))
+					os.WriteFile(scanPath, rendered, 0644)
+					if rescueImages && len(res.images) == 0 {
+						// No figure rescued: the render is the fallback image.
+						res.images = append(res.images, pdf2chatImage{path: scanPath, kind: "scan"})
+					}
+				}
+				// Scans are read by the vision model directly (or the OCR
+				// text below) — only OCR when the client wants text.
+				if ocr {
+					if ocrText := s.llmDescribe(scanPath, ocrPrompt); ocrText != "" {
+						res.text = ocrText
+					}
 				}
 			}
-			if ocrText := s.llmDescribe(renderPath, ocrPrompt); ocrText != "" {
-				res.text = ocrText
+			if describe {
+				// Only embedded figures get a description, linked to the
+				// surrounding page text. Scan images are read by vision.
+				for _, im := range res.images {
+					if im.kind != "embedded" {
+						res.descs = append(res.descs, "")
+						continue
+					}
+					surrounding := res.text
+					if len(surrounding) > 2000 {
+						cut := 2000
+						for cut > 0 && !utf8.RuneStart(surrounding[cut]) {
+							cut--
+						}
+						surrounding = surrounding[:cut] + " …"
+					}
+					res.descs = append(res.descs,
+						s.llmDescribe(im.path, fmt.Sprintf(figurePrompt, surrounding)))
+				}
 			}
 		}(i)
 	}
@@ -2025,6 +2078,7 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 		Page        int    `json:"page"`
 		B64         string `json:"b64"`
 		Mime        string `json:"mime"`
+		Kind        string `json:"kind"`
 		Description string `json:"description,omitempty"`
 	}
 	images := []chatImage{} // non-nil: JSON "[]", never null
@@ -2035,12 +2089,16 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 		if res.text != "" {
 			parts = append(parts, fmt.Sprintf("[Seite %d/%d]\n%s", pageNum, pageCount, res.text))
 		}
-		if res.image != nil {
-			img := chatImage{Page: pageNum,
-				B64:  base64.StdEncoding.EncodeToString(res.image),
+		for imgIdx, im := range res.images {
+			imgData, err := os.ReadFile(im.path)
+			if err != nil || len(imgData) == 0 {
+				continue
+			}
+			img := chatImage{Page: pageNum, Kind: im.kind,
+				B64:  base64.StdEncoding.EncodeToString(imgData),
 				Mime: "image/png"}
-			if describe {
-				img.Description = res.desc
+			if imgIdx < len(res.descs) {
+				img.Description = res.descs[imgIdx]
 			}
 			images = append(images, img)
 		}
@@ -2062,6 +2120,185 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 		pageCount, processed, len(result["text"].(string)), len(images), rescueImages, describe, dpi)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
+}
+
+// pdf2chatImage is one rescued page image: a figure embedded in the text
+// flow (kind "embedded") or an image covering the whole page, i.e. a scan
+// (kind "scan", also used for page renders of weak pages).
+type pdf2chatImage struct {
+	path string
+	kind string
+}
+
+// pdfPageSize returns the size of one page in points via pdfinfo.
+func (s *Server) pdfPageSize(path string, pageNum int) (widthPt, heightPt float64, ok bool) {
+	out, err := exec.Command("pdfinfo", "-f", strconv.Itoa(pageNum),
+		"-l", strconv.Itoa(pageNum), path).Output()
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		// Whole doc: "Page size: 612 x 792 pts (letter)"
+		// Per page:  "Page    1 size:  612 x 792 pts (letter)"
+		if !strings.HasPrefix(line, "Page") {
+			continue
+		}
+		idx := strings.Index(line, "size:")
+		if idx < 0 {
+			continue
+		}
+		if _, err := fmt.Sscanf(line[idx+len("size:"):], "%g x %g", &widthPt, &heightPt); err == nil &&
+			widthPt > 0 && heightPt > 0 {
+			return widthPt, heightPt, true
+		}
+	}
+	return 0, 0, false
+}
+
+// rescueEmbeddedImages extracts the raster images embedded in one page
+// (pdfimages). This matters for normal text PDFs (exports, not scans):
+// figures, tables and diagrams are embedded as images inside the text
+// flow and are lost by a plain text extraction. Small icons and logo
+// marks are filtered out by size. An image covering (nearly) the whole
+// page is a scan, not a figure: it is kept but labeled kind "scan"
+// (placement scale vs. MediaBox from pdfinfo). Deduplication by content
+// hash avoids resending the same figure from multiple pages.
+func (s *Server) rescueEmbeddedImages(pdfPath, renderDir string, pageNum int,
+	seenImageHashes map[string]bool, imageHashMu *sync.Mutex) []pdf2chatImage {
+	if renderDir == "" {
+		return nil
+	}
+	const (
+		minImageSide      = 250  // px, below: icons / bullet marks
+		fullPageFactor    = 0.85 // covers >= 85% of the page (both dims)
+		unknownFullPagePx = 2500 // fallback if placement/page size is unknown
+		minImageBytes     = 2048 // extracted PNG smaller than this is noise
+		maxPerPage        = 4
+	)
+	pageArg := strconv.Itoa(pageNum)
+	listOut, err := exec.Command("pdfimages", "-list",
+		"-f", pageArg, "-l", pageArg, pdfPath).Output()
+	if err != nil {
+		return nil
+	}
+
+	// List rows (including smask rows) correspond 1:1 to the extracted
+	// files; smasks are extracted as separate files, so keep them in
+	// the index mapping even though they are not rescued themselves.
+	// Column layout: page num type width height color comp bpc enc interp
+	// objectID [gen] x-ppi y-ppi size ratio — the ppi columns are taken
+	// from the end, the type/size columns from the front.
+	type imageRow struct {
+		rescue bool
+		kind   string
+		width  int
+		height int
+		xPpi   int
+		yPpi   int
+	}
+	var rows []imageRow
+	rescueCandidates := 0
+	for _, line := range strings.Split(string(listOut), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 8 || (fields[2] != "image" && fields[2] != "smask") {
+			continue
+		}
+		width, errW := strconv.Atoi(fields[3])
+		height, errH := strconv.Atoi(fields[4])
+		if errW != nil || errH != nil {
+			continue
+		}
+		row := imageRow{width: width, height: height}
+		if fields[2] == "image" && width >= minImageSide && height >= minImageSide {
+			row.rescue = true
+			row.kind = "embedded"
+			row.xPpi, _ = strconv.Atoi(fields[len(fields)-4])
+			row.yPpi, _ = strconv.Atoi(fields[len(fields)-3])
+			rescueCandidates++
+		}
+		rows = append(rows, row)
+	}
+	if rescueCandidates == 0 {
+		return nil
+	}
+
+	// Full-page check: image placement scale (px per inch, from the
+	// pdfimages matrix columns) vs. page size in points (pdfinfo).
+	// One pdfinfo call per page, only if a candidate reports a scale.
+	pageWpt, pageHpt, pageOk := 0.0, 0.0, false
+	for _, row := range rows {
+		if row.rescue && row.xPpi > 0 && row.yPpi > 0 {
+			pageWpt, pageHpt, pageOk = s.pdfPageSize(pdfPath, pageNum)
+			break
+		}
+	}
+	keptRows := make([]imageRow, 0, len(rows))
+	keptCandidates := 0
+	for _, row := range rows {
+		if row.rescue {
+			if row.xPpi > 0 && row.yPpi > 0 && pageOk {
+				if float64(row.width)/float64(row.xPpi)*72 >= fullPageFactor*pageWpt &&
+					float64(row.height)/float64(row.yPpi)*72 >= fullPageFactor*pageHpt {
+					row.kind = "scan"
+				}
+			} else if row.width > unknownFullPagePx && row.height > unknownFullPagePx {
+				// No reliable placement/page size: a huge image is almost
+				// certainly a page scan, not a figure — leave it to the
+				// render path.
+				continue
+			}
+			keptCandidates++
+		}
+		keptRows = append(keptRows, row)
+	}
+	rows = keptRows
+	if keptCandidates == 0 {
+		return nil
+	}
+
+	prefix := filepath.Join(renderDir, fmt.Sprintf("emb-p%03d-", pageNum))
+	if err := exec.Command("pdfimages", "-png",
+		"-f", pageArg, "-l", pageArg, pdfPath, prefix).Run(); err != nil {
+		return nil
+	}
+	files, err := filepath.Glob(prefix + "-*.png")
+	if err != nil || len(files) == 0 {
+		return nil
+	}
+	sort.Strings(files)
+
+	var rescued []pdf2chatImage
+	scansRescued := 0
+	for i, row := range rows {
+		if !row.rescue || i >= len(files) {
+			continue
+		}
+		if len(rescued) >= maxPerPage {
+			break
+		}
+		if row.kind == "scan" && scansRescued >= 1 {
+			continue // one page image per page is enough
+		}
+		imgData, err := os.ReadFile(files[i])
+		if err != nil || len(imgData) < minImageBytes {
+			continue
+		}
+		imgHash := sha256hex(imgData)
+		imageHashMu.Lock()
+		duplicate := seenImageHashes[imgHash]
+		if !duplicate {
+			seenImageHashes[imgHash] = true
+		}
+		imageHashMu.Unlock()
+		if !duplicate {
+			if row.kind == "scan" {
+				scansRescued++
+			}
+			rescued = append(rescued, pdf2chatImage{path: files[i], kind: row.kind})
+		}
+	}
+	return rescued
 }
 
 // pdf2chatCacheSave writes a pdf2chat result and prunes the cache
