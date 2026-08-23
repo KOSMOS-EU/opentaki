@@ -125,12 +125,12 @@ func (s *Server) chatTools() []toolDefinition {
 		{Type: "function", Function: toolFunction{
 			Name:        "search_item",
 			Description: "Sucht nach DATEIEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als read_file-Pfad nutzbar), Datum und Größe. Liefert KEINE Dateiinhalte. Bei großen Ordnern VORZIEHEN vor list_directory, um gezielt Dateien zu finden. Mit dem optionalen extra-Parameter lassen sich Treffer zusätzlich nach Dateityp, Tag und KI-Metadaten eingrenzen.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Dateinamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft. Beispiele: \"metadata.doc.type:rechnung\" (KI-Dokumenttyp), \"mediatype:pdf\" (Dateityp), \"metadata.doc.date:*2025*\" (Dokumentenjahr), \"tag:privat\" (Tag). Wildcards OHNE Anführungszeichen. Metadaten-Felder nur bei KI-angereicherten Dateien."}},"required":["pattern"]}`),
+			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Dateinamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft. Beispiele: \"metadata.doc.type:rechnung\" (KI-Dokumenttyp), \"mediatype:pdf\" (Dateityp), \"metadata.doc.date:*2025*\" (Dokumentenjahr), \"tag:privat\" (Tag). Wildcards OHNE Anführungszeichen. Metadaten-Felder nur bei KI-angereicherten Dateien."},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Optional: maximale Trefferzahl (Default 20, max 100). Nur bei ausdrücklicher User-Zustimmung auf einen höheren Wert setzen."}},"required":["pattern"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
 			Name:        "search_dir",
 			Description: "Sucht nach VERZEICHNISSEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als list_directory-/read_file-Pfad nutzbar) und Datum. Zum Finden des richtigen Unterverzeichnisses. Optional: extra-Parameter wie bei search_item (AND-Verknüpfung).",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft (wie bei search_item)."}},"required":["pattern"]}`),
+			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft (wie bei search_item)."},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Optional: maximale Trefferzahl (Default 20, max 100). Nur bei ausdrücklicher User-Zustimmung auf einen höheren Wert setzen."}},"required":["pattern"]}`),
 		}},
 	}
 }
@@ -834,6 +834,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		Path    string `json:"path"`
 		Pattern string `json:"pattern"`
 		Extra   string `json:"extra"`
+		Limit   int    `json:"limit"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
@@ -869,8 +870,14 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Such-Pattern braucht mindestens 2 Zeichen.", trace
 		}
-		maxResults := s.cfg.Chat.Search.MaxResults
-		hits, total, err := u.search(pattern, extra, maxResults*3)
+		limit := s.cfg.Chat.Search.MaxResults
+		if args.Limit >= 1 {
+			limit = args.Limit
+			if limit > 100 {
+				limit = 100
+			}
+		}
+		hits, total, err := u.search(pattern, extra, limit*3)
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
@@ -892,7 +899,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 				continue
 			}
 			shown++
-			if shown > maxResults {
+			if shown > limit {
 				break
 			}
 			rel := stripScopePrefix(hit.Path, u.scopePath)
@@ -911,10 +918,18 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		if shown == 0 {
 			sb.WriteString("  (keine Treffer — anderes Pattern versuchen)\n")
 		}
-		if total > maxResults {
+		if total > limit {
 			sb.WriteString(fmt.Sprintf("  … Treffer gekürzt: max. %d, Gesamtzahl %d. "+
-				"Pattern eingrenzen oder ein Unterverzeichnis direkt auflisten.\n", maxResults, total))
+				"Pattern eingrenzen oder ein Unterverzeichnis direkt auflisten.\n", limit, total))
 			trace.Truncated = true
+		}
+		if total > 30 {
+			sb.WriteString(fmt.Sprintf("  Es gibt insgesamt %d Treffer. Lies nicht eigenmächtig "+
+				"viele Dateien durch — beende deinen Turn mit einer kurzen Frage an den User, "+
+				"wie er weitermachen möchte: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, "+
+				"Zeitraum), (2) limitieren (z. B. limit=100 für die ersten 100 Treffer) oder "+
+				"(3) alles durchlaufen lassen (kann mehrere Minuten dauern). Zeige in der Frage "+
+				"einige Treffer als Beispiele (max. 10).", total))
 		}
 		trace.Method = "report"
 		trace.Chars = len(sb.String())
@@ -1135,18 +1150,18 @@ func truncateChars(s string, n int) string {
 }
 
 // loopBreakAnswer baut die finale Antwort nach einem serverseitigen
-// Loop-Abbruch: Grund + Zwischenergebnis (falls vorhanden) + die drei
-// Fortsetzungs-Optionen für den User.
+// Loop-Stopp: eine Nachfrage, kein Fehler. Der Server meldet, was
+// bisher gesehen wurde, der User entscheidet, wie es weitergeht.
 func loopBreakAnswer(reason, lastTool, lastResult string) string {
-	s := "Abbruch: Die Bearbeitung wurde gestoppt, weil " + reason + ".\n"
+	s := "Ich komme mit der aktuellen Vorgabe nicht weiter: " + reason + ".\n"
 	if lastResult != "" {
 		toolNote := ""
 		if lastTool != "" {
 			toolNote = " (" + lastTool + ")"
 		}
-		s += "\nZwischenergebnis" + toolNote + ":\n" + lastResult + "\n"
+		s += "\nBisher gesehen" + toolNote + ":\n" + lastResult + "\n"
 	}
-	s += "\nSo kannst du weitermachen:\n" +
+	s += "\nWie möchtest du weitermachen? Zum Beispiel:\n" +
 		"1) Konkretisieren: präzisere Begriffe, Dokumenttyp (z. B. Rechnung, Bescheid) oder Zeitraum angeben.\n" +
 		"2) Limitieren: auf einen bestimmten Unterordner, Dateityp oder eine Ergebnisanzahl beschränken.\n" +
 		"3) Durchlaufen lassen: ich bewerte den Ordner komplett — das kann mehrere Minuten dauern."
@@ -1233,17 +1248,19 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools "+
 			"in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander "+
 			"in separaten Schritten. "+
-			"Beurteile vor großem Arbeitsaufwand, ob die Aufgabe in überschaubarem Rahmen "+
-			"erledigbar ist (Faustregel: das Listing zeigt deutlich mehr als 50 Dateien, oder "+
-			"du hast bereits 3 Suchversuche ohne Treffer unternommen). Wenn nicht, iteriere "+
-			"nicht blind weiter — beende deinen Turn mit einer kurzen, konkreten Frage an den "+
-			"User und biete an: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), "+
-			"(2) limitieren (bestimmter Unterordner, Dateityp, Ergebnislimit) oder (3) alles "+
-			"durchlaufen lassen (kann mehrere Minuten dauern). Zur Unterstützung zeige in der "+
-			"Frage eine kurze Beispiel-Auswahl aus dem, was du schon gesehen hast (max. 10 "+
-			"Einträge, z. B. erste Zeilen eines Listings oder Treffer einer lockeren "+
-			"Namenssuche), damit der User echte Begriffe und Namen sehen kann. Wenn der User "+
-			"im Verlauf bereits eine solche Vorgabe gemacht hat, frage nicht erneut. "+
+			"Große Ergebnismengen — Regel: Meldet ein Tool „Gesamtzahl über 30 Treffer“ "+
+			"(Suche) oder zeigt das Listing deutlich mehr als 50 Dateien, oder hast du bereits "+
+			"3 Suchversuche ohne Treffer unternommen, iteriere nicht blind weiter — beende "+
+			"deinen Turn mit einer kurzen, konkreten Frage an den User und biete an: "+
+			"(1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), "+
+			"(2) limitieren (bestimmter Unterordner, Dateityp oder das limit-Parameter der "+
+			"Suche) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern). "+
+			"Zur Unterstützung zeige in der Frage eine kurze Beispiel-Auswahl aus dem, was du "+
+			"schon gesehen hast (max. 10 Einträge, z. B. erste Zeilen eines Listings oder "+
+			"Treffer einer lockeren Namenssuche), damit der User echte Begriffe und Namen "+
+			"sehen kann. Erst bei ausdrücklicher User-Zustimmung verarbeite die komplette "+
+			"Treffermenge. Wenn der User im Verlauf bereits eine solche Vorgabe gemacht hat, "+
+			"frage nicht erneut. "+
 			"Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort "+
 			"explizit, dass dieses Dokument nur teilweise ausgewertet wurde. "+
 			"Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.",
@@ -1370,23 +1387,27 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					lastRealResult = truncateChars(result, 1500)
 				}
 			}
-			toolTraces = append(toolTraces, trace)
 			log.Printf("chat/ask: tool=%s path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
 				tc.Function.Name, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
-			if stream {
-				if err := sse.event("tool", map[string]interface{}{
-					"index":     len(toolTraces),
-					"tool":      tc.Function.Name,
-					"path":      trace.Path,
-					"pattern":   trace.Pattern,
-					"extra":     trace.Extra,
-					"method":    trace.Method,
-					"chars":     trace.Chars,
-					"truncated": trace.Truncated,
-					"error":     trace.Error,
-					"ms":        trace.MS,
-				}); err != nil {
-					return
+			// Duplikate erreichen nur Modell (als Hint) und Journal —
+			// nicht den UI-Trace, um verwirrende Wiedereinträge zu vermeiden.
+			if trace.Method != "duplicate" {
+				toolTraces = append(toolTraces, trace)
+				if stream {
+					if err := sse.event("tool", map[string]interface{}{
+						"index":     len(toolTraces),
+						"tool":      tc.Function.Name,
+						"path":      trace.Path,
+						"pattern":   trace.Pattern,
+						"extra":     trace.Extra,
+						"method":    trace.Method,
+						"chars":     trace.Chars,
+						"truncated": trace.Truncated,
+						"error":     trace.Error,
+						"ms":        trace.MS,
+					}); err != nil {
+						return
+					}
 				}
 			}
 			messages = append(messages, chatToolMessage{
