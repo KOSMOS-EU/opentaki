@@ -4,6 +4,7 @@
 //
 // Endpoints:
 //   PUT /tika/text       → plain text extraction (Tika-compatible)
+//   PUT /tika/pdf2chat   → PDF for chat: page-marked text + rescued images
 //   PUT /rmeta/text      → metadata + content (Tika MetaRecursive compatible)
 //   GET /tika            → health check
 //   GET /version         → version info
@@ -1296,6 +1297,10 @@ func (s *Server) docMetaVisionPass(dataURL string) *takiDocMeta {
 
 // pdfPageToImage renders a single PDF page to a PNG image.
 func (s *Server) pdfPageToImage(pdfData []byte, pageNum int) []byte {
+	return s.pdfPageToImageDPI(pdfData, pageNum, s.cfg.PDF.DPI)
+}
+
+func (s *Server) pdfPageToImageDPI(pdfData []byte, pageNum, dpi int) []byte {
 	tmpDir, err := os.MkdirTemp("", "taki-docmeta-*")
 	if err != nil {
 		return nil
@@ -1307,7 +1312,7 @@ func (s *Server) pdfPageToImage(pdfData []byte, pageNum int) []byte {
 	last := first
 
 	cmd := exec.Command("pdftoppm", "-png", "-r",
-		fmt.Sprintf("%d", s.cfg.PDF.DPI),
+		fmt.Sprintf("%d", dpi),
 		"-f", first, "-l", last,
 		"-", prefix)
 	cmd.Stdin = bytes.NewReader(pdfData)
@@ -1890,6 +1895,219 @@ func (s *Server) llmOCR(data []byte) string {
 		}
 	}
 	return strings.Join(allText, "\n\n")
+}
+
+// ── PDF → Chat ───────────────────────────────────────────────
+//
+// /tika/pdf2chat prepares a PDF for LLM chat (called by microllm):
+// per-page text with [Seite N/M] markers, weak (scanned) pages rescued
+// as PNG images and/or LLM-described, weak pages OCR'd into the text.
+
+func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "PUT only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	rescueImages := q.Get("images") == "1"
+	describe := q.Get("describe") == "1"
+	dpi := s.cfg.PDF.DPI
+	if v, err := strconv.Atoi(q.Get("dpi")); err == nil && v >= 50 && v <= 300 {
+		dpi = v
+	}
+	maxPages := s.cfg.PDF.MaxPages
+	if v, err := strconv.Atoi(q.Get("max_pages")); err == nil && v >= 1 {
+		maxPages = v
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 200*1024*1024))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if !bytes.HasPrefix(body, []byte("%PDF")) {
+		http.Error(w, "not a PDF", http.StatusBadRequest)
+		return
+	}
+
+	// Content-addressed cache: chat clients re-send the same PDF on every
+	// turn, and extraction (OCR, description) is the expensive part.
+	var cacheKey string
+	if s.workDir != "" {
+		imagesFlag, describeFlag := 0, 0
+		if rescueImages {
+			imagesFlag = 1
+		}
+		if describe {
+			describeFlag = 1
+		}
+		cacheKey = fmt.Sprintf("%s.i%d.d%d.p%d.r%d.json",
+			sha256hex(body), imagesFlag, describeFlag, maxPages, dpi)
+		cachedPath := filepath.Join(s.workDir, "pdf2chat", cacheKey)
+		if cached, err := os.ReadFile(cachedPath); err == nil {
+			var cachedResult map[string]interface{}
+			if json.Unmarshal(cached, &cachedResult) == nil {
+				log.Printf("/tika/pdf2chat: cache hit (%s)", cacheKey)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(cachedResult)
+				return
+			}
+		}
+	}
+
+	tmp, err := os.CreateTemp("", "taki-pdf2chat-*.pdf")
+	if err != nil {
+		http.Error(w, "temp error", http.StatusInternalServerError)
+		return
+	}
+	tmp.Write(body)
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+
+	pageCount := s.pdfPageCount(tmp.Name())
+	processed := pageCount
+	if maxPages < processed {
+		processed = maxPages
+	}
+
+	type pageResult struct {
+		text  string
+		image []byte
+		desc  string
+	}
+	results := make([]pageResult, processed)
+	renderDir, renderErr := os.MkdirTemp("", "taki-pdf2chat-img-*")
+	if renderErr != nil {
+		renderDir = ""
+	}
+	defer os.RemoveAll(renderDir)
+
+	const ocrPrompt = "Extract all text from this scanned document page. " +
+		"Return the complete text content, preserving structure. " +
+		"If it's a form or contract, extract structured fields."
+	const describePrompt = "Describe this document page for an AI assistant: " +
+		"figures, tables, diagrams, charts, and any non-text content. " +
+		"Be specific and concise."
+
+	var wg sync.WaitGroup
+	for i := 0; i < processed; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			pageNum := idx + 1
+			res := &results[idx]
+			res.text = s.pdftextPage(tmp.Name(), pageNum)
+			if len(res.text) >= s.cfg.Fallback.MinCharsPerPage {
+				return // page has real text
+			}
+			// Weak page (scan/figure): render once, reuse for rescue + OCR.
+			rendered := s.pdfPageToImageDPI(body, pageNum, dpi)
+			if rendered == nil || renderDir == "" {
+				return
+			}
+			renderPath := filepath.Join(renderDir, fmt.Sprintf("page-%03d.png", pageNum))
+			os.WriteFile(renderPath, rendered, 0644)
+			if rescueImages {
+				res.image = rendered
+				if describe {
+					res.desc = s.llmDescribe(renderPath, describePrompt)
+				}
+			}
+			if ocrText := s.llmDescribe(renderPath, ocrPrompt); ocrText != "" {
+				res.text = ocrText
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	type chatImage struct {
+		Page        int    `json:"page"`
+		B64         string `json:"b64"`
+		Mime        string `json:"mime"`
+		Description string `json:"description,omitempty"`
+	}
+	images := []chatImage{} // non-nil: JSON "[]", never null
+	var parts []string
+	for i := 0; i < processed; i++ {
+		pageNum := i + 1
+		res := results[i]
+		if res.text != "" {
+			parts = append(parts, fmt.Sprintf("[Seite %d/%d]\n%s", pageNum, pageCount, res.text))
+		}
+		if res.image != nil {
+			img := chatImage{Page: pageNum,
+				B64:  base64.StdEncoding.EncodeToString(res.image),
+				Mime: "image/png"}
+			if describe {
+				img.Description = res.desc
+			}
+			images = append(images, img)
+		}
+	}
+	if processed < pageCount {
+		parts = append(parts, fmt.Sprintf(
+			"[PDF gekürzt: nur die ersten %d von %d Seiten verarbeitet]", processed, pageCount))
+	}
+
+	result := map[string]interface{}{
+		"text":   strings.Join(parts, "\n\n"),
+		"pages":  pageCount,
+		"images": images,
+	}
+	if s.workDir != "" {
+		s.pdf2chatCacheSave(filepath.Join(s.workDir, "pdf2chat", cacheKey), result)
+	}
+	log.Printf("/tika/pdf2chat: %d pages (%d processed), %d chars, %d rescued images [images=%v describe=%v dpi=%d]",
+		pageCount, processed, len(result["text"].(string)), len(images), rescueImages, describe, dpi)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// pdf2chatCacheSave writes a pdf2chat result and prunes the cache
+// (max 50 entries, oldest by mtime first).
+func (s *Server) pdf2chatCacheSave(path string, result interface{}) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		return
+	}
+	os.WriteFile(path+".tmp", data, 0644)
+	os.Rename(path+".tmp", path)
+	s.prunePdf2ChatCache(dir)
+}
+
+func (s *Server) prunePdf2ChatCache(dir string) {
+	const maxEntries = 50
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) <= maxEntries {
+		return
+	}
+	type cacheEntry struct {
+		name string
+		mt   time.Time
+	}
+	var list []cacheEntry
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		list = append(list, cacheEntry{e.Name(), info.ModTime()})
+	}
+	if len(list) <= maxEntries {
+		return
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].mt.Before(list[j].mt) })
+	for i := 0; i < len(list)-maxEntries; i++ {
+		os.Remove(filepath.Join(dir, list[i].name))
+	}
 }
 
 // ── PDF OCR enrichment (TAKI_OCR_PDF) ────────────────────────
@@ -4012,6 +4230,7 @@ func main() {
 	srv := NewServer(cfg)
 
 	http.HandleFunc("/tika/text", srv.handleTikaText)
+	http.HandleFunc("/tika/pdf2chat", srv.handlePdf2Chat)
 	http.HandleFunc("/rmeta/text", srv.handleRmetaText)
 	http.HandleFunc("/taki/enrich-pdf", srv.handleEnrichPDF)
 	http.HandleFunc("/taki/remount-pdf", srv.handleRemountPDF)
