@@ -919,18 +919,15 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			sb.WriteString("  (keine Treffer — anderes Pattern versuchen)\n")
 		}
 		if total > limit {
-			sb.WriteString(fmt.Sprintf("  … Treffer gekürzt: max. %d, Gesamtzahl %d. "+
-				"Pattern eingrenzen oder ein Unterverzeichnis direkt auflisten.\n", limit, total))
 			trace.Truncated = true
 		}
-		if total > 30 {
-			sb.WriteString(fmt.Sprintf("  Es gibt insgesamt %d Treffer. Lies nicht eigenmächtig "+
-				"viele Dateien durch — beende deinen Turn mit einer kurzen Frage an den User, "+
-				"wie er weitermachen möchte: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, "+
-				"Zeitraum), (2) limitieren (z. B. limit=100 für die ersten 100 Treffer) oder "+
-				"(3) alles durchlaufen lassen (kann mehrere Minuten dauern). Zeige in der Frage "+
-				"einige Treffer als Beispiele (max. 10).", total))
+		// Qualifizierte Zählung: das Modell erkennt selbst, ob das
+		// Ergebnis vollständig (found ≤ limit) oder unvollständig ist.
+		sb.WriteString(fmt.Sprintf("  found: %d, limit: %d", total, limit))
+		if total > limit {
+			sb.WriteString(" (unvollständig — es gibt weitere Treffer)")
 		}
+		sb.WriteString("\n")
 		trace.Method = "report"
 		trace.Chars = len(sb.String())
 		trace.MS = time.Since(start).Milliseconds()
@@ -968,10 +965,14 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			}
 			sb.WriteString(line + "\n")
 		}
+		// Qualifizierte Zählung wie bei der Suche (found = gezeigte
+		// Einträge, limit = max_listings; das Listing kennt die echte
+		// Gesamtzahl nicht, daher der Kürzungs-Marker).
+		sb.WriteString(fmt.Sprintf("  found: %d, limit: %d", len(entries), s.cfg.Chat.MaxListings))
 		if entryCut {
-			sb.WriteString(fmt.Sprintf("  … Listing gekürzt: max. %d Einträge — es gibt WEITERE Dateien/Verzeichnisse. "+
-				"Falls die Frage darauf ankommt, liste ein bestimmtes Unterverzeichnis einzeln auf.\n", s.cfg.Chat.MaxListings))
+			sb.WriteString(" (unvollständig — weitere Einträge vorhanden)")
 		}
+		sb.WriteString("\n")
 		if depthCut {
 			sb.WriteString(fmt.Sprintf("  … Verzeichnisse tiefer als Ebene %d wurden NICHT gelistet.\n", maxDepth))
 		}
@@ -1248,19 +1249,21 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools "+
 			"in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander "+
 			"in separaten Schritten. "+
-			"Große Ergebnismengen — Regel: Meldet ein Tool „Gesamtzahl über 30 Treffer“ "+
-			"(Suche) oder zeigt das Listing deutlich mehr als 50 Dateien, oder hast du bereits "+
-			"3 Suchversuche ohne Treffer unternommen, iteriere nicht blind weiter — beende "+
-			"deinen Turn mit einer kurzen, konkreten Frage an den User und biete an: "+
-			"(1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), "+
-			"(2) limitieren (bestimmter Unterordner, Dateityp oder das limit-Parameter der "+
-			"Suche) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern). "+
-			"Zur Unterstützung zeige in der Frage eine kurze Beispiel-Auswahl aus dem, was du "+
-			"schon gesehen hast (max. 10 Einträge, z. B. erste Zeilen eines Listings oder "+
-			"Treffer einer lockeren Namenssuche), damit der User echte Begriffe und Namen "+
-			"sehen kann. Erst bei ausdrücklicher User-Zustimmung verarbeite die komplette "+
-			"Treffermenge. Wenn der User im Verlauf bereits eine solche Vorgabe gemacht hat, "+
-			"frage nicht erneut. "+
+			"Zählung in den Ergebnissen: Jedes Suchergebnis und jedes Listing endet mit "+
+			"„found: X, limit: Y“. Bei Suchen ist found die Gesamtzahl aller Treffer, bei "+
+			"Listings die Zahl der gezeigten Einträge (limit = max. Einträge). Ist das "+
+			"Ergebnis NICHT als unvollständig markiert, hast du die vollständige Menge — "+
+			"lies dann die relevanten Dateien (read_file oder read_metadata) oder antworte; "+
+			"such nicht endlos weiter. Ist found > limit oder das Ergebnis als unvollständig "+
+			"markiert, iteriere nicht blind weiter — beende deinen Turn mit einer kurzen, "+
+			"konkreten Frage an den User und biete an: (1) konkretisieren (präzisere "+
+			"Begriffe, Dokumenttyp, Zeitraum), (2) limit erhöhen (limit-Parameter der Suche, "+
+			"max. 100) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern). "+
+			"Zeige in der Frage eine kurze Beispiel-Auswahl aus dem, was du schon gesehen "+
+			"hast (max. 10 Einträge), damit der User echte Begriffe und Namen sehen kann. "+
+			"Nach 3 Suchversuchen ohne Treffer frage den User ebenfalls, statt weiter zu "+
+			"raten. Wenn der User im Verlauf bereits eine solche Vorgabe gemacht hat, frage "+
+			"nicht erneut. "+
 			"Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort "+
 			"explizit, dass dieses Dokument nur teilweise ausgewertet wurde. "+
 			"Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.",
