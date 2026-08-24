@@ -1270,6 +1270,16 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			"Nach 3 Suchversuchen ohne Treffer frage den User ebenfalls, statt weiter zu "+
 			"raten. Wenn der User im Verlauf bereits eine solche Vorgabe gemacht hat, frage "+
 			"nicht erneut. "+
+			"Filter in der Frage (z. B. Jahr, Lieferant, Betrag) deckst du nur vollständig "+
+			"ab, wenn die passenden Metadaten (doc.date, doc.type, …) bei den Treffern "+
+			"gesetzt sind. Sind solche Metadaten-Suchen leer oder dünn (doc.date ist bei "+
+			"älteren Dateien oft nicht belegt), verenge stillschweigend nicht den "+
+			"Antwortumfang auf das, was du schon hast (z. B. einen Ordner, dessen Name "+
+			"den Filterbegriff trägt): such zusätzlich einfach nach dem Filterbegriff "+
+			"selbst (z. B. nach dem Jahr im Namen). Kannst du Vollständigkeit damit nicht "+
+			"sicherstellen, beziehe die Antwort ausdrücklich auf den Umfang, den du "+
+			"tatsächlich ausgewertet hast, und frage, ob du die übrigen Kandidaten "+
+			"durchlaufen sollst. "+
 			"Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort "+
 			"explizit, dass dieses Dokument nur teilweise ausgewertet wurde. "+
 			"Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.",
