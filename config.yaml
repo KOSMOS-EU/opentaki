@@ -71,6 +71,7 @@ chat:
   max_file_chars: 60000    # read_file-Kappung
   max_listings: 300        # max. Einträge im rekursiven list_directory
   list_depth: 3            # max. Verzeichnisebenen im rekursiven list_directory
+  system_prompt_file: ""   # default: /etc/open_taki/prompts/chat_system.txt (taka-prompts-Paket)
 
 # Routing (active with X-Taki-Protocol: v2)
 routing:

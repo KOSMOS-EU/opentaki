@@ -508,6 +508,23 @@ func (cfg *Config) loadDocMetaFiles(configDir string) {
 	}
 }
 
+// loadChatSystemPrompt lädt das Chat-System-Prompt-Template
+// (Platzhalter {{folder}} und {{tools}}). Default-Pfad:
+// <configDir>/prompts/chat_system.txt (taka-prompts-Paket).
+// Datei fehlt → Built-in-Template (chatSystemPromptBuiltin in chat.go).
+func (cfg *Config) loadChatSystemPrompt(configDir string) {
+	if cfg.Chat.SystemPromptFile == "" {
+		cfg.Chat.SystemPromptFile = filepath.Join(configDir, "prompts", "chat_system.txt")
+	}
+	if data, err := os.ReadFile(cfg.Chat.SystemPromptFile); err == nil {
+		cfg.Chat.systemPrompt = strings.TrimSpace(string(data))
+		log.Printf("  Chat system prompt: %s (%d chars)", cfg.Chat.SystemPromptFile, len(cfg.Chat.systemPrompt))
+	} else {
+		log.Printf("  Chat system prompt: using built-in default (%s not found)", cfg.Chat.SystemPromptFile)
+		cfg.Chat.systemPrompt = chatSystemPromptBuiltin
+	}
+}
+
 // Built-in defaults (used when external files are not found)
 var docMetaDefaultSchema = json.RawMessage(`{"type":"object","additionalProperties":false,"required":["doc","sender","uncertain"],"properties":{"doc":{"type":"object","additionalProperties":false,"required":["subject","subject_inferred","type","date","reference"],"properties":{"subject":{"type":["string","null"]},"subject_inferred":{"type":"boolean"},"type":{"type":["string","null"],"enum":["brief","bescheid","verfuegung","satzung","niederschrift","antrag","vertrag","mitteilung","einladung","kuendigung","angebot","rechnung","lieferschein","kontoauszug","kassenbon","ec_bon","mahnung","gutschrift","urkunde","zeugnis","foto","skizze","tabelle","praesentation","email","sonstiges",null]},"date":{"type":["string","null"],"pattern":"^\\d{4}-\\d{2}-\\d{2}$"},"reference":{"type":["string","null"]}}},"sender":{"type":"object","additionalProperties":false,"required":["company","given_name","family_name","street","house_number","postal_code","sub_locality","city","country","email","phone"],"properties":{"company":{"type":["string","null"]},"given_name":{"type":["string","null"]},"family_name":{"type":["string","null"]},"street":{"type":["string","null"]},"house_number":{"type":["string","null"]},"postal_code":{"type":["string","null"]},"sub_locality":{"type":["string","null"]},"city":{"type":["string","null"]},"country":{"type":["string","null"],"pattern":"^[A-Z]{2}$"},"email":{"type":["string","null"]},"phone":{"type":["string","null"]}}},"recipient":{"type":"object","additionalProperties":false,"required":["company","given_name","family_name"],"properties":{"company":{"type":["string","null"]},"given_name":{"type":["string","null"]},"family_name":{"type":["string","null"]}}},"amounts":{"type":"object","additionalProperties":false,"required":["total","tax","currency","payment_due"],"properties":{"total":{"type":["string","null"]},"tax":{"type":["string","null"]},"currency":{"type":["string","null"],"pattern":"^[A-Z]{3}$"},"payment_due":{"type":["string","null"],"pattern":"^\\d{4}-\\d{2}-\\d{2}$"}}},"uncertain":{"type":"array","items":{"type":"string"}}}}`)
 
@@ -540,6 +557,7 @@ func loadConfig(path string) Config {
 		log.Printf("config %s not found, using defaults", path)
 		cfg.Chat.applyDefaults(&cfg)
 		cfg.loadDocMetaFiles(filepath.Dir(path))
+		cfg.loadChatSystemPrompt(filepath.Dir(path))
 		return cfg
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -547,6 +565,7 @@ func loadConfig(path string) Config {
 	}
 	cfg.Chat.applyDefaults(&cfg)
 	cfg.loadDocMetaFiles(filepath.Dir(path))
+	cfg.loadChatSystemPrompt(filepath.Dir(path))
 	return cfg
 }
 

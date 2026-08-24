@@ -27,6 +27,7 @@ PROMPT_FILES=(
     field_rules.json
     store_detect_prompt.txt
     aktenplan.txt
+    chat_system.txt
 )
 
 # Create ZIP
