@@ -14,6 +14,7 @@ RUN apk add --no-cache curl poppler-utils pandoc python3 py3-pip \
 COPY --from=builder /open_taki /usr/local/bin/open_taki
 COPY taki-embed-ocr.py /usr/local/bin/taki-embed-ocr.py
 COPY taki-pdf-check.py /usr/local/bin/taki-pdf-check.py
+COPY taki-vector-crop.py /usr/local/bin/taki-vector-crop.py
 COPY config.yaml /etc/open_taki/config.yaml
 COPY docmeta_schema.json /etc/open_taki/docmeta_schema.json
 COPY docmeta_prompt.txt /etc/open_taki/docmeta_prompt.txt

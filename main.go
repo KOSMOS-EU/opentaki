@@ -1933,6 +1933,7 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	rescueImages := q.Get("images") == "1"
+	rescueVector := q.Get("vector") == "1"
 	describe := q.Get("describe") == "1"
 	// ocr=0: skip OCR of weak pages (vision clients read the scan image
 	// themselves, no text needed); default 1 keeps old behavior.
@@ -1960,9 +1961,12 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 	// turn, and extraction (OCR, description) is the expensive part.
 	var cacheKey string
 	if s.workDir != "" {
-		imagesFlag, describeFlag, ocrFlag := 0, 0, 0
+		imagesFlag, vectorFlag, describeFlag, ocrFlag := 0, 0, 0, 0
 		if rescueImages {
 			imagesFlag = 1
+		}
+		if rescueVector {
+			vectorFlag = 1
 		}
 		if describe {
 			describeFlag = 1
@@ -1970,8 +1974,8 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 		if ocr {
 			ocrFlag = 1
 		}
-		cacheKey = fmt.Sprintf("%s.i%d.d%d.o%d.p%d.r%d.json",
-			sha256hex(body), imagesFlag, describeFlag, ocrFlag, maxPages, dpi)
+		cacheKey = fmt.Sprintf("%s.i%d.v%d.d%d.o%d.p%d.r%d.json",
+			sha256hex(body), imagesFlag, vectorFlag, describeFlag, ocrFlag, maxPages, dpi)
 		cachedPath := filepath.Join(s.workDir, "pdf2chat", cacheKey)
 		if cached, err := os.ReadFile(cachedPath); err == nil {
 			var cachedResult map[string]interface{}
@@ -2038,6 +2042,11 @@ func (s *Server) handlePdf2Chat(w http.ResponseWriter, r *http.Request) {
 				res.images = append(res.images,
 					s.rescueEmbeddedImages(tmp.Name(), renderDir,
 						pageNum, seenImageHashes, &imageHashMu)...)
+			}
+			if rescueVector {
+				res.images = append(res.images,
+					s.rescueVectorDrawings(tmp.Name(), renderDir,
+						pageNum, dpi, seenImageHashes, &imageHashMu)...)
 			}
 			if len(res.text) < s.cfg.Fallback.MinCharsPerPage {
 				// Weak page: reuse a rescued full-page image (a scan),
@@ -2315,6 +2324,70 @@ func (s *Server) rescueEmbeddedImages(pdfPath, renderDir string, pageNum int,
 				scansRescued++
 			}
 			rescued = append(rescued, pdf2chatImage{path: files[i], kind: row.kind})
+		}
+	}
+	return rescued
+}
+
+// rescueVectorDrawings extracts vector-drawing clusters from one page via
+// PyMuPDF (pymupdf) and renders them as cropped PNGs via pdftoppm.
+// Vectors (diagrams, charts, schematics) are invisible to pdfimages.
+// Returns kind="vector" images (no OCR, no LLM describe — vision reads them).
+func (s *Server) rescueVectorDrawings(pdfPath, renderDir string, pageNum, dpi int,
+	seenImageHashes map[string]bool, imageHashMu *sync.Mutex) []pdf2chatImage {
+	if renderDir == "" {
+		return nil
+	}
+	// Locate the helper script (installed next to the binary in the container)
+	scriptPath := ""
+	if s.workDir != "" {
+		// Script lives in the work dir or next to the binary
+		for _, p := range []string{
+			filepath.Join(filepath.Dir(os.Args[0]), "taki-vector-crop.py"),
+			"/usr/local/bin/taki-vector-crop.py",
+		} {
+			if _, err := os.Stat(p); err == nil {
+				scriptPath = p
+				break
+			}
+		}
+	}
+	if scriptPath == "" {
+		return nil
+	}
+
+	out, err := exec.Command("python3", scriptPath,
+		pdfPath, strconv.Itoa(pageNum), renderDir, strconv.Itoa(dpi)).Output()
+	if err != nil {
+		return nil
+	}
+	var clusters []struct {
+		Path     string  `json:"path"`
+		HasRaster bool   `json:"has_raster"`
+		SizePt   float64 `json:"size_pt"`
+	}
+	if json.Unmarshal(out, &clusters) != nil || len(clusters) == 0 {
+		return nil
+	}
+
+	var rescued []pdf2chatImage
+	for _, c := range clusters {
+		if c.Path == "" {
+			continue
+		}
+		imgData, err := os.ReadFile(c.Path)
+		if err != nil || len(imgData) == 0 {
+			continue
+		}
+		imgHash := sha256hex(imgData)
+		imageHashMu.Lock()
+		duplicate := seenImageHashes[imgHash]
+		if !duplicate {
+			seenImageHashes[imgHash] = true
+		}
+		imageHashMu.Unlock()
+		if !duplicate {
+			rescued = append(rescued, pdf2chatImage{path: c.Path, kind: "vector"})
 		}
 	}
 	return rescued
