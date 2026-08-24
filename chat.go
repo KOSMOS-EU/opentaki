@@ -67,6 +67,7 @@ Lies nur Dateien, die für die Frage relevant sind.
 Ist die Frage auf mehrere Entitäten gerichtet (z. B. mehrere Personen oder Unterordner im Listing), beziehe alle davon in der Antwort mit ein – nicht nur die ersten. Wenn das Tool-Budget nicht ausreicht, um alles zu bearbeiten, nenne in der Antwort ausdrücklich, welche Entitäten du nicht ausgewertet hast.
 Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander in separaten Schritten.
 Zählung in den Ergebnissen: Jedes Suchergebnis und jedes Listing endet mit „found: X, limit: Y“. Bei Suchen ist found die Gesamtzahl aller Treffer, bei Listings die Zahl der gezeigten Einträge (limit = max. Einträge). Ist das Ergebnis NICHT als unvollständig markiert, hast du die vollständige Menge — lies dann die relevanten Dateien (read_file oder read_metadata) oder antworte; such nicht endlos weiter. Ist found > limit oder das Ergebnis als unvollständig markiert, iteriere nicht blind weiter — beende deinen Turn mit einer kurzen, konkreten Frage an den User und biete an: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), (2) limit erhöhen (limit-Parameter der Suche, max. 100) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern). Zeige in der Frage eine kurze Beispiel-Auswahl aus dem, was du schon gesehen hast (max. 10 Einträge), damit der User echte Begriffe und Namen sehen kann.
+Wenn der User eine Entscheidung treffen muss (z. B. unklare Vorgabe, mehrere mögliche Wege, uneindeutiger Umfang), beende den Turn mit dem Tool present_options statt mit nummeriertem Text: 1-5 kurze Optionen, jede eine vollständige User-Anweisung (z. B. „Nur Rechnungen aus 2025 auswerten“). Der User klickt die gewählte Option, und sie erreicht dich als nächste User-Nachricht. Kannst du die Frage direkt beantworten, antworte normal OHNE present_options.
 „Alle“ oder „komplett“ in der User-Frage — ebenso Aufträge wie „Übersicht erstellen“ oder „alles auswerten“ — beschreiben das Suchziel (finde alle passenden Treffer), nicht die Genehmigung, eine unvollständige Treffermenge komplett zu durchlaufen. Eine solche Genehmigung zählt nur, wenn der User sie nach Kenntnis der gefundenen Anzahl ausdrücklich erteilt hat (z. B. „ja, alle 1590 durchlaufen“).
 Nach 3 Suchversuchen ohne Treffer frage den User ebenfalls, statt weiter zu raten. Wenn der User im Verlauf bereits eine solche Vorgabe gemacht hat, frage nicht erneut.
 Filter in der Frage (z. B. Jahr, Lieferant, Betrag) deckst du nur vollständig ab, wenn die passenden Metadaten (doc.date, doc.type, …) bei den Treffern gesetzt sind. Sind solche Metadaten-Suchen leer oder dünn (doc.date ist bei älteren Dateien oft nicht belegt), verenge stillschweigend nicht den Antwortumfang auf das, was du schon hast (z. B. einen Ordner, dessen Name den Filterbegriff trägt): such zusätzlich einfach nach dem Filterbegriff selbst (z. B. nach dem Jahr im Namen). Kannst du Vollständigkeit damit nicht sicherstellen, beziehe die Antwort ausdrücklich auf den Umfang, den du tatsächlich ausgewertet hast, und frage, ob du die übrigen Kandidaten durchlaufen sollst.
@@ -186,6 +187,11 @@ func (s *Server) chatTools() []toolDefinition {
 			Name:        "search_dir",
 			Description: "Sucht nach VERZEICHNISSEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als list_directory-/read_file-Pfad nutzbar) und Datum. Zum Finden des richtigen Unterverzeichnisses. Optional: extra-Parameter wie bei search_item (AND-Verknüpfung).",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft (wie bei search_item)."},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Optional: maximale Trefferzahl (Default 20, max 100). Nur bei ausdrücklicher User-Zustimmung auf einen höheren Wert setzen."}},"required":["pattern"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "present_options",
+			Description: "Beendet den Turn mit konkreten Antwort-Optionen, die der User in der Chat-UI anklicken kann. NUR verwenden, wenn der User eine Entscheidung treffen soll (z. B. unklare Vorgabe, mehrere mögliche Wege, Umfang-Frage) und du selbst nicht weiterkommst. Max. 5 kurze Optionen, jede für sich eine vollständige User-Anweisung. Wenn du die Frage direkt beantworten kannst, antworte normal OHNE dieses Tool.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"options":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5,"description":"1-5 kurze Optionen, jede eine vollständige User-Anweisung, z. B. \"Nur Rechnungen aus 2025 auswerten\""}},"required":["options"]}`),
 		}},
 	}
 }
@@ -1183,7 +1189,10 @@ type chatAskResponse struct {
 	ToolTrace  []toolTrace `json:"tool_trace"`
 	Iterations int         `json:"iterations"`
 	Model      string      `json:"model"`
-	Error      string      `json:"error,omitempty"`
+	// Vom Modell per present_options gereichte (bzw. beim Loop-Abbruch
+	// serverseitig gesetzte) Antwort-Optionen — klickbar in der Chat-UI.
+	Options []string `json:"options,omitempty"`
+	Error   string   `json:"error,omitempty"`
 }
 
 // handleChatTools: GET /chat/tools — liefert die Tool-Definitionen.
@@ -1349,6 +1358,44 @@ func loopBreakAnswer(reason, lastTool, lastResult string) string {
 	return s
 }
 
+// loopBreakOptions: die drei Standard-Optionen des serverseitigen
+// Loop-Abbruchs — klickbar für Extensions, die das "options"-Event
+// kennen. Der Text von loopBreakAnswer bleibt für ältere Clients
+// selbsterklärend.
+var loopBreakOptions = []string{
+	"Konkretisieren: Ich gebe jetzt präzisere Begriffe, Dokumenttyp (z. B. Rechnung, Bescheid) oder einen Zeitraum an.",
+	"Limitieren: Beschränke die Auswertung auf einen bestimmten Unterordner, Dateityp oder eine Ergebnisanzahl.",
+	"Durchlaufen lassen: Bewerte den Ordner komplett, das kann mehrere Minuten dauern.",
+}
+
+// parsePresentOptions liest die Argumente von present_options
+// ({"options": [ ... ]}) und liefert 1-5 getrimmte, nicht-leere
+// Strings. ok=false → die Argumente sind kein gültiges
+// Options-Array (das Modell bekommt einen Fehler-Hint).
+func parsePresentOptions(argsJSON string) ([]string, bool) {
+	var args struct {
+		Options []string `json:"options"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return nil, false
+	}
+	options := make([]string, 0, len(args.Options))
+	for _, option := range args.Options {
+		option = strings.TrimSpace(option)
+		if option == "" {
+			continue
+		}
+		options = append(options, option)
+		if len(options) == 5 {
+			break
+		}
+	}
+	if len(options) == 0 {
+		return nil, false
+	}
+	return options, true
+}
+
 // handleChatAsk: POST /chat/ask — Tool-Loop gegen den ephemeralen Share.
 func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1441,6 +1488,12 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	consecutiveDuplicates := 0
 	lastRealTool := ""
 	lastRealResult := ""
+	// present_options beendet den Turn: das Modell reicht dem User
+	// konkrete, anklickbare Optionen (SSE-Event "options" + JSON-Feld
+	// "options"). Beim serverseitigen Loop-Abbruch liefert der Server
+	// selbst die drei Standard-Optionen (loopBreakOptions).
+	loopOptions := []string{}
+	optionsDone := false
 
 	lastUserQuestion := ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
@@ -1524,6 +1577,54 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		}
 
 		for _, tc := range msg.ToolCalls {
+			// present_options ist terminal: gültige Optionen beenden den
+			// Turn sofort (der User klickt, die Option kommt als nächste
+			// User-Nachricht zurück). Ungültige Argumente bekommen einen
+			// Fehler-Hint, damit das Modell den Call korrigieren kann.
+			if tc.Function.Name == "present_options" {
+				options, optionsValid := parsePresentOptions(tc.Function.Arguments)
+				trace := toolTrace{Tool: "present_options", Method: "options"}
+				var result string
+				if !optionsValid {
+					result = "Fehler: present_options erwartet JSON im Format " +
+						"{\"options\": [\"Option 1\", \"Option 2\"]} mit 1-5 kurzen Strings. " +
+						"Übergib die Optionen bitte erneut in diesem Format."
+					trace.Error = "ungültige Optionen"
+				} else {
+					loopOptions = options
+					answer = content
+					if answer == "" {
+						answer = "Wähle eine Option oder antworte frei:"
+					}
+					result = "Die Optionen werden dem User angezeigt; der Turn endet."
+					trace.Chars = len(answer)
+				}
+				log.Printf("chat/ask: tool=present_options valid=%v options=%d args=%q",
+					optionsValid, len(options), tc.Function.Arguments)
+				toolTraces = append(toolTraces, trace)
+				if stream {
+					if err := sse.event("tool", map[string]interface{}{
+						"index":     len(toolTraces),
+						"tool":      "present_options",
+						"method":    "options",
+						"chars":     trace.Chars,
+						"error":     trace.Error,
+						"ms":        trace.MS,
+					}); err != nil {
+						return
+					}
+				}
+				messages = append(messages, chatToolMessage{
+					Role:       "tool",
+					Content:    strPtr(result),
+					ToolCallID: tc.ID,
+				})
+				if optionsValid {
+					optionsDone = true
+					break
+				}
+				continue
+			}
 			callKey := tc.Function.Name + "\x00" + strings.TrimSpace(tc.Function.Arguments)
 			var result string
 			var trace toolTrace
@@ -1576,12 +1677,17 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
+		if optionsDone {
+			break
+		}
+
 		// Serverseitiger Abbruch: das Modell wiederholt sich und liefert
 		// kein neues Ergebnis. Statt blind weiterzulaufen (970 Iterationen
 		// im August-Fall) antworten mit Zwischenergebnis + Optionen.
 		if consecutiveDuplicates >= 3 {
 			log.Printf("chat/ask: loop-break nach %d aufeinanderfolgenden Duplikaten (iteration %d)", consecutiveDuplicates, iterations)
 			answer = loopBreakAnswer("die gleiche Anfrage wiederholt lieferte kein neues Ergebnis (Wiederholungsschleife)", lastRealTool, lastRealResult)
+			loopOptions = loopBreakOptions
 			break
 		}
 
@@ -1595,6 +1701,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 
 	if answer == "" && iterations > 0 {
 		answer = loopBreakAnswer("die Maximalzahl an Iterationen erreicht wurde", lastRealTool, lastRealResult)
+		loopOptions = loopBreakOptions
 	}
 
 	resp := chatAskResponse{
@@ -1602,8 +1709,16 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		ToolTrace:  toolTraces,
 		Iterations: iterations,
 		Model:      model,
+		Options:    loopOptions,
 	}
 	if stream {
+		// Vor "done": die Extension kann die Buttons mit der Antwort
+		// rendern, ohne das done-Payload warten zu müssen.
+		if len(loopOptions) > 0 {
+			if err := sse.event("options", map[string]interface{}{"options": loopOptions}); err != nil {
+				return
+			}
+		}
 		if err := sse.event("done", resp); err != nil {
 			return
 		}
