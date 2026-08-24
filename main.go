@@ -4481,7 +4481,7 @@ func main() {
 	if cfg.DocMeta.Enabled {
 		log.Printf("  DocMeta:   enabled (model=%s, rescue=%v, required=%v)", cfg.DocMeta.ModelVersion, cfg.DocMeta.RescuePass, cfg.DocMeta.RequiredFields)
 	}
-	log.Printf("  Chat:      /chat/ask (opencloud=%s, model=%s, max_iter=%d)", cfg.OpenCloud.URL, cfg.Chat.DefaultModel, cfg.Chat.MaxIterations)
+	log.Printf("  Chat:      /chat/ask (opencloud=%s, model=%s, max_iter=%d, chat_token=%v)", cfg.OpenCloud.URL, cfg.Chat.DefaultModel, cfg.Chat.MaxIterations, cfg.Chat.ChatToken.Secret != "")
 
 	srv := NewServer(cfg)
 
@@ -4493,7 +4493,9 @@ func main() {
 	http.HandleFunc("/embed", srv.handleEmbed)
 	http.HandleFunc("/schema", srv.handleSchema)
 	http.HandleFunc("/chat/ask", srv.handleChatAsk)
+	http.HandleFunc("/chat/token", srv.handleChatToken)
 	http.HandleFunc("/chat/tools", srv.handleChatTools)
+	http.HandleFunc("/chat-direct/ask", srv.handleChatDirectAsk)
 	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/stats", srv.handleStats)
 	http.HandleFunc("/tika", srv.handleHealth)

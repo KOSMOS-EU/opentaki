@@ -18,6 +18,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -50,6 +53,7 @@ type ChatConfig struct {
 	systemPrompt     string              // runtime: geladenes Template (leer = noch nicht geladen)
 	Search           ChatSearchConfig    `yaml:"search"`
 	Heartbeat        ChatHeartbeatConfig `yaml:"heartbeat"`
+	ChatToken        ChatTokenConfig     `yaml:"chat_token"`
 }
 
 // chatSystemPromptBuiltin ist das Fallback-Template für den Chat-System-Prompt,
@@ -91,6 +95,20 @@ type ChatHeartbeatConfig struct {
 	IntervalSeconds int `yaml:"interval_seconds"` // Default 20, <5 = aus
 }
 
+// ChatTokenConfig steuert das langlebige Chat-Token (yaml: chat.chat_token:).
+// Der Proxy-OIDC-Gate akzeptiert nur IDP-Tokens — den vom Proxy geprägten
+// 1-Day-User-JWT kann die Extension also nicht als Bearer präsentieren.
+// Deshalb wrappt /chat/token (OIDC-gated) den User-JWT in ein HMAC-Token,
+// das Taki auf der unprotected /chat-direct-Route selbst validiert.
+type ChatTokenConfig struct {
+	// Secret: HMAC-SHA256-Secret. Leer = Chat-Token aus (die Extension
+	// nutzt dann weiterhin die OIDC-gated /chat/-Route).
+	Secret string `yaml:"secret"`
+	// TTLHours: maximale Gültigkeit eines Chat-Tokens. Die tatsächliche
+	// Expiry ist min(TTL, Expiry des eingebetteten User-JWTs). Default 24.
+	TTLHours int `yaml:"ttl_hours"`
+}
+
 func (c *ChatConfig) applyDefaults(cfg *Config) {
 	if c.MaxIterations < 1 {
 		c.MaxIterations = 8
@@ -118,6 +136,9 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 	}
 	if c.Heartbeat.IntervalSeconds < 5 {
 		c.Heartbeat.IntervalSeconds = 20
+	}
+	if c.ChatToken.TTLHours < 1 {
+		c.ChatToken.TTLHours = 24
 	}
 }
 
@@ -1173,6 +1194,131 @@ func (s *Server) handleChatTools(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(s.chatTools())
+}
+
+// ── Chat-Token (langlebig, Taki-validiert) ───────────────────
+//
+// Hintergrund: Das OIDC-Gate des Proxys akzeptiert nur IDP-Tokens — den
+// vom Proxy pro Request geprägten 1-Day-User-JWT kann die Extension nicht
+// als Bearer präsentieren (würde am Gate 401 werden). Langlaufende
+// Folder-Chats (10–30 min) sollen daher nicht auf den 5-minütigen
+// Browser-Bearer setzen. Lösung in zwei Endpunkten:
+//
+//	GET /chat/token        (OIDC-gated Route): wrappt den vom Proxy
+//	                       geprägten User-JWT in ein HMAC-Chat-Token.
+//	POST /chat-direct/ask  (unprotected Route): validiert das Token,
+//	                       stellt den User-JWT wieder her, delegiert an
+//	                       handleChatAsk.
+//
+// Token-Format: base64url(userJWT) + "." + exp(unix) + "." +
+// base64url(HMAC-SHA256(secret, userJWT + "." + exp)).
+
+// parseJWTExp liest die exp-Claim aus einem JWT-Payload (Base64-URL-JSON),
+// ohne die Signatur zu prüfen. 0 = nicht vorhanden/ungültig.
+func parseJWTExp(jwt string) int64 {
+	parts := strings.Split(jwt, ".")
+	if len(parts) != 3 {
+		return 0
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return 0
+	}
+	return claims.Exp
+}
+
+func chatTokenSign(secret, userJWT string, exp int64) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(userJWT + "." + strconv.FormatInt(exp, 10)))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return base64.RawURLEncoding.EncodeToString([]byte(userJWT)) +
+		"." + strconv.FormatInt(exp, 10) + "." + sig
+}
+
+// chatTokenVerify prüft Format, Expiry und HMAC (konstantzeitig) und
+// liefert den eingebetteten User-JWT.
+func chatTokenVerify(secret, token string) (string, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	userJWT, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil || len(userJWT) == 0 {
+		return "", false
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || exp < time.Now().Unix() {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(string(userJWT) + "." + parts[1]))
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !hmac.Equal(sig, mac.Sum(nil)) {
+		return "", false
+	}
+	return string(userJWT), true
+}
+
+// bearerFromHeader entnimmt den Token aus "Authorization: Bearer <token>".
+func bearerFromHeader(h string) string {
+	const bearerPrefix = "Bearer "
+	return strings.TrimPrefix(h, bearerPrefix)
+}
+
+// handleChatToken: GET /chat/token (OIDC-gated Proxy-Route) — wrappt den
+// vom Proxy als x-access-token geprägten 1-Day-User-JWT in ein langlebiges
+// Chat-Token. Läuft spätestens mit dem eingebetteten User-JWT aus.
+func (s *Server) handleChatToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.cfg.Chat.ChatToken.Secret == "" {
+		writeChatError(w, http.StatusServiceUnavailable, "Chat-Token nicht konfiguriert")
+		return
+	}
+	jwt := r.Header.Get("x-access-token")
+	if jwt == "" {
+		jwt = bearerFromHeader(r.Header.Get("Authorization"))
+	}
+	if jwt == "" {
+		writeChatError(w, http.StatusUnauthorized, "kein User-JWT vorhanden")
+		return
+	}
+	exp := time.Now().Add(time.Duration(s.cfg.Chat.ChatToken.TTLHours) * time.Hour).Unix()
+	if userExp := parseJWTExp(jwt); userExp > 0 && userExp < exp {
+		exp = userExp
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"token": chatTokenSign(s.cfg.Chat.ChatToken.Secret, jwt, exp),
+		"exp":   exp,
+	})
+}
+
+// handleChatDirectAsk: POST /chat-direct/ask (unprotected Proxy-Route) —
+// validiert das Chat-Token, stellt den User-JWT als x-access-token wieder
+// her und delegiert an handleChatAsk (Share-Zugriff bleibt Share-Token-
+// gebunden, Suche läuft über den wiederhergestellten User-JWT).
+func (s *Server) handleChatDirectAsk(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Chat.ChatToken.Secret == "" {
+		writeChatError(w, http.StatusServiceUnavailable, "Chat-Token nicht konfiguriert")
+		return
+	}
+	token := bearerFromHeader(r.Header.Get("Authorization"))
+	jwt, ok := chatTokenVerify(s.cfg.Chat.ChatToken.Secret, token)
+	if !ok {
+		writeChatError(w, http.StatusUnauthorized, "ungültiges oder abgelaufenes Chat-Token")
+		return
+	}
+	r.Header.Set("x-access-token", jwt)
+	s.handleChatAsk(w, r)
 }
 
 // truncateChars kürzt einen String auf n Runes, mit Kürzungs-Hinweis.
