@@ -2,6 +2,12 @@
 
 **Intelligent, LLM-powered drop-in replacement for Apache Tika.**
 
+open_taki is the document analysis engine of the OpenCore stack
+(OpenCloud + OpenCosmos): it enriches documents with LLM-based
+metadata so they become searchable and intelligible. (F17 builds on
+open_taki — the reference direction is F17 → open_taki, not the
+other way around.)
+
 Part of the [kosmos](https://codeberg.org/kosmos-eu) open source initiative — building vendor-free, sovereign digital infrastructure for European municipalities and public institutions.
 
 ---

@@ -1,0 +1,92 @@
+publiccodeYmlVersion: "0.4"
+name: "open_taki"
+applicationSuite: "KOSMOS"
+url: "https://gitlab.opencode.de/kosmos/open_taki"
+landingURL: "https://kosmos.technology/"
+softwareVersion: "0.9.1"
+releaseDate: "2026-08-25"
+platforms:
+  - "linux"
+categories:
+  - "document-management"
+  - "data-analytics"
+developmentStatus: "beta"
+softwareType: "standalone/backend"
+description:
+  de:
+    genericName: "KI-Dokumentenanalyse"
+    shortDescription: "KI-gestützte Dokumentenanalyse als Drop-in-Ersatz für Apache Tika: OCR, Zusammenfassung, Klassifikation und Transkription auf eigener Infrastruktur."
+    longDescription: >
+      open_taki ist die Dokumentenanalyse-Engine des OpenCore-Stacks
+      (OpenCloud + OpenCosmos) und ersetzt Apache Tika als
+      Dokumentenanalyse-Schicht. Statt eines 1-GB-Java-Monolithen mit
+      CPU-basiertem OCR ist es eine kompakte Go-Anwendung, die
+      Sprachmodelle für das Verständnis von Dokumenten einsetzt.
+
+      F17 baut auf open_taki auf — die Referenzrichtung ist F17 →
+      open_taki, nicht umgekehrt. open_taki ist eigenständig
+      einsetzbar; F17 ist eine Anwendung auf dieser Basis.
+
+      open_taki extrahiert aus Dokumenten (PDF, Office, Bilder, Audio)
+      Text, Entitäten (Namen, Daten, Beträge), Zusammenfassungen und
+      Dokumenttypen. Es beschreibt Bildinhalte, transkribiert Audio
+      (Whisper) und liefert die Metadaten, die die Volltext- und
+      Semantiksuche der KOSMOS Edition mit füllt.
+
+      Die Sprachmodelle laufen auf eigener Hardware (GPU-Server) und
+      werden über microllm angesteuert — keine Daten verlassen die
+      eigene Infrastruktur.
+    features:
+      - "LLM-basierte Dokumentenanalyse statt klassischem Tesseract-OCR"
+      - "Entitäten-Extraktion: Namen, Daten, Beträge"
+      - "Zusammenfassung und Klassifikation von Dokumenten"
+      - "Bildbeschreibung und Audio-Transkription (Whisper)"
+      - "Parallele Verarbeitung aller Seiten/Dateien"
+      - "Betrieb auf eigener Infrastruktur, Modelle lokal"
+  en:
+    genericName: "AI Document Analysis"
+    shortDescription: "AI-powered document analysis as a drop-in replacement for Apache Tika: OCR, summarization, classification and transcription on own infrastructure."
+    longDescription: >
+      open_taki is the document analysis engine of the OpenCore stack
+      (OpenCloud + OpenCosmos) and replaces Apache Tika as the
+      document analysis layer. Instead of a 1 GB Java monolith with
+      CPU-based OCR it is a compact Go application that uses language
+      models to understand documents.
+
+      F17 builds on open_taki — the reference direction is F17 →
+      open_taki, not the other way around. open_taki is fully
+      standalone; F17 is an application on top of it.
+
+      open_taki extracts text, entities (names, dates, amounts),
+      summaries and document types from documents (PDF, office files,
+      images, audio). It describes image content, transcribes audio
+      (Whisper) and provides the metadata that feeds the full-text and
+      semantic search of the KOSMOS Edition.
+
+      The language models run on own hardware (GPU servers) and are
+      accessed through microllm — no data leaves own infrastructure.
+    features:
+      - "LLM-based document analysis instead of classic Tesseract OCR"
+      - "Entity extraction: names, dates, amounts"
+      - "Summarization and classification of documents"
+      - "Image description and audio transcription (Whisper)"
+      - "Parallel processing of all pages/files"
+      - "Operation on own infrastructure, models local"
+intendedAudience:
+  countries:
+    - "de"
+  scope:
+    - "local-authorities"
+    - "government"
+legal:
+  license: "AGPL-3.0-or-later"
+maintenance:
+  type: "community"
+  contacts:
+    - name: "KOSMOS"
+      email: "info@kosmos.technology"
+localisation:
+  localisationReady: true
+  availableLanguages:
+    - "de"
+    - "en"
