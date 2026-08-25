@@ -4,7 +4,7 @@ applicationSuite: "KOSMOS"
 url: "https://gitlab.opencode.de/kosmos/open_taki"
 landingURL: "https://kosmos.technology/"
 softwareVersion: "0.9.1"
-logo: "logo.png"
+logo: "feature.png"
 releaseDate: "2026-08-25"
 platforms:
   - "linux"
