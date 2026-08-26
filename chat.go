@@ -1315,19 +1315,105 @@ func (s *Server) handleChatToken(w http.ResponseWriter, r *http.Request) {
 // validiert das Chat-Token, stellt den User-JWT als x-access-token wieder
 // her und delegiert an handleChatAsk (Share-Zugriff bleibt Share-Token-
 // gebunden, Suche läuft über den wiederhergestellten User-JWT).
-func (s *Server) handleChatDirectAsk(w http.ResponseWriter, r *http.Request) {
+// chatVerifyToken validiert das langlebige Chat-Token und stellt den
+// User-JWT als x-access-token wieder her. ok=false → Auth-Fehler ist
+// schon an den Client geschickt.
+func (s *Server) chatVerifyToken(w http.ResponseWriter, r *http.Request) bool {
 	if s.cfg.Chat.ChatToken.Secret == "" {
 		writeChatError(w, http.StatusServiceUnavailable, "Chat-Token nicht konfiguriert")
-		return
+		return false
 	}
 	token := bearerFromHeader(r.Header.Get("Authorization"))
 	jwt, ok := chatTokenVerify(s.cfg.Chat.ChatToken.Secret, token)
 	if !ok {
 		writeChatError(w, http.StatusUnauthorized, "ungültiges oder abgelaufenes Chat-Token")
-		return
+		return false
 	}
 	r.Header.Set("x-access-token", jwt)
+	return true
+}
+
+func (s *Server) handleChatDirectAsk(w http.ResponseWriter, r *http.Request) {
+	if !s.chatVerifyToken(w, r) {
+		return
+	}
 	s.handleChatAsk(w, r)
+}
+
+// maxChatTranscribeBytes: Cap für Audio-Aufnahmen (WebM/OGG ~150 kB/min,
+// 50 MB ≈ 5 h Aufnahme — reichlich für Chat-Zwecke).
+const maxChatTranscribeBytes = 50 * 1024 * 1024
+
+// handleChatTranscribe: POST /chat-direct/transcribe (unprotected Proxy-Route,
+// Chat-Token-Auth) — leitet eine Audio-Aufnahme (Multipart-Feld "file") über
+// Whisper (microllm llm-stt) an und liefert den Transkript-Text zurück.
+// Antwort: {"text": "…", "method": "whisper"}.
+func (s *Server) handleChatTranscribe(w http.ResponseWriter, r *http.Request) {
+	if !s.chatVerifyToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.cfg.Whisper.APIBase == "" {
+		writeChatError(w, http.StatusServiceUnavailable, "Whisper nicht konfiguriert")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxChatTranscribeBytes+1024*1024)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeChatError(w, http.StatusBadRequest, "multipart/form-data erwartet: "+err.Error())
+		return
+	}
+
+	var audioData []byte
+	var audioName, audioCT string
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			writeChatError(w, http.StatusBadRequest, "multipart-Fehler: "+err.Error())
+			return
+		}
+		if part.FormName() != "file" {
+			_, _ = io.Copy(io.Discard, part)
+			continue
+		}
+		// Cap auf maxChatTranscribeBytes (Buffer-Overrun → 413)
+		audioData, err = io.ReadAll(io.LimitReader(part, maxChatTranscribeBytes+1))
+		if err != nil {
+			writeChatError(w, http.StatusBadRequest, "Audio-Fehler: "+err.Error())
+			return
+		}
+		if len(audioData) > maxChatTranscribeBytes {
+			writeChatError(w, http.StatusRequestEntityTooLarge, "Audio-Datei zu groß (max. 50 MB)")
+			return
+		}
+		audioName = part.FileName()
+		audioCT = part.Header.Get("Content-Type")
+		break
+	}
+	if audioData == nil {
+		writeChatError(w, http.StatusBadRequest, "Feld 'file' fehlt")
+		return
+	}
+
+	text, method := s.transcribeAudioBytes(audioData, audioCT, audioName)
+	if method != "whisper" {
+		status := http.StatusBadGateway
+		if method == "skipped" {
+			status = http.StatusServiceUnavailable
+		}
+		writeChatError(w, status, text)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"text": text, "method": method})
 }
 
 // truncateChars kürzt einen String auf n Runes, mit Kürzungs-Hinweis.

@@ -3282,13 +3282,33 @@ func (s *Server) extractImage(data []byte, ct string) (string, string) {
 // ── Audio extraction (Whisper) ───────────────────────────────
 
 func (s *Server) extractAudio(data []byte, ct string) (string, string) {
+	text, method := s.transcribeAudioBytes(data, "audio/"+ct, "")
+	if method == "whisper" {
+		return text, "whisper"
+	}
+	return text, method // "skipped" | "error"
+}
+
+// transcribeAudioBytes leitet rohe Audio-Bytes über Whisper (microllm
+// llm-stt). ct = MIME-Typ (Bestimmung der Dateiendung), filename =
+// Originalname (Fallback, z.B. "aufnahme.webm"). Liefert Text und Methode:
+// "whisper" (Erfolg), "skipped" (nicht konfiguriert), "error" (Fehler —
+// text enthält dann einen Hinweis).
+func (s *Server) transcribeAudioBytes(data []byte, ct, filename string) (string, string) {
 	if s.cfg.Whisper.APIBase == "" {
 		return "[audio transcription not configured]", "skipped"
 	}
 
 	ext := ".wav"
-	for _, pair := range [][2]string{{"mp3", ".mp3"}, {"mpeg", ".mp3"}, {"ogg", ".ogg"}, {"flac", ".flac"}, {"m4a", ".m4a"}, {"mp4", ".m4a"}} {
+	for _, pair := range [][2]string{{"mp3", ".mp3"}, {"mpeg", ".mp3"}, {"ogg", ".ogg"}, {"webm", ".webm"}, {"flac", ".flac"}, {"m4a", ".m4a"}, {"mp4", ".m4a"}, {"aac", ".aac"}} {
 		if strings.Contains(ct, pair[0]) {
+			ext = pair[1]
+			break
+		}
+	}
+	// Filename-Match vor MIME (Browser-Aufnahmen: MIME webm, Name .webm)
+	for _, pair := range [][2]string{{".mp3", ".mp3"}, {".ogg", ".ogg"}, {".oga", ".ogg"}, {".webm", ".webm"}, {".flac", ".flac"}, {".m4a", ".m4a"}, {".mp4", ".m4a"}, {".wav", ".wav"}, {".aac", ".aac"}} {
+		if strings.HasSuffix(strings.ToLower(filename), pair[0]) {
 			ext = pair[1]
 			break
 		}
@@ -4569,6 +4589,7 @@ func main() {
 	http.HandleFunc("/chat/token", srv.handleChatToken)
 	http.HandleFunc("/chat/tools", srv.handleChatTools)
 	http.HandleFunc("/chat-direct/ask", srv.handleChatDirectAsk)
+	http.HandleFunc("/chat-direct/transcribe", srv.handleChatTranscribe)
 	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/stats", srv.handleStats)
 	http.HandleFunc("/tika", srv.handleHealth)
