@@ -3322,7 +3322,23 @@ func (s *Server) transcribeAudioBytes(data []byte, ct, filename string) (string,
 	tmp.Write(data)
 	tmp.Close()
 
-	text := s.whisperTranscribe(tmp.Name())
+	audioPath := tmp.Name()
+
+	// WebM/Opus: vLLM Whisper decodes it not — transcode to WAV first
+	if ext == ".webm" || ext == ".ogg" {
+		wavPath := tmp.Name() + ".wav"
+		cmd := exec.Command("ffmpeg", "-i", tmp.Name(),
+			"-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+			"-y", wavPath)
+		if err := cmd.Run(); err != nil {
+			log.Printf("ffmpeg transcode error: %v", err)
+		} else {
+			defer os.Remove(wavPath)
+			audioPath = wavPath
+		}
+	}
+
+	text := s.whisperTranscribe(audioPath)
 	if text != "" {
 		return text, "whisper"
 	}
