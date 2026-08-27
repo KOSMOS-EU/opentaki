@@ -49,11 +49,26 @@ type ChatConfig struct {
 	// Platzhaltern {{folder}} und {{tools}}. Default:
 	// <configDir>/prompts/chat_system.txt (taka-prompts-Paket).
 	// Datei fehlt → Built-in-Template (chatSystemPromptBuiltin).
-	SystemPromptFile string              `yaml:"system_prompt_file"`
-	systemPrompt     string              // runtime: geladenes Template (leer = noch nicht geladen)
-	Search           ChatSearchConfig    `yaml:"search"`
+	SystemPromptFile string `yaml:"system_prompt_file"`
+	systemPrompt     string // runtime: geladenes Template (leer = noch nicht geladen)
+	// BlankSystemPromptFile: externes Template für den Blank-Chat mit den
+	// Platzhaltern {{root}}, {{tools_write}} und {{options_rule}}.
+	// Default: <configDir>/prompts/chat_system_blank.txt (taka-prompts-Paket).
+	// Datei fehlt → Built-in-Template (chatSystemPromptBlankBuiltin).
+	BlankSystemPromptFile string `yaml:"blank_system_prompt_file"`
+	blankSystemPrompt     string // runtime (leer = noch nicht geladen)
+	Search           ChatSearchConfig `yaml:"search"`
 	Heartbeat        ChatHeartbeatConfig `yaml:"heartbeat"`
-	ChatToken        ChatTokenConfig     `yaml:"chat_token"`
+	ChatToken        ChatTokenConfig  `yaml:"chat_token"`
+	Write            ChatWriteConfig  `yaml:"write"`
+}
+
+// ChatWriteConfig steuert die Write-Tools des Blank-Chats (yaml: chat.write:).
+// Nur Requests mit context.write erhalten die Tools — der Personal-Space-Gate
+// liegt auf der Extension (createFileHandler + Panel-visibility).
+type ChatWriteConfig struct {
+	MaxFileBytes int `yaml:"max_file_bytes"` // default 1 MB
+	MaxDepth     int `yaml:"max_depth"`      // default 3 (Verzeichnisebenen unter der Root)
 }
 
 // chatSystemPromptBuiltin ist das Fallback-Template für den Chat-System-Prompt,
@@ -83,6 +98,37 @@ func renderChatSystemPrompt(s *Server, folder, searchTools string) string {
 	}
 	prompt = strings.ReplaceAll(prompt, "{{folder}}", folder)
 	return strings.ReplaceAll(prompt, "{{tools}}", searchTools)
+}
+
+// chatSystemPromptBlankBuiltin ist das Fallback-Template für den Blank-Chat
+// (Create with Chat, kein geteilter Ordner, Schreiben in das Workspace-
+// Verzeichnis des persönlichen Spaces). Es muss inhaltlich mit
+// chat_system_blank.txt im taka-prompts-Paket übereinstimmen.
+const chatSystemPromptBlankBuiltin = `Du bist ein kreativer Assistent, der Dateien für den User in seinem persönlichen Cloud-Arbeitsbereich „{{root}}“ erstellt.
+{{tools_write}}Regeln:
+• Lege ZUERST ein Projektverzeichnis mit mkdir an — der User soll seine Erzeugnisse in klar getrennten Ordner-Projekten finden (Name: kurz beschreibend, kleingeschrieben, Bindestriche, z. B. "url-kurzner" oder "notizen-2026-08").
+• Erstelle pro Antwort max. EINE Datei (write_file) — mehr auf Anweisung.
+• Ggf. weitere Dateien im selben Projekt: erst mit present_options anbieten.
+• Nenne in der Antwort den vollen Pfad relativ zu {{root}}, z. B. „url-kurzner/app.html“.
+• Vor der ersten Änderung an einem existierenden Projekt (Datei/Ordner) den User um Bestätigung bitten (present_options).
+{{options_rule}}Wenn der User eine Entscheidung treffen muss (z. B. unklare Vorgabe, mehrere mögliche Varianten) — beende den Turn mit dem Tool present_options, NIEMALS mit freier oder nummerierter Frage im Antworttext: 1-5 kurze Optionen, jede eine vollständige User-Anweisung. Kannst du den Auftrag direkt ausführen, antworte normal OHNE present_options.
+Dateiformate für interaktive Inhalte:
+• XHTML (Endung .xhtml): direkt in der Cloud als Seite/App/Spiel/Rechner öffnet — ideal für selbstständige, interaktive Anwendungen (Spiele, Taschenrechner, Visualisierungen, Tools).
+• HTML (Endung .html): für Internet-/Intranet-Spaces gedacht (externe Links, CDN-Resources, Frameworks).
+Beide Formate werden in der Chat-UI als Live-Vorschau angezeigt, wenn der Codeblock mit dem html-Tag (drei Backticks + "html") umflossen ist.
+Wenn du fertig bist, antworte kurz und strukturiert (was du wo erstellt hast).`
+
+// renderChatBlankSystemPrompt füllt die Platzhalter des Blank-Chat-
+// System-Prompt-Templates ({{root}} = Workspace-Verzeichnis,
+// {{tools_write}} = Write-Tool-Beschreibung, {{options_rule}} = leer).
+func renderChatBlankSystemPrompt(s *Server, root, writeTools string) string {
+	prompt := s.cfg.Chat.blankSystemPrompt
+	if prompt == "" {
+		prompt = chatSystemPromptBlankBuiltin
+	}
+	prompt = strings.ReplaceAll(prompt, "{{root}}", root)
+	prompt = strings.ReplaceAll(prompt, "{{tools_write}}", writeTools)
+	return strings.ReplaceAll(prompt, "{{options_rule}}", "")
 }
 
 // ChatSearchConfig steuert die WebDAV-REPORT-Suche (yaml: chat.search:)
@@ -141,6 +187,12 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 	if c.ChatToken.TTLHours < 1 {
 		c.ChatToken.TTLHours = 24
 	}
+	if c.Write.MaxFileBytes < 1 {
+		c.Write.MaxFileBytes = 1024 * 1024
+	}
+	if c.Write.MaxDepth < 1 {
+		c.Write.MaxDepth = 3
+	}
 }
 
 // ── Tool-Definitionen (OpenAI-Format) ────────────────────────
@@ -192,6 +244,29 @@ func (s *Server) chatTools() []toolDefinition {
 			Name:        "present_options",
 			Description: "Beendet den Turn mit konkreten Antwort-Optionen, die der User in der Chat-UI anklicken kann. NUR verwenden, wenn der User eine Entscheidung treffen soll (z. B. unklare Vorgabe, mehrere mögliche Wege, Umfang-Frage) und du selbst nicht weiterkommst. Max. 5 kurze Optionen, jede für sich eine vollständige User-Anweisung. Wenn du die Frage direkt beantworten kannst, antworte normal OHNE dieses Tool.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"options":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5,"description":"1-5 kurze Optionen, jede eine vollständige User-Anweisung, z. B. \"Nur Rechnungen aus 2025 auswerten\""}},"required":["options"]}`),
+		}},
+	}
+}
+
+// chatWriteTools: die Write-Tools des Blank-Chats (write_file, mkdir,
+// rmdir). Nur bei context.write im Request injiziert — der Personal-Space-
+// Gate liegt auf der Extension. Pfade sind relativ zur Write-Root.
+func chatWriteTools() []toolDefinition {
+	return []toolDefinition{
+		{Type: "function", Function: toolFunction{
+			Name:        "write_file",
+			Description: "Erstellt eine Datei (oder überschreibt eine bestehende) mit dem vorgegebenen Textinhalt im Arbeitsbereich. Pfad relativ zur Arbeitsbereich-Root (z. B. \"projekt/datei.html\"). Überschreibt vorhandene Dateien — rufe vorher mkdir auf, wenn das Verzeichnis neu ist.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root, z. B. \"projekt/datei.html\""},"content":{"type":"string","description":"Vollständiger Dateiinhalt (Unicode-Text)"}},"required":["path","content"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "mkdir",
+			Description: "Legt ein Verzeichnis im Arbeitsbereich an (Pfad relativ zur Root, z. B. \"projekt\"). Existiert es bereits, ist der Call ein no-op.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad des Verzeichnisses relativ zur Arbeitsbereich-Root"}},"required":["path"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "rmdir",
+			Description: "Entfernt ein LEERES Verzeichnis im Arbeitsbereich (Pfad relativ zur Root, z. B. \"projekt\"). Nicht-leere Verzeichnisse werden NICHT entfernt (Fehlermeldung).",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad des Verzeichnisses relativ zur Arbeitsbereich-Root"}},"required":["path"]}`),
 		}},
 	}
 }
@@ -704,6 +779,10 @@ type userWebDav struct {
 	jwt       string // User-Reva-JWT (nie loggen)
 	scopeID   string // <storageid>$<spaceid>!<opaqueid>, "" = keine Suche
 	scopePath string // geteilter Ordner relativ zur Space-Root, "" = Root
+	// Write-Root (Blank-Chat): context.write.root, "" = keine Write-Tools
+	writeRoot string
+	// writeSpaceID: lazily aufgelöste Space-ID des persönlichen Spaces
+	writeSpaceID string
 }
 
 func newUserWebDav(s *Server, jwt string) *userWebDav {
@@ -712,6 +791,156 @@ func newUserWebDav(s *Server, jwt string) *userWebDav {
 		base:   strings.TrimRight(s.cfg.Chat.Search.WebDavURL, "/"),
 		jwt:    jwt,
 	}
+}
+
+// resolvePersonalSpaceID liefert die Space-Resource-ID des persönlichen
+// Spaces des Users (<storageid>$<spaceid>!) per PROPFIND auf /dav/spaces.
+// Leerer String = kein persönlicher Space auffindbar.
+func (u *userWebDav) resolvePersonalSpaceID() string {
+	const propfindBody = `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><oc:drive-type xmlns:oc="http://owncloud.org/ns"/></d:prop></d:propfind>`
+	req, err := http.NewRequest("PROPFIND", u.base+"/dav/spaces", strings.NewReader(propfindBody))
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Depth", "1")
+	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
+	req.Header.Set("x-access-token", u.jwt)
+	resp, err := u.client.Do(req)
+	if err != nil {
+		log.Printf("chat write: PROPFIND /dav/spaces: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMultiStatus {
+		log.Printf("chat write: PROPFIND /dav/spaces: HTTP %d", resp.StatusCode)
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	if err != nil {
+		return ""
+	}
+	return spaceIDFromPropfindBody(raw)
+}
+
+// spaceIDFromPropfindBody holt die Space-Resource-ID aus einer
+// /dav/spaces-PROPFIND-Antwort (d:resourcetype mit <d:collection/> +
+// oc:drive-type = "personal", href = /dav/spaces/<id>/).
+func spaceIDFromPropfindBody(body []byte) string {
+	type propfindRest struct {
+		Href  string `xml:"href"`
+		Raw   string `xml:",innerxml"`
+	}
+	type propfindML struct {
+		XMLName xml.Name     `xml:"multistatus"`
+		Rests   []propfindRest `xml:"response"`
+	}
+	var ml propfindML
+	if err := xml.Unmarshal(body, &ml); err != nil {
+		return ""
+	}
+	for _, rest := range ml.Rests {
+		if !strings.Contains(rest.Href, "/dav/spaces/") {
+			continue
+		}
+		// resourcetype mit <d:collection/>: Space (vs. einzelner Resource)
+		if !strings.Contains(rest.Raw, "collection") {
+			continue
+		}
+		// oc:drive-type = "personal"
+		if !strings.Contains(rest.Raw, "personal") {
+			continue
+		}
+		return path.Base(strings.TrimSuffix(rest.Href, "/"))
+	}
+	return ""
+}
+
+// ── Write-Tools (Blank-Chat) ─────────────────────────────────
+//
+// Write-Aktionen laufen gegen den persönlichen Space des Users
+// (userJWT, PROPFIND-Resolved Space-ID), relativ zu einer von der
+// Extension mitgegebenen Root (context.write.root). safeWritePath
+// ist die Path-Safety-Schicht: alles außerhalb der Root oder tiefer
+// als MaxDepth wird blockiert.
+
+// safeWritePath normalisiert einen relativen Pfad unter root (z. B.
+// "projekt/datei.html" → "workspace/projekt/datei.html") und prüft
+// MaxDepth. Liefert "" bei leerem Input (die Root selbst).
+func safeWritePath(root, relPath string, maxDepth int) (string, error) {
+	if relPath == "" {
+		return strings.TrimRight(root, "/"), nil
+	}
+	p := strings.TrimLeft(relPath, "/")
+	if strings.Contains(p, "..") {
+		return "", fmt.Errorf("Pfade mit '..' sind nicht erlaubt")
+	}
+	p = path.Clean(p)
+	depth := strings.Count(p, "/") + 1
+	if depth > maxDepth {
+		return "", fmt.Errorf("Pfad zu tief (max. %d Ebenen unter der Root)", maxDepth)
+	}
+	return strings.TrimRight(root, "/") + "/" + p, nil
+}
+
+// spaceURL baut den vollständigen WebDAV-Pfad für ein Resource im
+// persönlichen Space (root + relPath → /dav/spaces/<spaceID>/<root>/<rel>).
+func (u *userWebDav) spaceURL(spaceID, root, relPath string) string {
+	base := strings.TrimRight(u.base, "/")
+	root = strings.TrimRight(strings.TrimLeft(root, "/"), "/")
+	if relPath == "" {
+		return base + "/dav/spaces/" + url.PathEscape(spaceID) + "/" + root + "/"
+	}
+	seg := strings.Split(strings.TrimLeft(relPath, "/"), "/")
+	for i, s := range seg {
+		seg[i] = url.PathEscape(s)
+	}
+	return base + "/dav/spaces/" + url.PathEscape(spaceID) + "/" + root + "/" + strings.Join(seg, "/")
+}
+
+// doWrite führt eine WebDAV-Write-Aktion (MKCOL/PUT/DELETE) gegen
+// den persönlichen Space aus.
+func (u *userWebDav) doWrite(method, uURL string, body io.Reader) error {
+	req, err := http.NewRequest(method, uURL, body)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+	req.Header.Set("x-access-token", u.jwt)
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch {
+	case method == "MKCOL" && (resp.StatusCode == 201 || resp.StatusCode == 405):
+		return nil // 405 = bereits existiert → no-op
+	case method == "PUT" && (resp.StatusCode == 201 || resp.StatusCode == 204):
+		return nil
+	case method == "DELETE" && resp.StatusCode == 204:
+		return nil
+	default:
+		return fmt.Errorf("WebDAV %s: HTTP %d", method, resp.StatusCode)
+	}
+}
+
+// mkdir legt ein Verzeichnis im persönlichen Space an (MKCOL).
+// Existiert es bereits → no-op (405).
+func (u *userWebDav) mkdir(spaceID, root, relPath string) error {
+	return u.doWrite("MKCOL", u.spaceURL(spaceID, root, relPath), nil)
+}
+
+// putFile legt eine Datei im persönlichen Space an oder überschreibt
+// sie (PUT). content wird als application/octet-stream übertragen.
+func (u *userWebDav) putFile(spaceID, root, relPath, content string) error {
+	return u.doWrite("PUT", u.spaceURL(spaceID, root, relPath), strings.NewReader(content))
+}
+
+// deletePath entfernt ein LEERES Verzeichnis (DELETE, nicht rekursiv).
+func (u *userWebDav) deletePath(spaceID, root, relPath string) error {
+	return u.doWrite("DELETE", u.spaceURL(spaceID, root, relPath), nil)
 }
 
 // escapeBlevePattern escapiert Bleve-Spezialzeichen — das Pattern wird als
@@ -896,6 +1125,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		Pattern string `json:"pattern"`
 		Extra   string `json:"extra"`
 		Limit   int    `json:"limit"`
+		Content string `json:"content"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
@@ -1126,6 +1356,64 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.MS = time.Since(start).Milliseconds()
 		return sb.String(), trace
 
+	case "write_file", "mkdir", "rmdir":
+		// Write-Tools: nur bei context.write (u != nil + writeRoot != "")
+		if u == nil || u.writeRoot == "" {
+			trace.Error = "Schreiben nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Schreiben ist für diesen Chat nicht verfügbar.", trace
+		}
+		if u.writeSpaceID == "" {
+			u.writeSpaceID = u.resolvePersonalSpaceID()
+		}
+		if u.writeSpaceID == "" {
+			trace.Error = "persönlicher Space nicht gefunden"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: persönlicher Space konnte nicht aufgelöst werden.", trace
+		}
+		fullPath, err := safeWritePath(u.writeRoot, relPath, s.cfg.Chat.Write.MaxDepth)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		trace.Path = fullPath
+		switch name {
+		case "write_file":
+			if len(args.Content) > s.cfg.Chat.Write.MaxFileBytes {
+				trace.Error = "Datei zu groß"
+				trace.MS = time.Since(start).Milliseconds()
+				return fmt.Sprintf("Fehler: Dateiinhalt zu groß (max. %d Bytes).", s.cfg.Chat.Write.MaxFileBytes), trace
+			}
+			if err := u.putFile(u.writeSpaceID, u.writeRoot, relPath, args.Content); err != nil {
+				trace.Error = err.Error()
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: " + err.Error(), trace
+			}
+			trace.Method = "put"
+			trace.Chars = len(args.Content)
+			trace.MS = time.Since(start).Milliseconds()
+			return "Datei erfolgreich erstellt: " + fullPath, trace
+		case "mkdir":
+			if err := u.mkdir(u.writeSpaceID, u.writeRoot, relPath); err != nil {
+				trace.Error = err.Error()
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: " + err.Error(), trace
+			}
+			trace.Method = "mkcol"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Verzeichnis erfolgreich angelegt: " + fullPath + "/", trace
+		case "rmdir":
+			if err := u.deletePath(u.writeSpaceID, u.writeRoot, relPath); err != nil {
+				trace.Error = err.Error()
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: " + err.Error() + " (nur leere Verzeichnisse können entfernt werden)", trace
+			}
+			trace.Method = "delete"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Verzeichnis erfolgreich entfernt: " + fullPath, trace
+		}
+		fallthrough
 	default:
 		trace.Error = "unbekanntes Tool"
 		trace.MS = time.Since(start).Milliseconds()
@@ -1178,6 +1466,12 @@ type chatAskRequest struct {
 			ResourceID string `json:"resource_id"`
 			Path       string `json:"path"`
 		} `json:"scope"`
+		// Write: Blank-Chat — schreiben in den persönlichen Space.
+		// Root: Verzeichnis relativ zur Space-Root (z. B. "workspace").
+		// Leer = keine Write-Tools (Share/Scope-Chat bleibt read-only).
+		Write struct {
+			Root string `json:"root"`
+		} `json:"write"`
 	} `json:"context"`
 	// Stream: live Fortschritt per Server-Sent-Events
 	// (start/phase/tool/error/done). Default false = finale JSON-Antwort.
@@ -1494,8 +1788,9 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, http.StatusBadRequest, "ungültiger Request: " + err.Error())
 		return
 	}
-	if req.Context.Share.Token == "" || req.Context.Share.Password == "" {
-		writeChatError(w, http.StatusBadRequest, "context.share (token + password) erforderlich")
+	writeRoot := strings.Trim(req.Context.Write.Root, "/")
+	if writeRoot != "" && strings.Contains(writeRoot, "..") {
+		writeChatError(w, http.StatusBadRequest, "context.write.root darf keine '..'-Segmente enthalten")
 		return
 	}
 	if len(req.Messages) == 0 {
@@ -1512,6 +1807,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 
 	// User-JWT (vom Proxy als x-access-token, Bearer-Fallback für
 	// Direkt-Tests) → WebDAV-REPORT-Suche auf den mitgeschickten Scope.
+	// Im Blank-Chat ist er zwingend — ohne JWT keine Write-Tools.
 	jwt := r.Header.Get("x-access-token")
 	if jwt == "" {
 		const bearerPrefix = "Bearer "
@@ -1519,34 +1815,56 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			jwt = strings.TrimPrefix(h, bearerPrefix)
 		}
 	}
+	// Blank-Chat: context.write statt context.share — Write-Tools gegen
+	// den persönlichen Space (Personal-Space-Gate liegt auf der Extension).
+	isBlankChat := writeRoot != "" && jwt != ""
+	if isBlankChat {
+		tools = append(tools, chatWriteTools()...)
+	}
+	if !isBlankChat && (req.Context.Share.Token == "" || req.Context.Share.Password == "") {
+		writeChatError(w, http.StatusBadRequest, "context.share (token + password) erforderlich")
+		return
+	}
 	var u *userWebDav
 	if jwt != "" {
 		u = newUserWebDav(s, jwt)
 		u.scopeID = req.Context.Scope.ResourceID
 		u.scopePath = req.Context.Scope.Path
+		if isBlankChat {
+			u.writeRoot = writeRoot
+		}
 	}
 	searchAvailable := u != nil && u.scopeID != ""
 
 	// System-Prompt (serverseitig, deterministisch)
-	folder := req.Context.FolderName
-	if folder == "" {
-		folder = "der geteilte Ordner"
+	var sysPrompt string
+	if isBlankChat {
+		writeTools := ""
+		if u != nil {
+			writeTools = "Du kannst Dateien in dem Verzeichnis „" + writeRoot + "“ im persönlichen Cloud-Arbeitsbereich des Users mit den Tools mkdir (Verzeichnis anlegen), write_file (Datei erstellen/überschreiben) und rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
+		}
+		sysPrompt = renderChatBlankSystemPrompt(s, writeRoot, writeTools)
+	} else {
+		folder := req.Context.FolderName
+		if folder == "" {
+			folder = "der geteilte Ordner"
+		}
+		searchTools := ""
+		if searchAvailable {
+			searchTools = "Bei großen Ordnern: erst mit search_item (Dateien) oder search_dir (Verzeichnisse) " +
+				"suchen, statt alles aufzulisten. Suchtreffer sind mit read_file lesbar " +
+				"(Pfad relativ zum Ordner). " +
+				"Strukturierte Suche: der optionale extra-Parameter verknüpft eine zusätzliche " +
+				"Bedingung mit AND, z. B. extra=\"metadata.doc.type:rechnung\" (KI-Dokumenttyp), " +
+				"extra=\"mediatype:pdf\" (Dateityp), extra=\"metadata.doc.date:*2025*\" (Dokumentenjahr), " +
+				"extra=\"tag:privat\" (Tag) — Wildcards OHNE Anführungszeichen. Metadaten-Felder " +
+				"(doc.type, doc.date, doc.title, doc.subject, sender.name, amounts.total) existieren " +
+				"nur bei KI-angereicherten Dateien. Metadaten-Werte sind exakt indiziert: ein Wert " +
+				"ohne Wildcard muss stimmen, mit Wildcard (*wert*) matcht er als Substring im " +
+				"gesamten Feldwert. Mehrwort-Begriffe in extra gehören in Anführungszeichen. "
+		}
+		sysPrompt = renderChatSystemPrompt(s, folder, searchTools)
 	}
-	searchTools := ""
-	if searchAvailable {
-		searchTools = "Bei großen Ordnern: erst mit search_item (Dateien) oder search_dir (Verzeichnisse) " +
-			"suchen, statt alles aufzulisten. Suchtreffer sind mit read_file lesbar " +
-			"(Pfad relativ zum Ordner). " +
-			"Strukturierte Suche: der optionale extra-Parameter verknüpft eine zusätzliche " +
-			"Bedingung mit AND, z. B. extra=\"metadata.doc.type:rechnung\" (KI-Dokumenttyp), " +
-			"extra=\"mediatype:pdf\" (Dateityp), extra=\"metadata.doc.date:*2025*\" (Dokumentenjahr), " +
-			"extra=\"tag:privat\" (Tag) — Wildcards OHNE Anführungszeichen. Metadaten-Felder " +
-			"(doc.type, doc.date, doc.title, doc.subject, sender.name, amounts.total) existieren " +
-			"nur bei KI-angereicherten Dateien. Metadaten-Werte sind exakt indiziert: ein Wert " +
-			"ohne Wildcard muss stimmen, mit Wildcard (*wert*) matcht er als Substring im " +
-			"gesamten Feldwert. Mehrwort-Begriffe in extra gehören in Anführungszeichen. "
-	}
-	sysPrompt := renderChatSystemPrompt(s, folder, searchTools)
 
 	messages := make([]chatToolMessage, 0, len(req.Messages)+4)
 	messages = append(messages, chatToolMessage{Role: "system", Content: strPtr(sysPrompt)})
@@ -1558,7 +1876,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		messages = append(messages, chatToolMessage{Role: role, Content: strPtr(m.Content)})
 	}
 
-	d := newShareWebDav(s, req.Context.Share.Token, req.Context.Share.Password)
+	var d *shareWebDav
+	if !isBlankChat {
+		d = newShareWebDav(s, req.Context.Share.Token, req.Context.Share.Password)
+	}
 	toolTraces := make([]toolTrace, 0, 8)
 	answer := ""
 	iterations := 0
@@ -1588,8 +1909,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	log.Printf("chat/ask: folder=%q model=%s messages=%d stream=%v search=%v question=%q",
-		folder, model, len(req.Messages), req.Stream, searchAvailable, truncateChars(lastUserQuestion, 200))
+	log.Printf("chat/ask: blank=%v folder=%q model=%s messages=%d stream=%v search=%v question=%q",
+		isBlankChat, req.Context.FolderName, model, len(req.Messages), req.Stream, searchAvailable, truncateChars(lastUserQuestion, 200))
 
 	// Stream: Live-Fortschritt per SSE. Client-Disconnect bricht die
 	// Iterationen ab. Nicht-flushbarer Writer → Fallback auf JSON-Antwort.
@@ -1605,7 +1926,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(http.StatusOK)
-			if err := sse.event("start", map[string]string{"model": model, "folder": folder}); err != nil {
+			if err := sse.event("start", map[string]string{"model": model, "folder": req.Context.FolderName}); err != nil {
 				return
 			}
 			heartbeatDone := make(chan struct{})

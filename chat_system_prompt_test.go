@@ -5,6 +5,8 @@ package main
 //    → sonst würden File-Chat-Instanzen mit/ohne Paket unterschiedliche Prompts fahren.
 // 2. renderChatSystemPrompt löst {{folder}}/{{tools}} auf (Folder- und File-Chat).
 // 3. Leerer systemPrompt → Built-in-Fallback.
+// 4. chat_system_blank.txt ≡ chatSystemPromptBlankBuiltin.
+// 5. renderChatBlankSystemPrompt löst {{root}}/{{tools_write}}/{{options_rule}} auf.
 
 import (
 	"os"
@@ -53,6 +55,42 @@ func TestRenderChatSystemPrompt(t *testing.T) {
 	// Fallback: systemPrompt nicht geladen → Built-in
 	srv = &Server{cfg: Config{}}
 	got = renderChatSystemPrompt(srv, folder, searchTools)
+	if strings.Contains(got, "{{") {
+		t.Errorf("fallback render has unresolved placeholder")
+	}
+}
+
+func TestChatSystemBlankPromptFileMatchesBuiltin(t *testing.T) {
+	data, err := os.ReadFile("chat_system_blank.txt")
+	if err != nil {
+		t.Fatalf("chat_system_blank.txt not readable: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != chatSystemPromptBlankBuiltin {
+		t.Errorf("chat_system_blank.txt differs from chatSystemPromptBlankBuiltin")
+	}
+}
+
+func TestRenderChatBlankSystemPrompt(t *testing.T) {
+	root := "workspace"
+	writeTools := "Du kannst Dateien mit write_file, mkdir und rmdir schreiben. "
+
+	// Blank-Chat: beide Platzhalter gefüllt
+	srv := &Server{cfg: Config{}}
+	srv.cfg.Chat.blankSystemPrompt = chatSystemPromptBlankBuiltin
+	got := renderChatBlankSystemPrompt(srv, root, writeTools)
+	if strings.Contains(got, "{{") {
+		t.Errorf("unresolved placeholder in rendered blank prompt")
+	}
+	if !strings.Contains(got, "„workspace“ erstellt") {
+		t.Errorf("root placeholder not substituted")
+	}
+	if !strings.Contains(got, "write_file, mkdir und rmdir") {
+		t.Errorf("tools_write placeholder not substituted")
+	}
+
+	// Fallback: blankSystemPrompt nicht geladen → Built-in
+	srv = &Server{cfg: Config{}}
+	got = renderChatBlankSystemPrompt(srv, root, writeTools)
 	if strings.Contains(got, "{{") {
 		t.Errorf("fallback render has unresolved placeholder")
 	}

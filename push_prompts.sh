@@ -28,6 +28,7 @@ PROMPT_FILES=(
     store_detect_prompt.txt
     aktenplan.txt
     chat_system.txt
+    chat_system_blank.txt
 )
 
 # Create ZIP

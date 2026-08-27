@@ -523,6 +523,16 @@ func (cfg *Config) loadChatSystemPrompt(configDir string) {
 		log.Printf("  Chat system prompt: using built-in default (%s not found)", cfg.Chat.SystemPromptFile)
 		cfg.Chat.systemPrompt = chatSystemPromptBuiltin
 	}
+	if cfg.Chat.BlankSystemPromptFile == "" {
+		cfg.Chat.BlankSystemPromptFile = filepath.Join(configDir, "prompts", "chat_system_blank.txt")
+	}
+	if data, err := os.ReadFile(cfg.Chat.BlankSystemPromptFile); err == nil {
+		cfg.Chat.blankSystemPrompt = strings.TrimSpace(string(data))
+		log.Printf("  Chat blank system prompt: %s (%d chars)", cfg.Chat.BlankSystemPromptFile, len(cfg.Chat.blankSystemPrompt))
+	} else {
+		log.Printf("  Chat blank system prompt: using built-in default (%s not found)", cfg.Chat.BlankSystemPromptFile)
+		cfg.Chat.blankSystemPrompt = chatSystemPromptBlankBuiltin
+	}
 }
 
 // Built-in defaults (used when external files are not found)
