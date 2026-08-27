@@ -1468,9 +1468,11 @@ type chatAskRequest struct {
 		} `json:"scope"`
 		// Write: Blank-Chat — schreiben in den persönlichen Space.
 		// Root: Verzeichnis relativ zur Space-Root (z. B. "workspace").
+		// SpaceID: ID des persönlichen Spaces (aus der Extension).
 		// Leer = keine Write-Tools (Share/Scope-Chat bleibt read-only).
 		Write struct {
-			Root string `json:"root"`
+			Root    string `json:"root"`
+			SpaceID string `json:"space_id"`
 		} `json:"write"`
 	} `json:"context"`
 	// Stream: live Fortschritt per Server-Sent-Events
@@ -1832,6 +1834,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		u.scopePath = req.Context.Scope.Path
 		if isBlankChat {
 			u.writeRoot = writeRoot
+			u.writeSpaceID = req.Context.Write.SpaceID // aus der Extension, kein PROPFIND nötig
 		}
 	}
 	searchAvailable := u != nil && u.scopeID != ""
