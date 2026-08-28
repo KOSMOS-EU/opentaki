@@ -4,10 +4,10 @@ package main
 //
 // Das Modell beschafft sich den Dokumenteninhalt selbst über Tools:
 //
-//	list_directory(path) → WebDAV PROPFIND depth=1, rekursiv (BFS, begrenzt:
+//	List(path)           → WebDAV PROPFIND depth=1, rekursiv (BFS, begrenzt:
 //	                       list_depth Ebenen, max_listings Einträge gesamt)
-//	read_file(path)      → WebDAV GET + s.extract (pdf/office/svg/text/…)
-//	read_image(path)     → WebDAV GET + VLM-Beschreibung
+//	Read(path)           → WebDAV GET + s.extract (pdf/office/svg/text/…)
+//	                       oder VLM-Beschreibung bei Bildern
 //
 // Zugriffsmodell: Taki bekommt KEIN User-Token. Der Client (Web-Extension)
 // legt einen Public-Link-Share (view, password, 1h) auf den Ordner an —
@@ -59,8 +59,8 @@ type ChatConfig struct {
 	BlankSystemPromptFile string `yaml:"blank_system_prompt_file"`
 	blankSystemPrompt     string // runtime (leer = noch nicht geladen)
 	// EditableExtensions: Dateierweiterungen (ohne Punkt) die im Create-Mode
-	// (Blank-Chat) editierbar sind. Für diese Typen liefern read_file,
-	// read_file_segment und patch_file den rohen Content.
+	// (Blank-Chat) editierbar sind. Für diese Typen liefern Read und Edit
+	// den rohen Content.
 	// Default: html xhtml css js json md txt yaml yml xml svg ts vue py go sh
 	EditableExtensions []string `yaml:"editable_extensions"`
 	Search            ChatSearchConfig    `yaml:"search"`
@@ -83,13 +83,13 @@ type ChatWriteConfig struct {
 // falls kein externes chat_system.txt geladen wurde. Es muss inhaltlich mit
 // der chat_system.txt im taka-prompts-Paket übereinstimmen.
 const chatSystemPromptBuiltin = `Du bist ein Assistent, der mit dem Inhalt des Cloud-Ordners „{{folder}}“ arbeitet.
-Du kannst dessen Inhalte mit den Tools list_directory (Verzeichnisinhalt), read_metadata (KI-Metadaten ohne Dateilesen), read_file (Dateitext, auch PDF/Office/SVG) und read_image (Bildbeschreibung) lesen.
+Du kannst dessen Inhalte mit den Tools List (Verzeichnisinhalt), Meta (KI-Metadaten ohne Dateilesen), Read (Dateitext, auch PDF/Office/SVG/Bilder) lesen.
 {{tools}}Pfade sind immer relativ zum Ordner (leerer Pfad = der Ordner selbst).
 Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast.
 Lies nur Dateien, die für die Frage relevant sind.
 Ist die Frage auf mehrere Entitäten gerichtet (z. B. mehrere Personen oder Unterordner im Listing), beziehe alle davon in der Antwort mit ein – nicht nur die ersten. Wenn das Tool-Budget nicht ausreicht, um alles zu bearbeiten, nenne in der Antwort ausdrücklich, welche Entitäten du nicht ausgewertet hast.
 Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander in separaten Schritten.
-Zählung in den Ergebnissen: Jedes Suchergebnis und jedes Listing endet mit „found: X, limit: Y“. Bei Suchen ist found die Gesamtzahl aller Treffer, bei Listings die Zahl der gezeigten Einträge (limit = max. Einträge). Ist das Ergebnis NICHT als unvollständig markiert, hast du die vollständige Menge — lies dann die relevanten Dateien (read_file oder read_metadata) oder antworte; such nicht endlos weiter. Ist found > limit oder das Ergebnis als unvollständig markiert, iteriere nicht blind weiter — beende deinen Turn mit dem Tool present_options und biete an: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), (2) limit erhöhen (limit-Parameter der Suche, max. 100) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern), jeweils als vollständige User-Anweisung. Nenne in der Antwort kurz den gefundenen Umfang und zeige eine Beispiel-Auswahl aus dem, was du schon gesehen hast (max. 10 Einträge), damit der User echte Begriffe und Namen sehen kann.
+Zählung in den Ergebnissen: Jedes Suchergebnis und jedes Listing endet mit „found: X, limit: Y“. Bei Suchen ist found die Gesamtzahl aller Treffer, bei Listings die Zahl der gezeigten Einträge (limit = max. Einträge). Ist das Ergebnis NICHT als unvollständig markiert, hast du die vollständige Menge — lies dann die relevanten Dateien (Read oder Meta) oder antworte; such nicht endlos weiter. Ist found > limit oder das Ergebnis als unvollständig markiert, iteriere nicht blind weiter — beende deinen Turn mit dem Tool present_options und biete an: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), (2) limit erhöhen (limit-Parameter der Suche, max. 100) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern), jeweils als vollständige User-Anweisung. Nenne in der Antwort kurz den gefundenen Umfang und zeige eine Beispiel-Auswahl aus dem, was du schon gesehen hast (max. 10 Einträge), damit der User echte Begriffe und Namen sehen kann.
 Wenn der User eine Entscheidung treffen muss (z. B. unklare Vorgabe, mehrere mögliche Wege, uneindeutiger Umfang) — auch dann, wenn du am Antwortende nur eine Ja/Nein- oder andere Rückfrage stellen wolltest — beende den Turn mit dem Tool present_options, NIEMALS mit freier oder nummerierter Frage im Antworttext: 1-5 kurze Optionen, jede eine vollständige User-Anweisung (z. B. „Ja, prüfe alle übrigen Rechnungsdokumente“ / „Nein, der bisherige Umfang reicht“ / „Nur Rechnungen aus 2025 auswerten“). Der User klickt die gewählte Option, und sie erreicht dich als nächste User-Nachricht. Kannst du die Frage direkt beantworten, antworte normal OHNE present_options.
 „Alle“ oder „komplett“ in der User-Frage — ebenso Aufträge wie „Übersicht erstellen“ oder „alles auswerten“ — beschreiben das Suchziel (finde alle passenden Treffer), nicht die Genehmigung, eine unvollständige Treffermenge komplett zu durchlaufen. Eine solche Genehmigung zählt nur, wenn der User sie nach Kenntnis der gefundenen Anzahl ausdrücklich erteilt hat (z. B. „ja, alle 1590 durchlaufen“).
 Nach 3 Suchversuchen ohne Treffer frage den User ebenfalls, statt weiter zu raten. Wenn der User im Verlauf bereits eine solche Vorgabe gemacht hat, frage nicht erneut.
@@ -114,8 +114,9 @@ func renderChatSystemPrompt(s *Server, folder, searchTools string) string {
 // chat_system_blank.txt im taka-prompts-Paket übereinstimmen.
 const chatSystemPromptBlankBuiltin = `Du bist ein kreativer Assistent, der Dateien für den User in seinem persönlichen Cloud-Arbeitsbereich „{{root}}“ erstellt.
 {{tools_write}}Regeln:
-• Lege ZUERST ein Projektverzeichnis mit mkdir an — der User soll seine Erzeugnisse in klar getrennten Ordner-Projekten finden (Name: kurz beschreibend, kleingeschrieben, Bindestriche, z. B. "url-kurzner" oder "notizen-2026-08").
-• Erstelle pro Antwort max. EINE Datei (write_file) — mehr auf Anweisung.
+• Bei großen Ordnern: erst mit Search (type="file" für Dateien, type="dir" für Verzeichnisse) suchen, statt alles aufzulisten.
+• Lege ZUERST ein Projektverzeichnis mit Mkdir an — der User soll seine Erzeugnisse in klar getrennten Ordner-Projekten finden (Name: kurz beschreibend, kleingeschrieben, Bindestriche, z. B. "url-kurzner" oder "notizen-2026-08").
+• Erstelle pro Antwort max. EINE Datei (Write) — mehr auf Anweisung.
 • Ggf. weitere Dateien im selben Projekt: erst mit present_options anbieten.
 • Nenne in der Antwort den vollen Pfad relativ zu {{root}}, z. B. „url-kurzner/app.html“.
 • Vor der ersten Änderung an einem existierenden Projekt (Datei/Ordner) den User um Bestätigung bitten (present_options).
@@ -394,7 +395,7 @@ func applyHunkAt(currentLines []string, startPos int, hunkBody []string) (int, i
 		}
 	}
 	return 0, 0, fmt.Errorf(
-		"Hunk-Kontext wurde in der Datei nicht gefunden (Startzeile %d). Nutze read_file_segment für den aktuellen Stand.",
+		"Hunk-Kontext wurde in der Datei nicht gefunden (Startzeile %d). Nutze Read für den aktuellen Stand.",
 		startPos+1)
 }
 
@@ -592,38 +593,28 @@ type toolFunction struct {
 func (s *Server) chatTools() []toolDefinition {
 	return []toolDefinition{
 		{Type: "function", Function: toolFunction{
-			Name:        "list_directory",
-			Description: "Listet den Inhalt eines Verzeichnisses im geteilten Ordner REKURSIV (begrenzt durch Tiefe und Eintragszahl, Kürzungen werden angegeben): Unterverzeichnisse (mit /) und Dateien, jeweils mit relativem Pfad (direkt als read_file-/read_image-Pfad nutzbar), Datum (JJJJ-MM-TT) und bei Dateien der Größe. Liefert KEINE Dateiinhalte. Leerer Pfad = der geteilte Ordner selbst.",
+			Name:        "List",
+			Description: "Listet den Inhalt eines Verzeichnisses im geteilten Ordner REKURSIV (begrenzt durch Tiefe und Eintragszahl, Kürzungen werden angegeben): Unterverzeichnisse (mit /) und Dateien, jeweils mit relativem Pfad (direkt als Read-Pfad nutzbar), Datum (JJJJ-MM-TT) und bei Dateien der Größe. Liefert KEINE Dateiinhalte. Leerer Pfad = der geteilte Ordner selbst.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad relativ zum geteilten Ordner, leer = Basisordner"}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
-			Name:        "read_file",
-			Description: "Liest den Textinhalt einer Datei (txt, md, pdf, office, csv, svg, code, …). Große Dateien werden gekürzt. Pfade relativ zum geteilten Ordner.",
+			Name:        "Read",
+			Description: "Liest eine Datei im geteilten Ordner. Editierbare Typen (code, html, md, txt, …) liefern raw Content; andere Typen (pdf, office, …) den extrahierten Text. Bilder liefern eine VLM-Beschreibung. Große Dateien werden gekürzt. offset/limit ermöglichen zeilenweises Lesen (1-basiert) — außerhalb des Bereichs liefert Read den verfügbaren Inhalt mit Hinweis statt Fehler. Pfade relativ zum geteilten Ordner.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"},"offset":{"type":"integer","description":"Optional: erste Zeile (1-basiert). Nur bei editierbaren Texttypen. Default 1."},"limit":{"type":"integer","description":"Optional: Anzahl der Zeilen. Nur bei editierbaren Texttypen. Default 200."}},"required":["path"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "Meta",
+			Description: "Liefert die KI-Metadaten eines Dokuments (Dokumenttyp, Betreff, Datum, Referenz, Absender/Empfänger, Beträge, Tags) OHNE den Dateiinhalt zu laden — zum schnellen Drüberschauen und um zu entscheiden, welche Dateien man mit Read im Detail lesen muss. Liefert Werte nur, wenn die Datei bereits von der KI angereichert wurde; sonst Hinweis. Pfade relativ zum geteilten Ordner.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
-			Name:        "read_image",
-			Description: "Liest eine Bilddatei (jpg, png, …) und liefert eine detaillierte Beschreibung inkl. aller lesbaren Texte (VLM). Pfade relativ zum geteilten Ordner.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Bilddatei relativ zum geteilten Ordner"}},"required":["path"]}`),
+			Name:        "Search",
+			Description: "Sucht nach DATEIEN oder VERZEICHNISSEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als Read-Pfad nutzbar), Datum und Größe. Liefert KEINE Dateiinhalte. Bei großen Ordnern VORZIEHEN vor List, um gezielt Einträge zu finden. Mit dem optionalen extra-Parameter lassen sich Treffer zusätzlich nach Dateityp, Tag und KI-Metadaten eingrenzen. type: \"file\" (Default) oder \"dir\".",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Namens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"type":{"type":"string","enum":["file","dir"],"description":"Optional: \"file\" (Default) oder \"dir\"."},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft. Beispiele: \"metadata.doc.type:rechnung\" (KI-Dokumenttyp), \"mediatype:pdf\" (Dateityp), \"metadata.doc.date:*2025*\" (Dokumentenjahr), \"tag:privat\" (Tag). Wildcards OHNE Anführungszeichen. Metadaten-Felder nur bei KI-angereicherten Dateien."},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Optional: maximale Trefferzahl (Default 20, max 100). Nur bei ausdrücklicher User-Zustimmung auf einen höheren Wert setzen."}},"required":["pattern"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
-			Name:        "read_metadata",
-			Description: "Liefert die KI-Metadaten eines Dokuments (Dokumenttyp, Betreff, Datum, Referenz, Absender/Empfänger, Beträge, Tags) OHNE den Dateiinhalt zu laden — zum schnellen Drüberschauen und um zu entscheiden, welche Dateien man mit read_file im Detail lesen muss. Liefert Werte nur, wenn die Datei bereits von der KI angereichert wurde; sonst Hinweis. Pfade relativ zum geteilten Ordner.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"}},"required":["path"]}`),
-		}},
-		{Type: "function", Function: toolFunction{
-			Name:        "search_item",
-			Description: "Sucht nach DATEIEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als read_file-Pfad nutzbar), Datum und Größe. Liefert KEINE Dateiinhalte. Bei großen Ordnern VORZIEHEN vor list_directory, um gezielt Dateien zu finden. Mit dem optionalen extra-Parameter lassen sich Treffer zusätzlich nach Dateityp, Tag und KI-Metadaten eingrenzen.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Dateinamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft. Beispiele: \"metadata.doc.type:rechnung\" (KI-Dokumenttyp), \"mediatype:pdf\" (Dateityp), \"metadata.doc.date:*2025*\" (Dokumentenjahr), \"tag:privat\" (Tag). Wildcards OHNE Anführungszeichen. Metadaten-Felder nur bei KI-angereicherten Dateien."},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Optional: maximale Trefferzahl (Default 20, max 100). Nur bei ausdrücklicher User-Zustimmung auf einen höheren Wert setzen."}},"required":["pattern"]}`),
-		}},
-		{Type: "function", Function: toolFunction{
-			Name:        "search_dir",
-			Description: "Sucht nach VERZEICHNISSEN im geteilten Ordner (in beliebiger Tiefe), deren Name den Teilstring enthält: liefert relative Pfade (direkt als list_directory-/read_file-Pfad nutzbar) und Datum. Zum Finden des richtigen Unterverzeichnisses. Optional: extra-Parameter wie bei search_item (AND-Verknüpfung).",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft (wie bei search_item)."},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Optional: maximale Trefferzahl (Default 20, max 100). Nur bei ausdrücklicher User-Zustimmung auf einen höheren Wert setzen."}},"required":["pattern"]}`),
-		}},
-		{Type: "function", Function: toolFunction{
-			Name:        "egrep",
-			Description: "Durchsucht den INHALT von Dateien im geteilten Ordner (rekursiv) mit einer regulären Expression (POSIX ERE, wie egrep). Liefert die Trefferzeilen mit Pfad, Zeilennummer und Kontext. Nutze das, um gezielt in vielen Dateien zu finden, statt jede Datei einzeln mit read_file zu lesen. Binäre Dateien werden übersprungen.",
+			Name:        "Grep",
+			Description: "Durchsucht den INHALT von Dateien im geteilten Ordner (rekursiv) mit einer regulären Expression (POSIX ERE). Liefert die Trefferzeilen mit Pfad und Zeilennummer. Nutze das, um gezielt in vielen Dateien zu finden, statt jede Datei einzeln mit Read zu lesen. Binäre Dateien werden übersprungen.",
 			Parameters:  json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Reguläre Expression (ERE), z. B. \"Rechnung|Invoice\" oder \"total:[0-9,.]+\""},"path":{"type":"string","description":"Optional: Verzeichnis oder Datei relativ zum geteilten Ordner. Leer = der gesamte geteilte Ordner."},"limit":{"type":"integer","minimum":1,"maximum":200,"description":"Optional: maximale Trefferzeilen (Default 50, max 200)."}},"required":["pattern"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
@@ -634,34 +625,29 @@ func (s *Server) chatTools() []toolDefinition {
 	}
 }
 
-// chatWriteTools: die Write-Tools des Blank-Chats (write_file, mkdir,
-// rmdir). Nur bei context.write im Request injiziert — der Personal-Space-
-// Gate liegt auf der Extension. Pfade sind relativ zur Write-Root.
+// chatWriteTools: die Write-Tools des Blank-Chats (Write, Mkdir, Rmdir, Edit).
+// Nur bei context.write im Request injiziert — der Personal-Space-Gate liegt
+// auf der Extension. Pfade sind relativ zur Write-Root.
 func chatWriteTools() []toolDefinition {
 	return []toolDefinition{
 		{Type: "function", Function: toolFunction{
-			Name:        "write_file",
-			Description: "Erstellt eine Datei (oder überschreibt eine bestehende) mit dem vorgegebenen Textinhalt im Arbeitsbereich. Pfad relativ zur Arbeitsbereich-Root (z. B. \"projekt/datei.html\"). Überschreibt vorhandene Dateien — rufe vorher mkdir auf, wenn das Verzeichnis neu ist.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root, z. B. \"projekt/datei.html\""},"content":{"type":"string","description":"Vollständiger Dateiinhalt (Unicode-Text)"}},"required":["path","content"]}`),
+			Name:        "Write",
+			Description: "Erstellt eine Datei (oder überschreibt eine bestehende) mit dem vorgegebenen Textinhalt im Arbeitsbereich. Pfad relativ zur Arbeitsbereich-Root (z. B. \"projekt/datei.html\"). Überschreibt vorhandene Dateien — rufe vorher Mkdir auf, wenn das Verzeichnis neu ist. Leerer Content wird abgelehnt.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root, z. B. \"projekt/datei.html\""},"content":{"type":"string","description":"Vollständiger Dateiinhalt (Unicode-Text), nicht leer"}},"required":["path","content"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
-			Name:        "mkdir",
+			Name:        "Mkdir",
 			Description: "Legt ein Verzeichnis im Arbeitsbereich an (Pfad relativ zur Root, z. B. \"projekt\"). Existiert es bereits, ist der Call ein no-op.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad des Verzeichnisses relativ zur Arbeitsbereich-Root"}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
-			Name:        "rmdir",
+			Name:        "Rmdir",
 			Description: "Entfernt ein LEERES Verzeichnis im Arbeitsbereich (Pfad relativ zur Root, z. B. \"projekt\"). Nicht-leere Verzeichnisse werden NICHT entfernt (Fehlermeldung).",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad des Verzeichnisses relativ zur Arbeitsbereich-Root"}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
-			Name:        "read_file_segment",
-			Description: "Liest einen zeilenweisen Ausschnitt einer Datei im Arbeitsbereich (raw, ohne Extraktion). Nutze das, um große Dateien in Teilen zu sehen, statt die gesamte Datei zu laden. Zeilen sind 1-basiert.",
-			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root"},"offset":{"type":"integer","description":"Erste Zeile (1-basiert). Default 1."},"limit":{"type":"integer","description":"Anzahl der Zeilen. Default 200."}},"required":["path"]}`),
-		}},
-		{Type: "function", Function: toolFunction{
-			Name:        "patch_file",
-			Description: "Wendet einen Unified-Diff-Patch auf eine Datei im Arbeitsbereich an. Effizienter als write_file für kleine Änderungen. Format: Standard Unified Diff mit --- /+++ Header und @@-Hunk-Header. Nutze read_file_segment vorher, um den genauen Zeilenkontext zu sehen.",
+			Name:        "Edit",
+			Description: "Wendet einen Unified-Diff-Patch auf eine Datei im Arbeitsbereich an. Effizienter als Write für kleine Änderungen. Format: Standard Unified Diff mit --- /+++ Header und @@-Hunk-Header. Nutze Read vorher, um den genauen Zeilenkontext zu sehen.",
 			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root"},"patch":{"type":"string","description":"Unified-Diff-Patch (mit --- /+++ und @@ Hunk-Headern)"}},"required":["path","patch"]}`),
 		}},
 	}
@@ -866,7 +852,7 @@ func shareAuthError(resp *http.Response) (string, bool) {
 		return "Share-Zugriff verweigert (Password falsch oder Share abgelaufen — bitte Chat neu starten)", true
 	}
 	if resp.StatusCode == 404 {
-		return "Datei/Ordner nicht gefunden. Prüfe den Pfad mit list_directory (Tippfehler?)", true
+		return "Datei/Ordner nicht gefunden. Prüfe den Pfad mit List (Tippfehler?)", true
 	}
 	return "", false
 }
@@ -1597,13 +1583,15 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		Limit   int    `json:"limit"`
 		Offset  int    `json:"offset"`
 		Content string `json:"content"`
+		Type    string `json:"type"`
+		Patch   string `json:"patch"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
 		trace.MS = time.Since(start).Milliseconds()
 		return "Fehler: ungültige Tool-Argumente: " + err.Error(), trace
 	}
-	isSearch := name == "search_item" || name == "search_dir"
+	isSearch := name == "Search"
 	relPath := ""
 	if !isSearch {
 		cleanPath, err := safeRelPath(args.Path)
@@ -1617,11 +1605,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 	trace.Path = relPath
 
 	switch name {
-	case "egrep":
+	case "Grep":
 		if d == nil {
 			trace.Error = "nicht verfügbar"
 			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: egrep ist für diesen Chat nicht verfügbar.", trace
+			return "Fehler: Grep ist für diesen Chat nicht verfügbar.", trace
 		}
 		pattern := strings.TrimSpace(args.Pattern)
 		if pattern == "" {
@@ -1662,7 +1650,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.Chars = len(sb.String())
 		return sb.String(), trace
 
-	case "search_item", "search_dir":
+	case "Search":
 		if u == nil || u.scopeID == "" {
 			trace.Error = "Suche nicht verfügbar"
 			trace.MS = time.Since(start).Milliseconds()
@@ -1684,6 +1672,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 				limit = 100
 			}
 		}
+		wantDir := args.Type == "dir"
 		hits, total, err := u.search(pattern, extra, limit*3)
 		if err != nil {
 			trace.Error = err.Error()
@@ -1691,7 +1680,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			return "Fehler: " + err.Error(), trace
 		}
 		kind := "Datei-Suche"
-		if name == "search_dir" {
+		if wantDir {
 			kind = "Ordner-Suche"
 		}
 		var sb strings.Builder
@@ -1702,7 +1691,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		sb.WriteString(" in diesem Ordner:\n")
 		shown := 0
 		for _, hit := range hits {
-			if hit.IsDir != (name == "search_dir") {
+			if hit.IsDir != wantDir {
 				continue
 			}
 			shown++
@@ -1740,7 +1729,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.MS = time.Since(start).Milliseconds()
 		return sb.String(), trace
 
-	case "list_directory":
+	case "List":
 		maxDepth := s.cfg.Chat.ListDepth
 		entries, depthCut, entryCut, err := d.propfindTree(relPath, maxDepth, s.cfg.Chat.MaxListings)
 		if err != nil {
@@ -1789,24 +1778,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.MS = time.Since(start).Milliseconds()
 		return sb.String(), trace
 
-	case "read_file":
+	case "Read":
 		data, ct, err := d.getfile(relPath)
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
-			// 404: Verfügbare Top-Level-Einträge mitschicken, damit das Modell
-			// Tippfehler selbst korrigieren kann.
-			if strings.Contains(err.Error(), "nicht gefunden") {
-				if entries, listErr := d.propfind(""); listErr == nil && len(entries) > 0 {
-					names := make([]string, 0, len(entries))
-					for _, e := range entries {
-						names = append(names, e.Name)
-					}
-					sort.Strings(names)
-					return fmt.Sprintf("Fehler: Datei/Ordner nicht gefunden. Verfügbare Einträge in der Root:\n%s",
-						strings.Join(names, ", ")), trace
-				}
-			}
 			return "Fehler: " + err.Error(), trace
 		}
 		if len(data) == 0 {
@@ -1814,14 +1790,35 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Die Datei existiert, ist aber leer (0 Bytes).", trace
 		}
-		// Editierbare Dateitypen: raw an das Modell (Config: editable_extensions).
-		// Sonst: s.extract (pandoc, pdftotext, etc.)
-		var text, method string
-		if s.cfg.Chat.isEditableFile(relPath) {
-			text, method = string(data), "raw"
-		} else {
-			text, method = s.extract(data, ct)
+		// Bild: VLM-Beschreibung
+		if strings.HasPrefix(strings.ToLower(ct), "image/") || looksLikeImage(data) {
+			text, method := s.extractImage(data, ct)
+			if text == "" {
+				trace.Method = method
+				trace.Error = "Bild konnte nicht beschrieben werden"
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: Bild konnte nicht beschrieben werden", trace
+			}
+			trace.Method = method
+			trace.Chars = len(text)
+			trace.MS = time.Since(start).Milliseconds()
+			return text, trace
 		}
+		// Editierbare Texttypen: raw (mit optionaler Segmentierung)
+		if s.cfg.Chat.isEditableFile(relPath) {
+			text, method := s.readSegment(string(data), args.Offset, args.Limit)
+			if text == "" {
+				trace.Method = method
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: " + method, trace
+			}
+			trace.Method = method
+			trace.Chars = len(text)
+			trace.MS = time.Since(start).Milliseconds()
+			return text, trace
+		}
+		// Nicht-editierbar: s.extract (pandoc, pdftotext, etc.)
+		text, method := s.extract(data, ct)
 		if strings.HasPrefix(method, "error") || text == "" {
 			trace.Method = method
 			trace.Error = "Inhalt konnte nicht extrahiert werden"
@@ -1840,31 +1837,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.MS = time.Since(start).Milliseconds()
 		return text, trace
 
-	case "read_image":
-		data, ct, err := d.getfile(relPath)
-		if err != nil {
-			trace.Error = err.Error()
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: " + err.Error(), trace
-		}
-		if !strings.HasPrefix(strings.ToLower(ct), "image/") && !looksLikeImage(data) {
-			trace.Error = "keine Bilddatei"
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: keine Bilddatei (nutze read_file für Dokumente)", trace
-		}
-		text, method := s.extractImage(data, ct)
-		if text == "" {
-			trace.Method = method
-			trace.Error = "Bild konnte nicht beschrieben werden"
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: Bild konnte nicht beschrieben werden", trace
-		}
-		trace.Method = method
-		trace.Chars = len(text)
-		trace.MS = time.Since(start).Milliseconds()
-		return text, trace
-
-	case "read_metadata":
+	case "Meta":
 		meta, err := d.propfindMeta(relPath)
 		if err != nil {
 			trace.Error = err.Error()
@@ -1892,79 +1865,19 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.MS = time.Since(start).Milliseconds()
 		return sb.String(), trace
 
-	case "read_file_segment":
-		// Zeilenweiser Ausschnitt (raw, kein Extract). Nur bei Blank-Chat.
-		if d == nil {
-			trace.Error = "nicht verfügbar"
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: read_file_segment ist nur im Arbeitsbereich verfügbar.", trace
-		}
-		data, _, err := d.getfile(relPath)
-		if err != nil {
-			trace.Error = err.Error()
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: " + err.Error(), trace
-		}
-		if len(data) == 0 {
-			trace.Method = "empty"
-			trace.MS = time.Since(start).Milliseconds()
-			return "Die Datei existiert, ist aber leer.", trace
-		}
-		lines := strings.Split(string(data), "\n")
-		totalLines := len(lines)
-		offset := args.Offset
-		if offset < 1 {
-			offset = 1
-		}
-		limit := args.Limit
-		if limit < 1 {
-			limit = 200
-		}
-		if offset > totalLines {
-			trace.Method = "segment"
-			trace.Chars = 0
-			trace.MS = time.Since(start).Milliseconds()
-			return fmt.Sprintf("[Datei hat %d Zeilen. offset %d ist außerhalb des Bereichs.]", totalLines, offset), trace
-		}
-		end := offset + limit - 1
-		if end > totalLines {
-			end = totalLines
-		}
-		// Zeilen mit Nummer prefixen (1-basiert)
-		var sb strings.Builder
-		for i := offset - 1; i < end; i++ {
-			fmt.Fprintf(&sb, "%5d  %s\n", i+1, lines[i])
-		}
-		footer := fmt.Sprintf("\n[%d von %d Zeilen gezeigt (Zeilen %d–%d)]", end-offset+1, totalLines, offset, end)
-		sb.WriteString(footer)
-		trace.Method = "segment"
-		trace.Path = relPath
-		trace.Chars = len(sb.String())
-		trace.MS = time.Since(start).Milliseconds()
-		return sb.String(), trace
-
-	case "patch_file":
+	case "Edit":
 		// Unified-Diff-Patch auf eine Datei anwenden (nur Blank-Chat, editierbare Typen).
 		if d == nil {
 			trace.Error = "nicht verfügbar"
 			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: patch_file ist nur im Arbeitsbereich verfügbar.", trace
+			return "Fehler: Edit ist nur im Arbeitsbereich verfügbar.", trace
 		}
 		if !s.cfg.Chat.isEditableFile(relPath) {
 			trace.Error = "nicht editierbar"
 			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: patch_file unterstützt nur editierbare Dateitypen.", trace
+			return "Fehler: Edit unterstützt nur editierbare Dateitypen.", trace
 		}
-		var patchArgs struct {
-			Path  string `json:"path"`
-			Patch string `json:"patch"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &patchArgs); err != nil {
-			trace.Error = "ungültige Argumente"
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: ungültige patch_file-Argumente.", trace
-		}
-		if strings.TrimSpace(patchArgs.Patch) == "" {
+		if strings.TrimSpace(args.Patch) == "" {
 			trace.Error = "patch erforderlich"
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: der 'patch'-Parameter darf nicht leer sein.", trace
@@ -1975,12 +1888,12 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: " + err.Error(), trace
 		}
-		newContent, changedLines, patchErr := applyUnifiedDiff(string(data), patchArgs.Patch)
+		newContent, changedLines, patchErr := applyUnifiedDiff(string(data), args.Patch)
 		if patchErr != nil {
 			trace.Error = patchErr.Error()
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Patch konnte nicht angewendet werden: " + patchErr.Error() +
-				" Nutze read_file_segment, um den aktuellen Zeileninhalt zu prüfen.", trace
+				" Nutze Read, um den aktuellen Zeileninhalt zu prüfen.", trace
 		}
 		if err := d.sharePutFile(relPath, newContent); err != nil {
 			trace.Error = err.Error()
@@ -1989,11 +1902,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		}
 		trace.Method = "patch"
 		trace.Path = relPath
-		trace.Chars = len(patchArgs.Patch)
+		trace.Chars = len(args.Patch)
 		trace.MS = time.Since(start).Milliseconds()
 		return fmt.Sprintf("Patch angewendet: %d geänderte Zeilen in %s", changedLines, relPath), trace
 
-	case "write_file", "mkdir", "rmdir":
+	case "Write", "Mkdir", "Rmdir":
 		// Write-Tools: nur bei Blank-Chat (d != nil, Share auf /workspace)
 		if d == nil {
 			trace.Error = "Schreiben nicht verfügbar"
@@ -2008,11 +1921,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		}
 		trace.Path = fullPath
 		switch name {
-		case "write_file":
+		case "Write":
 			if len(args.Content) == 0 {
 				trace.Error = "leerer Content"
 				trace.MS = time.Since(start).Milliseconds()
-				return "Fehler: Content ist leer. Sendung abgelehnt — eine leere Datei würde die bestehende Datei überschreiben. Lade den aktuellen Stand mit read_file_segment und sende den vollständigen Inhalt erneut.", trace
+				return "Fehler: Content ist leer. Sendung abgelehnt — eine leere Datei würde die bestehende Datei überschreiben. Lade den aktuellen Stand mit Read und sende den vollständigen Inhalt erneut.", trace
 			}
 			if len(args.Content) > s.cfg.Chat.Write.MaxFileBytes {
 				trace.Error = "Datei zu groß"
@@ -2028,7 +1941,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.Chars = len(args.Content)
 			trace.MS = time.Since(start).Milliseconds()
 			return "Datei erfolgreich erstellt: " + fullPath, trace
-		case "mkdir":
+		case "Mkdir":
 			if err := d.shareMkdir(relPath); err != nil {
 				trace.Error = err.Error()
 				trace.MS = time.Since(start).Milliseconds()
@@ -2037,7 +1950,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.Method = "mkcol"
 			trace.MS = time.Since(start).Milliseconds()
 			return "Verzeichnis erfolgreich angelegt: " + fullPath + "/", trace
-		case "rmdir":
+		case "Rmdir":
 			if err := d.shareDeletePath(relPath); err != nil {
 				trace.Error = err.Error()
 				trace.MS = time.Since(start).Milliseconds()
@@ -2075,6 +1988,44 @@ func looksLikeImage(data []byte) bool {
 		return true
 	}
 	return false
+}
+
+// readSegment liefert einen zeilenweisen Ausschnitt eines Text-Dokuments.
+// offset/limit sind 1-basiert. Tolerant: außerhalb des Bereichs liefert
+// die verfügbaren Zeilen + Hinweis statt Fehler.
+func (s *Server) readSegment(data string, offset, limit int) (string, string) {
+	lines := strings.Split(data, "\n")
+	totalLines := len(lines)
+	if offset < 1 {
+		offset = 1
+	}
+	if limit < 1 {
+		limit = 200
+	}
+	if offset > totalLines {
+		// Tolerant: letzte `limit` Zeilen + Hinweis
+		start := totalLines - limit + 1
+		if start < 1 {
+			start = 1
+		}
+		var sb strings.Builder
+		for i := start - 1; i < totalLines; i++ {
+			fmt.Fprintf(&sb, "%5d  %s\n", i+1, lines[i])
+		}
+		sb.WriteString(fmt.Sprintf("\n[Datei hat %d Zeilen. offset=%d war außerhalb des Bereichs — hier sind die letzten %d Zeilen (%d–%d)]",
+			totalLines, offset, totalLines-start+1, start, totalLines))
+		return sb.String(), "segment"
+	}
+	end := offset + limit - 1
+	if end > totalLines {
+		end = totalLines
+	}
+	var sb strings.Builder
+	for i := offset - 1; i < end; i++ {
+		fmt.Fprintf(&sb, "%5d  %s\n", i+1, lines[i])
+	}
+	sb.WriteString(fmt.Sprintf("\n[%d von %d Zeilen gezeigt (Zeilen %d–%d)]", end-offset+1, totalLines, offset, end))
+	return sb.String(), "segment"
 }
 
 // ── Request/Response ─────────────────────────────────────────
@@ -2480,7 +2431,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	// System-Prompt (serverseitig, deterministisch)
 	var sysPrompt string
 	if isBlankChat {
-		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools mkdir (Verzeichnis anlegen), write_file (Datei erstellen/überschreiben) und rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
+		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools Mkdir (Verzeichnis anlegen), Write (Datei erstellen/überschreiben), Edit (kleine Änderungen per Unified-Diff) und Rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
 		sysPrompt = renderChatBlankSystemPrompt(s, "workspace", writeTools)
 	} else {
 		folder := req.Context.FolderName
@@ -2489,8 +2440,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		}
 		searchTools := ""
 		if searchAvailable {
-			searchTools = "Bei großen Ordnern: erst mit search_item (Dateien) oder search_dir (Verzeichnisse) " +
-				"suchen, statt alles aufzulisten. Suchtreffer sind mit read_file lesbar " +
+			searchTools = "Bei großen Ordnern: erst mit Search (type=\"file\" für Dateien, type=\"dir\" für Verzeichnisse) " +
+				"suchen, statt alles aufzulisten. Suchtreffer sind mit Read lesbar " +
 				"(Pfad relativ zum Ordner). " +
 				"Strukturierte Suche: der optionale extra-Parameter verknüpft eine zusätzliche " +
 				"Bedingung mit AND, z. B. extra=\"metadata.doc.type:rechnung\" (KI-Dokumenttyp), " +
@@ -2680,8 +2631,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				// Write-Tools sind idempotent: gleiche Parameter = gleiches
 				// Ergebnis. Statt "Wiederholung bringt nichts" melden wir
 				// Erfolg, damit das Modell den Turn beenden kann.
-				if tc.Function.Name == "write_file" || tc.Function.Name == "patch_file" ||
-					tc.Function.Name == "mkdir" || tc.Function.Name == "rmdir" {
+				if tc.Function.Name == "Write" || tc.Function.Name == "Edit" ||
+					tc.Function.Name == "Mkdir" || tc.Function.Name == "Rmdir" {
 					result = fmt.Sprintf("OK: Dieser %s-Call mit identischen Parametern wurde bereits "+
 						"erfolgreich ausgeführt (letzte Ausführung: %d Zeichen). Die Datei/der "+
 						"Zustand ist bereits aktualisiert. Beende den Turn mit einer Antwort "+

@@ -26,7 +26,7 @@ func TestChatSystemPromptFileMatchesBuiltin(t *testing.T) {
 
 func TestRenderChatSystemPrompt(t *testing.T) {
 	folder := "Finanzrechnung"
-	searchTools := "Bei großen Ordnern: erst mit search_item suchen. "
+	searchTools := "Bei großen Ordnern: erst mit Search (type=\"file\") suchen. "
 
 	// Folder-Chat: beide Platzhalter gefüllt
 	srv := &Server{cfg: Config{}}
@@ -72,7 +72,7 @@ func TestChatSystemBlankPromptFileMatchesBuiltin(t *testing.T) {
 
 func TestRenderChatBlankSystemPrompt(t *testing.T) {
 	root := "workspace"
-	writeTools := "Du kannst Dateien mit write_file, mkdir und rmdir schreiben. "
+	writeTools := "Du kannst Dateien mit Write, Mkdir, Edit und Rmdir schreiben. "
 
 	// Blank-Chat: beide Platzhalter gefüllt
 	srv := &Server{cfg: Config{}}
@@ -84,7 +84,7 @@ func TestRenderChatBlankSystemPrompt(t *testing.T) {
 	if !strings.Contains(got, "„workspace“ erstellt") {
 		t.Errorf("root placeholder not substituted")
 	}
-	if !strings.Contains(got, "write_file, mkdir und rmdir") {
+	if !strings.Contains(got, "Write, Mkdir, Edit und Rmdir") {
 		t.Errorf("tools_write placeholder not substituted")
 	}
 
