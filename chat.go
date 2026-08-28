@@ -891,6 +891,45 @@ func safeRelPath(p string) (string, error) {
 	return path.Clean(p), nil
 }
 
+// binaryContainerExts: Dateiformate, die ZIP-Container sind und NICHT als
+// reinen Text erzeugt werden können. Ein LLM, das diese Formate als
+// XML-Text in die Datei schreibt, erzeugt eine KORRUPT-Datei (Word/LibreOffice
+// können sie nicht öffnen). Write/Edit verweigert den Pfad aktiv und verweist
+// auf .txt/.html (die Collabora in ein echtes ODT/DOCX konvertieren kann).
+var binaryContainerExts = map[string]string{
+	"docx":  "Microsoft-Word (ZIP-Container)",
+	"odt":   "LibreOffice-Writer (ZIP-Container)",
+	"xlsx":  "Microsoft-Excel (ZIP-Container)",
+	"ods":   "LibreOffice-Calc (ZIP-Container)",
+	"pptx":  "Microsoft-PowerPoint (ZIP-Container)",
+	"odp":   "LibreOffice-Impress (ZIP-Container)",
+	"odsx":  "LibreOffice-Draw (ZIP-Container)",
+	"ott":   "LibreOffice-Writer-Vorlage (ZIP-Container)",
+	"ots":   "LibreOffice-Calc-Vorlage (ZIP-Container)",
+	"odg":   "LibreOffice-Draw (ZIP-Container)",
+}
+
+// binaryContainerName liefert den Anzeigenamen für eine binäre
+// Container-Extension; "" wenn die Extension kein solches Format ist.
+func binaryContainerName(ext string) string {
+	return binaryContainerExts[ext]
+}
+
+// binaryContainerErr ist die verweisende Fehlermeldung, wenn das Modell
+// versucht, ein ZIP-basiertes Office-Format als Text zu schreiben.
+func binaryContainerErr(relPath, tool string) string {
+	dot := strings.LastIndex(relPath, ".")
+	ext := ""
+	if dot >= 0 && dot < len(relPath)-1 {
+		ext = strings.ToLower(relPath[dot+1:])
+	}
+	if name := binaryContainerName(ext); name != "" {
+		return fmt.Sprintf("Fehler: .%s ist ein %s und kann NICHT als Text-Datei erzeugt werden (Write/%s würde eine korrupte Datei hinterlegen). "+
+			"Erstelle den Inhalt stattdessen als .txt oder .html — die Cloud-UI zeigt .html live an und Collabora öffnet .txt/.html und exportiert sie in ein echtes .docx/.odt.", ext, name, tool)
+	}
+	return ""
+}
+
 // humanSize rendert eine Byte-Zahl lesbar (0 = "0 B", z.B. auch für leere Dateien).
 func humanSize(n int64) string {
 	const unit = 1024
@@ -2092,6 +2131,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Edit unterstützt nur editierbare Dateitypen.", trace
 		}
+		if msg := binaryContainerErr(relPath, "Edit"); msg != "" {
+			trace.Error = "binäres Office-Format"
+			trace.MS = time.Since(start).Milliseconds()
+			return msg, trace
+		}
 		if strings.TrimSpace(args.Patch) == "" {
 			trace.Error = "patch erforderlich"
 			trace.MS = time.Since(start).Milliseconds()
@@ -2137,6 +2181,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.Path = fullPath
 		switch name {
 		case "Write":
+			if msg := binaryContainerErr(relPath, "Write"); msg != "" {
+				trace.Error = "binäres Office-Format"
+				trace.MS = time.Since(start).Milliseconds()
+				return msg, trace
+			}
 			if len(args.Content) == 0 {
 				trace.Error = "leerer Content"
 				trace.MS = time.Since(start).Milliseconds()
@@ -2683,7 +2732,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	// System-Prompt (serverseitig, deterministisch)
 	var sysPrompt string
 	if isBlankChat {
-		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools Mkdir (Verzeichnis anlegen), Write (Datei erstellen/überschreiben), Edit (kleine Änderungen per Unified-Diff) und Rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
+		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools Mkdir (Verzeichnis anlegen), Write (Datei erstellen/überschreiben), Edit (kleine Änderungen per Unified-Diff) und Rmdir (leeres Verzeichnis entfernen) lesen und schreiben. " +
+			"WICHTIG: .docx/.odt/.xlsx/.ods/.pptx sind binäre ZIP-Formate und können NICHT als Text erzeugt werden — Write verweigert sie aktiv. Für Dokumente/Schreiben/Tabellen nutze .txt oder .html; die Cloud-UI zeigt .html live an und Collabora öffnet .txt/.html und exportiert sie in ein echtes .docx/.odt. "
 		sysPrompt = renderChatBlankSystemPrompt(s, "workspace", writeTools)
 	} else {
 		folder := req.Context.FolderName
