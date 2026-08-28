@@ -41,14 +41,14 @@ func TestSafeWritePath(t *testing.T) {
 
 func TestChatWriteTools(t *testing.T) {
 	tools := chatWriteTools()
-	if len(tools) != 3 {
-		t.Fatalf("chatWriteTools() returned %d tools, want 3", len(tools))
+	if len(tools) != 5 {
+		t.Fatalf("chatWriteTools() returned %d tools, want 5", len(tools))
 	}
 	names := map[string]bool{}
 	for _, t := range tools {
 		names[t.Function.Name] = true
 	}
-	for _, name := range []string{"write_file", "mkdir", "rmdir"} {
+	for _, name := range []string{"write_file", "mkdir", "rmdir", "read_file_segment", "patch_file"} {
 		if !names[name] {
 			t.Errorf("chatWriteTools() missing %s", name)
 		}

@@ -1996,6 +1996,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.Path = fullPath
 		switch name {
 		case "write_file":
+			if len(args.Content) == 0 {
+				trace.Error = "leerer Content"
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: Content ist leer. Sendung abgelehnt — eine leere Datei würde die bestehende Datei überschreiben. Lade den aktuellen Stand mit read_file_segment und sende den vollständigen Inhalt erneut.", trace
+			}
 			if len(args.Content) > s.cfg.Chat.Write.MaxFileBytes {
 				trace.Error = "Datei zu groß"
 				trace.MS = time.Since(start).Milliseconds()
