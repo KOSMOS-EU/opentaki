@@ -4097,9 +4097,9 @@ func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *respons
 			return "", backend
 		}
 
+		log.Printf("LLM empty response (attempt %d/%d, backend=%s, HTTP %d, raw: %.300s)",
+			attempt+1, maxRetries, backend, resp.StatusCode, string(respBody))
 		if attempt < maxRetries-1 {
-			log.Printf("LLM empty response (attempt %d/%d, backend=%s), retrying in %v",
-				attempt+1, maxRetries, backend, backoff[attempt])
 			time.Sleep(backoff[attempt])
 			continue
 		}

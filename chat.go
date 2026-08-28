@@ -757,6 +757,8 @@ func (s *Server) llmChatTools(model string, messages []chatToolMessage, tools []
 			return nil, "", fmt.Errorf("LLM-Backend fehlerhaft (HTTP %d)", resp.StatusCode)
 		}
 
+		log.Printf("chat LLM empty response (attempt %d/%d, model=%s, backend=%s, HTTP %d, raw: %.300s)",
+			attempt+1, maxRetries, model, resp.Header.Get("X-Backend"), resp.StatusCode, string(respBody))
 		if attempt < maxRetries-1 {
 			time.Sleep(backoff[attempt])
 			continue
