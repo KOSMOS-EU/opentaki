@@ -783,6 +783,8 @@ type userWebDav struct {
 	writeRoot string
 	// writeSpaceID: lazily aufgelöste Space-ID des persönlichen Spaces
 	writeSpaceID string
+	// Referenz auf den Server für API-Calls (validateSpaceAccess)
+	s *Server
 }
 
 func newUserWebDav(s *Server, jwt string) *userWebDav {
@@ -790,7 +792,31 @@ func newUserWebDav(s *Server, jwt string) *userWebDav {
 		client: &http.Client{Timeout: 30 * time.Second},
 		base:   strings.TrimRight(s.cfg.Chat.Search.WebDavURL, "/"),
 		jwt:    jwt,
+		s:      s,
 	}
+}
+
+// validateSpaceAccess prüft per OpenCloud Graph API, ob der User auf den
+// angegebenen Space zugreifen darf. true = Zugriff erlaubt, false = nicht.
+func (u *userWebDav) validateSpaceAccess(spaceID string) bool {
+	apiURL := strings.TrimRight(u.s.cfg.OpenCloud.URL, "/") + "/graph/v1.0/drives/" + url.PathEscape(spaceID)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		log.Printf("chat write: validateSpaceAccess: %v", err)
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+u.jwt)
+	resp, err := u.client.Do(req)
+	if err != nil {
+		log.Printf("chat write: validateSpaceAccess: %v", err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("chat write: validateSpaceAccess: HTTP %d für spaceID=%s", resp.StatusCode, spaceID)
+		return false
+	}
+	return true
 }
 
 // resolvePersonalSpaceID liefert die Space-Resource-ID des persönlichen
@@ -1834,7 +1860,12 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		u.scopePath = req.Context.Scope.Path
 		if isBlankChat {
 			u.writeRoot = writeRoot
-			u.writeSpaceID = req.Context.Write.SpaceID // aus der Extension, kein PROPFIND nötig
+			// Space-ID aus der Extension validieren: API-Call mit User-JWT
+			// stellt sicher, dass der User auf den Space zugreifen darf.
+			spaceID := req.Context.Write.SpaceID
+			if spaceID != "" && u.validateSpaceAccess(spaceID) {
+				u.writeSpaceID = spaceID
+			}
 		}
 	}
 	searchAvailable := u != nil && u.scopeID != ""
