@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,10 +58,17 @@ type ChatConfig struct {
 	// Datei fehlt → Built-in-Template (chatSystemPromptBlankBuiltin).
 	BlankSystemPromptFile string `yaml:"blank_system_prompt_file"`
 	blankSystemPrompt     string // runtime (leer = noch nicht geladen)
-	Search           ChatSearchConfig `yaml:"search"`
-	Heartbeat        ChatHeartbeatConfig `yaml:"heartbeat"`
-	ChatToken        ChatTokenConfig  `yaml:"chat_token"`
-	Write            ChatWriteConfig  `yaml:"write"`
+	// EditableExtensions: Dateierweiterungen (ohne Punkt) die im Create-Mode
+	// (Blank-Chat) editierbar sind. Für diese Typen liefern read_file,
+	// read_file_segment und patch_file den rohen Content.
+	// Default: html xhtml css js json md txt yaml yml xml svg ts vue py go sh
+	EditableExtensions []string `yaml:"editable_extensions"`
+	Search            ChatSearchConfig    `yaml:"search"`
+	Heartbeat         ChatHeartbeatConfig `yaml:"heartbeat"`
+	ChatToken         ChatTokenConfig     `yaml:"chat_token"`
+	Write             ChatWriteConfig     `yaml:"write"`
+	// runtime: lowercase-Set aus EditableExtensions
+	editableSet map[string]bool
 }
 
 // ChatWriteConfig steuert die Write-Tools des Blank-Chats (yaml: chat.write:).
@@ -193,6 +201,379 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 	if c.Write.MaxDepth < 1 {
 		c.Write.MaxDepth = 3
 	}
+	// EditableExtensions: Default-List für den Create-Mode
+	if len(c.EditableExtensions) == 0 {
+		c.EditableExtensions = []string{
+			"html", "xhtml", "css", "js", "json", "md", "txt",
+			"yaml", "yml", "xml", "svg", "ts", "vue", "py", "go", "sh",
+		}
+	}
+	c.editableSet = make(map[string]bool, len(c.EditableExtensions))
+	for _, ext := range c.EditableExtensions {
+		c.editableSet[strings.ToLower(ext)] = true
+	}
+}
+
+// isEditableFile prüft, ob die Dateierweiterung in der editable_extensions
+// Config-Liste steht. Datei ohne Extension → false.
+func (c *ChatConfig) isEditableFile(path string) bool {
+	dot := strings.LastIndex(path, ".")
+	if dot < 0 || dot == len(path)-1 {
+		return false
+	}
+	ext := strings.ToLower(path[dot+1:])
+	return c.editableSet[ext]
+}
+
+// applyUnifiedDiff wendet einen Unified-Diff-Patch auf fileContent an.
+// Format: "--- x" / "+++ y" Header, dann Hunks "@@ -oldStart,oldCount +newStart,newCount @@"
+// mit Kontextzeilen (Prefix " "), Entfernungen ("-"-Prefix) und Einfügungen ("+"-Prefix).
+// Liefert den neuen Content und die Anzahl geänderter Zeilen.
+func applyUnifiedDiff(fileContent, patchText string) (string, int, error) {
+	// Hunks werden sequentiell angewendet: vor jedem Hunk ist currentLines
+	// der aktuelle (bereits teilweise gepatchte) Stand der Datei. Nach dem
+	// Hunk wird der unveränderte Rest angehängt → das ergibt den Ausgangs-
+	// stand des nächsten Hunks.
+	currentLines := strings.Split(fileContent, "\n")
+	patchLines := strings.Split(patchText, "\n")
+
+	changedLines := 0
+	i := 0 // Index in patchLines
+
+	for i < len(patchLines) {
+		line := patchLines[i]
+
+		if !strings.HasPrefix(line, "@@") {
+			// Kopfzeilen des Diffs (--- /+++ / diff / index ...) und leere
+			// Zeilen außerhalb der Hunks — überspringen.
+			if isDiffHeaderLine(line) || line == "" {
+				i++
+				continue
+			}
+			return "", 0, fmt.Errorf("unerwartete Patch-Zeile %q", truncateForErr(line))
+		}
+
+		// Hunk-Header parsen: @@ -a,b +c,d @@
+		oldStart, err := parseHunkHeader(line)
+		if err != nil {
+			return "", 0, fmt.Errorf("ungültiger Hunk-Header %q: %s", line, err)
+		}
+		i++
+
+		// Hunk-Körper einlesen, bis eine neue @@-Zeile kommt
+		var hunkBody []string // Zeilen mit Prefix: " " Kontext, "-" entfernen, "+" einfügen
+		for i < len(patchLines) && !strings.HasPrefix(patchLines[i], "@@") {
+			hunkLine := patchLines[i]
+			switch {
+			case strings.HasPrefix(hunkLine, " ") ||
+				strings.HasPrefix(hunkLine, "-") ||
+				strings.HasPrefix(hunkLine, "+") ||
+				hunkLine == "\\": // No-newline-Marker
+				hunkBody = append(hunkBody, hunkLine)
+				i++
+			case hunkLine == "":
+				// Leere Zeile im Hunk = Kontext auf leerer Datei-Zeile
+				hunkBody = append(hunkBody, " ")
+				i++
+			default:
+				// Datei-Header o.ä. innerhalb eines Hunks — als Kontext behandeln
+				hunkBody = append(hunkBody, hunkLine)
+				i++
+			}
+		}
+
+		// Hunk anwenden: Startposition aus dem Header, bei Abweichung
+		// vor/zurück suchen (wie patch(1)), dann Kontext abgleichen.
+		oldPos, changed, applyErr := applyHunkAt(currentLines, oldStart-1, hunkBody)
+		if applyErr != nil {
+			return "", 0, fmt.Errorf("Hunk %q: %s. Tatsächlicher Dateiinhalt:\n%s",
+				line, applyErr, actualWindow(currentLines, 0, minInt(len(currentLines), 10)))
+		}
+		changedLines += changed
+		// Ergebnis: vor dem Hunk + Hunk-Ergebnis + Rest der Datei.
+		// Der Rest beginnt hinter den verbrauchten alten Zeilen (Kontext+„-“).
+		consumedOld := 0
+		for _, body := range hunkBody {
+			if len(body) > 0 && (body[0] == ' ' || body[0] == '-') {
+				consumedOld++
+			}
+		}
+		// prefix und tail kopieren: sie teilen das Backing-Array mit
+		// currentLines, und die Appends unten würden sie sonst überschreiben.
+		oldPrefix := append([]string(nil), currentLines[:oldPos]...)
+		oldTail := append([]string(nil), currentLines[oldPos+consumedOld:]...)
+		patched := hunkResult(hunkBody, oldPos, currentLines)
+		currentLines = make([]string, 0, len(oldPrefix)+len(patched)+len(oldTail))
+		currentLines = append(currentLines, oldPrefix...)
+		currentLines = append(currentLines, patched...)
+		currentLines = append(currentLines, oldTail...)
+	}
+
+	return strings.Join(currentLines, "\n"), changedLines, nil
+}
+
+// hunkResult wandelt den Hunk-Körper in die neuen Zeilen ab (Kontext bleibt,
+// "-" wird verworfen, "+" übernommen). Der aktuelle Stand (currentLines)
+// dient als Quelle für Kontextzeilen.
+func hunkResult(hunkBody []string, oldPos int, currentLines []string) []string {
+	var out []string
+	pos := oldPos
+	for _, body := range hunkBody {
+		if body == "" {
+			body = " "
+		}
+		switch body[0] {
+		case ' ':
+			if pos < len(currentLines) {
+				out = append(out, currentLines[pos])
+			}
+			pos++
+		case '-':
+			pos++
+		case '+':
+			out = append(out, body[1:])
+		case '\\':
+			// "\ No newline at end of file" — ignorieren
+		}
+	}
+	return out
+}
+
+// applyHunkAt prüft, ob der Hunk bei Position startPos (0-basiert) in
+// currentLines passt. Bei Nichtpassgen wird vor/zurück gesucht
+// (max. 50 Zeilen, wie patch(1)). Liefert die verwendete Position und die
+// Anzahl geänderter Zeilen.
+func applyHunkAt(currentLines []string, startPos int, hunkBody []string) (int, int, error) {
+	if startPos < 0 {
+		startPos = 0
+	}
+
+	matchesAt := func(pos int) bool {
+		p := pos
+		for _, body := range hunkBody {
+			if body == "" {
+				continue
+			}
+			switch body[0] {
+			case ' ':
+				if p >= len(currentLines) || strings.TrimRight(currentLines[p], "\r") != strings.TrimRight(body[1:], "\r") {
+					return false
+				}
+				p++
+			case '-':
+				if p >= len(currentLines) || strings.TrimRight(currentLines[p], "\r") != strings.TrimRight(body[1:], "\r") {
+					return false
+				}
+				p++
+			case '+':
+				// Nur Eintrag, kein Abgleich
+			case '\\':
+			}
+		}
+		return true
+	}
+
+	changed := 0
+	for _, body := range hunkBody {
+		if len(body) > 0 && (body[0] == '-' || body[0] == '+') {
+			changed++
+		}
+	}
+
+	// Exakte Position zuerst
+	if matchesAt(startPos) {
+		return startPos, changed, nil
+	}
+	// Vor/zurück suchen (Fuzz)
+	for offset := 1; offset <= 50; offset++ {
+		if startPos-offset >= 0 && matchesAt(startPos - offset) {
+			return startPos - offset, changed, nil
+		}
+		if matchesAt(startPos + offset) {
+			return startPos + offset, changed, nil
+		}
+	}
+	return 0, 0, fmt.Errorf(
+		"Hunk-Kontext wurde in der Datei nicht gefunden (Startzeile %d). Nutze read_file_segment für den aktuellen Stand.",
+		startPos+1)
+}
+
+// ── egrep (Inhaltssuche im Share) ─────────────────────────────
+
+type egrepHit struct {
+	path   string
+	lineNo int
+	line   string
+}
+
+// egrepWalk durchsucht Dateien unter rootRel rekursiv mit der Regex.
+// Liefert die Treffer, die Anzahl gescannter Dateien und einen Cut-Flag,
+// falls die Treffer-Limit erreicht wurde.
+func (s *Server) egrepWalk(d *shareWebDav, rootRel string, re *regexp.Regexp, limit int) ([]egrepHit, int, bool) {
+	maxDepth := s.cfg.Chat.ListDepth
+	entries, _, entryCut, err := d.propfindTree(rootRel, maxDepth, s.cfg.Chat.MaxListings)
+	if err != nil {
+		return nil, 0, false
+	}
+	var hits []egrepHit
+	filesScanned := 0
+	cut := false
+	for _, e := range entries {
+		if e.IsDir {
+			continue
+		}
+		if len(hits) >= limit {
+			cut = true
+			break
+		}
+		data, ct, getErr := d.getfile(e.Rel)
+		if getErr != nil {
+			continue
+		}
+		if !isTextyContent(ct, data) {
+			continue
+		}
+		filesScanned++
+		lines := strings.Split(string(data), "\n")
+		for lineNo, line := range lines {
+			if !re.MatchString(line) {
+				continue
+			}
+			hits = append(hits, egrepHit{path: e.Rel, lineNo: lineNo + 1, line: truncateChars(line, 200)})
+			if len(hits) >= limit {
+				cut = true
+				break
+			}
+		}
+	}
+	if entryCut {
+		cut = true
+	}
+	return hits, filesScanned, cut
+}
+
+// isTextyContent erkennt, ob der Content als Text durchsuchbar ist
+// (MIME-Typ + Byte-Prüfe). Binäre Dateien (PDF, Office, Bilder, …)
+// werden übersprungen.
+func isTextyContent(ct string, data []byte) bool {
+	lct := strings.ToLower(ct)
+	texty := []string{"text/", "json", "xml", "yaml", "csv", "x-sh", "x-python", "javascript", "typescript"}
+	for _, t := range texty {
+		if strings.Contains(lct, t) {
+			return true
+		}
+	}
+	// Kein erkennbarer MIME-Typ → per Magic-Byte prüfen
+	if len(data) < 2 || data[0] != 0x00 {
+		// Heuristik: kein Nullbyte in den ersten 512 Bytes = wahrscheinlich Text
+		if len(data) > 512 {
+			data = data[:512]
+		}
+		for _, b := range data {
+			if b == 0x00 {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func relPathOrRoot(relPath string) string {
+	if relPath == "" {
+		return "dem geteilten Ordner"
+	}
+	return relPath
+}
+
+// isDiffHeaderLine erkennt Kopfzeilen eines Unified/Extended Diffs.
+func isDiffHeaderLine(line string) bool {
+	return strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") ||
+		strings.HasPrefix(line, "diff ") || strings.HasPrefix(line, "index ") ||
+		strings.HasPrefix(line, "old mode") || strings.HasPrefix(line, "new mode") ||
+		strings.HasPrefix(line, "deleted file") || strings.HasPrefix(line, "new file") ||
+		strings.HasPrefix(line, "rename from") || strings.HasPrefix(line, "rename to") ||
+		strings.HasPrefix(line, "similarity index") || strings.HasPrefix(line, "Binary files")
+}
+
+// actualAt liefert die Datei-Zeile an Position (1-basiert) für Fehlermeldungen.
+func actualAt(lines []string, pos0 int) string {
+	if pos0 < 0 || pos0 >= len(lines) {
+		return "<außerhalb der Datei>"
+	}
+	return truncateForErr(lines[pos0])
+}
+
+// actualWindow rendert einen Zeilenbereich der Datei mit Zeilennummern,
+// damit das Modell bei einem Fehlschlag den tatsächlichen Inhalt sehen kann.
+func actualWindow(lines []string, from0, count int) string {
+	if from0 < 0 {
+		from0 = 0
+	}
+	to := from0 + count
+	if to > len(lines) {
+		to = len(lines)
+	}
+	if from0 >= len(lines) {
+		return "<Datei ist leer oder Zeile existiert nicht>"
+	}
+	var sb strings.Builder
+	for n := from0; n < to; n++ {
+		fmt.Fprintf(&sb, "%4d: %s\n", n+1, truncateForErr(lines[n]))
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func max1(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// parseHunkHeader liest "@@ -a[,b] +c[,d] @@ ..." und liefert die alte Startzeile (1-basiert).
+func parseHunkHeader(header string) (int, error) {
+	rest := strings.TrimSpace(strings.TrimPrefix(header, "@@"))
+	parts := strings.SplitN(rest, " @@", 2)
+	if len(parts) == 0 {
+		return 0, fmt.Errorf("kein @@-Abschluss")
+	}
+	segments := strings.Fields(parts[0])
+	if len(segments) < 2 || !strings.HasPrefix(segments[0], "-") || !strings.HasPrefix(segments[1], "+") {
+		return 0, fmt.Errorf("erwarte Format '-Start,Count +Start,Count'")
+	}
+	oldSpec := strings.TrimPrefix(segments[0], "-")
+	oldSpec = strings.SplitN(oldSpec, ",", 2)[0] // Start,Count → nur Start
+	oldStart, err := strconv.Atoi(oldSpec)
+	if err != nil {
+		return 0, fmt.Errorf("alte Startzeile %q ist keine Zahl", oldSpec)
+	}
+	return oldStart, nil
+}
+
+func truncateForErr(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 60 {
+		return s[:57] + "..."
+	}
+	if s == "" {
+		return "<leer>"
+	}
+	return s
+}
+
+func trailingNewlineTail(content string) string {
+	if strings.HasSuffix(content, "\n") {
+		return "\n"
+	}
+	return ""
 }
 
 // ── Tool-Definitionen (OpenAI-Format) ────────────────────────
@@ -241,6 +622,11 @@ func (s *Server) chatTools() []toolDefinition {
 			Parameters: json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Teilstring des Verzeichnisnamens (mind. 2-3 Zeichen, Groß-/Kleinschreibung egal)"},"extra":{"type":"string","description":"Optional: zusätzliche Bedingung, wird mit AND verknüpft (wie bei search_item)."},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Optional: maximale Trefferzahl (Default 20, max 100). Nur bei ausdrücklicher User-Zustimmung auf einen höheren Wert setzen."}},"required":["pattern"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
+			Name:        "egrep",
+			Description: "Durchsucht den INHALT von Dateien im geteilten Ordner (rekursiv) mit einer regulären Expression (POSIX ERE, wie egrep). Liefert die Trefferzeilen mit Pfad, Zeilennummer und Kontext. Nutze das, um gezielt in vielen Dateien zu finden, statt jede Datei einzeln mit read_file zu lesen. Binäre Dateien werden übersprungen.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string","description":"Reguläre Expression (ERE), z. B. \"Rechnung|Invoice\" oder \"total:[0-9,.]+\""},"path":{"type":"string","description":"Optional: Verzeichnis oder Datei relativ zum geteilten Ordner. Leer = der gesamte geteilte Ordner."},"limit":{"type":"integer","minimum":1,"maximum":200,"description":"Optional: maximale Trefferzeilen (Default 50, max 200)."}},"required":["pattern"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
 			Name:        "present_options",
 			Description: "Beendet den Turn mit konkreten Antwort-Optionen, die der User in der Chat-UI anklicken kann. NUR verwenden, wenn der User eine Entscheidung treffen soll (z. B. unklare Vorgabe, mehrere mögliche Wege, Umfang-Frage) und du selbst nicht weiterkommst. Max. 5 kurze Optionen, jede für sich eine vollständige User-Anweisung. Wenn du die Frage direkt beantworten kannst, antworte normal OHNE dieses Tool.",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"options":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5,"description":"1-5 kurze Optionen, jede eine vollständige User-Anweisung, z. B. \"Nur Rechnungen aus 2025 auswerten\""}},"required":["options"]}`),
@@ -272,6 +658,11 @@ func chatWriteTools() []toolDefinition {
 			Name:        "read_file_segment",
 			Description: "Liest einen zeilenweisen Ausschnitt einer Datei im Arbeitsbereich (raw, ohne Extraktion). Nutze das, um große Dateien in Teilen zu sehen, statt die gesamte Datei zu laden. Zeilen sind 1-basiert.",
 			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root"},"offset":{"type":"integer","description":"Erste Zeile (1-basiert). Default 1."},"limit":{"type":"integer","description":"Anzahl der Zeilen. Default 200."}},"required":["path"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "patch_file",
+			Description: "Wendet einen Unified-Diff-Patch auf eine Datei im Arbeitsbereich an. Effizienter als write_file für kleine Änderungen. Format: Standard Unified Diff mit --- /+++ Header und @@-Hunk-Header. Nutze read_file_segment vorher, um den genauen Zeilenkontext zu sehen.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root"},"patch":{"type":"string","description":"Unified-Diff-Patch (mit --- /+++ und @@ Hunk-Headern)"}},"required":["path","patch"]}`),
 		}},
 	}
 }
@@ -1226,6 +1617,51 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 	trace.Path = relPath
 
 	switch name {
+	case "egrep":
+		if d == nil {
+			trace.Error = "nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: egrep ist für diesen Chat nicht verfügbar.", trace
+		}
+		pattern := strings.TrimSpace(args.Pattern)
+		if pattern == "" {
+			trace.Error = "Pattern erforderlich"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: das Such-Pattern darf nicht leer sein.", trace
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			trace.Error = "ungültiger Regex"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: ungültige reguläre Expression: " + err.Error(), trace
+		}
+		limit := 50
+		if args.Limit >= 1 {
+			limit = args.Limit
+			if limit > 200 {
+				limit = 200
+			}
+		}
+		results, filesScanned, cut := s.egrepWalk(d, relPath, re, limit)
+		trace.Pattern = pattern
+		trace.Method = "egrep"
+		trace.Truncated = cut
+		trace.MS = time.Since(start).Milliseconds()
+		if len(results) == 0 {
+			return fmt.Sprintf("Keine Treffer für /%s/ in %d Datei(en) unter %s.", pattern, filesScanned, relPathOrRoot(relPath)), trace
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("Treffer für /%s/:\n", pattern))
+		for _, hit := range results {
+			sb.WriteString(fmt.Sprintf("%s:%d: %s\n", hit.path, hit.lineNo, hit.line))
+		}
+		if cut {
+			sb.WriteString(fmt.Sprintf("… (auf %d Treffer begrenzt, weitere vorhanden)\n", limit))
+		}
+		sb.WriteString(fmt.Sprintf("  found: %d Treffer in %d Datei(en) unter %s", len(results), filesScanned, relPathOrRoot(relPath)))
+		trace.Chars = len(sb.String())
+		return sb.String(), trace
+
 	case "search_item", "search_dir":
 		if u == nil || u.scopeID == "" {
 			trace.Error = "Suche nicht verfügbar"
@@ -1365,12 +1801,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Die Datei existiert, ist aber leer (0 Bytes).", trace
 		}
-		// HTML/XHTML: raw an das Modell (pandoc würde Tags entfernen und
-		// nur den sichtbaren Text liefern — der Code geht verloren).
-		ctLower := strings.ToLower(ct)
+		// Editierbare Dateitypen: raw an das Modell (Config: editable_extensions).
+		// Sonst: s.extract (pandoc, pdftotext, etc.)
 		var text, method string
-		if strings.Contains(ctLower, "text/html") || strings.Contains(ctLower, "xhtml") {
-			text, method = string(data), "raw-html"
+		if s.cfg.Chat.isEditableFile(relPath) {
+			text, method = string(data), "raw"
 		} else {
 			text, method = s.extract(data, ct)
 		}
@@ -1494,6 +1929,56 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		trace.Chars = len(sb.String())
 		trace.MS = time.Since(start).Milliseconds()
 		return sb.String(), trace
+
+	case "patch_file":
+		// Unified-Diff-Patch auf eine Datei anwenden (nur Blank-Chat, editierbare Typen).
+		if d == nil {
+			trace.Error = "nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: patch_file ist nur im Arbeitsbereich verfügbar.", trace
+		}
+		if !s.cfg.Chat.isEditableFile(relPath) {
+			trace.Error = "nicht editierbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: patch_file unterstützt nur editierbare Dateitypen.", trace
+		}
+		var patchArgs struct {
+			Path  string `json:"path"`
+			Patch string `json:"patch"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &patchArgs); err != nil {
+			trace.Error = "ungültige Argumente"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: ungültige patch_file-Argumente.", trace
+		}
+		if strings.TrimSpace(patchArgs.Patch) == "" {
+			trace.Error = "patch erforderlich"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: der 'patch'-Parameter darf nicht leer sein.", trace
+		}
+		data, _, err := d.getfile(relPath)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		newContent, changedLines, patchErr := applyUnifiedDiff(string(data), patchArgs.Patch)
+		if patchErr != nil {
+			trace.Error = patchErr.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Patch konnte nicht angewendet werden: " + patchErr.Error() +
+				" Nutze read_file_segment, um den aktuellen Zeileninhalt zu prüfen.", trace
+		}
+		if err := d.sharePutFile(relPath, newContent); err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		trace.Method = "patch"
+		trace.Path = relPath
+		trace.Chars = len(patchArgs.Patch)
+		trace.MS = time.Since(start).Milliseconds()
+		return fmt.Sprintf("Patch angewendet: %d geänderte Zeilen in %s", changedLines, relPath), trace
 
 	case "write_file", "mkdir", "rmdir":
 		// Write-Tools: nur bei Blank-Chat (d != nil, Share auf /workspace)
