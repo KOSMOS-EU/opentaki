@@ -2464,8 +2464,16 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	var u *userWebDav
 	if jwt != "" {
 		u = newUserWebDav(s, jwt)
-		u.scopeID = req.Context.Scope.ResourceID
-		u.scopePath = req.Context.Scope.Path
+		if isBlankChat {
+			// Blank-Chat: Workspace als Such-Scope
+			if spaceID := u.resolvePersonalSpaceID(); spaceID != "" {
+				u.scopeID = spaceID
+				u.scopePath = "workspace"
+			}
+		} else {
+			u.scopeID = req.Context.Scope.ResourceID
+			u.scopePath = req.Context.Scope.Path
+		}
 	}
 	searchAvailable := u != nil && u.scopeID != ""
 
@@ -2473,6 +2481,9 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	var sysPrompt string
 	if isBlankChat {
 		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools mkdir (Verzeichnis anlegen), write_file (Datei erstellen/überschreiben) und rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
+		if searchAvailable {
+			writeTools += "Bei großen Ordnern: erst mit search_item (Dateien) oder search_dir (Verzeichnisse) suchen, statt alles aufzulisten. "
+		}
 		sysPrompt = renderChatBlankSystemPrompt(s, "workspace", writeTools)
 	} else {
 		folder := req.Context.FolderName
