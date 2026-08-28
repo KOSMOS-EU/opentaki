@@ -1075,7 +1075,10 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 
 	const ocNS = "http://owncloud.org/ns"
+	const davNS = "DAV:"
 	wantBare := map[string]bool{"summary": true, "subject": true, "tags": true}
+	// DAV-Elemente die wir ausserhalb des oc-NS brauchen
+	wantDAV := map[string]bool{"getcontentlength": true, "getcontenttype": true}
 	meta := map[string]string{}
 
 	dec := xml.NewDecoder(bytes.NewReader(data))
@@ -1085,10 +1088,19 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 			break
 		}
 		start, ok := tok.(xml.StartElement)
-		if !ok || start.Name.Space != ocNS {
+		if !ok {
 			continue
 		}
-		if !strings.Contains(start.Name.Local, ".") && !wantBare[start.Name.Local] {
+		// oc-NS: doc.* Felder + bare summary/subject/tags
+		if start.Name.Space == ocNS {
+			if !strings.Contains(start.Name.Local, ".") && !wantBare[start.Name.Local] {
+				continue
+			}
+		} else if start.Name.Space == davNS {
+			if !wantDAV[start.Name.Local] {
+				continue
+			}
+		} else {
 			continue
 		}
 		// Elementinhalt lesen (bis zum passenden EndElement)
