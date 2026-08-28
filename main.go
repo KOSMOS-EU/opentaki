@@ -4035,7 +4035,11 @@ func (s *Server) llmCompleteOptsBackend(messages []chatMessage, rf *responseForm
 }
 
 func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *responseFormat, tc *traceCtx, label, model string) (string, string) {
-	sessionID := fmt.Sprintf("%s%04x", strings.TrimSpace(label[:1]), time.Now().UnixNano()&0xffffff)
+	prefix := "x"
+	if len(label) > 0 {
+		prefix = label[:1]
+	}
+	sessionID := fmt.Sprintf("%s%04x", prefix, time.Now().UnixNano()&0xffffff)
 	return s.llmCompleteOptsBackendModelSession(sessionID, messages, rf, tc, label, model)
 }
 
