@@ -756,6 +756,54 @@ func (d *shareWebDav) getfile(relPath string) ([]byte, string, error) {
 	return data, resp.Header.Get("Content-Type"), nil
 }
 
+// ── Write-Operationen auf dem Share (Blank-Chat) ─────────────
+//
+// Die Extension erzeugt einen Public-Link-Share auf /workspace im
+// persönlichen Space. Taki nutzt dieselbe shareWebDav-Auth (Basic Auth
+// "public:<password>") für PUT/MKCOL/DELETE. Der Share-Scope begrenzt
+// die Schreiboperationen strukturell auf den Workspace-Ordner.
+
+func (d *shareWebDav) doWrite(method, uURL string, body io.Reader) error {
+	req, err := http.NewRequest(method, uURL, body)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+	req.SetBasicAuth("public", d.passwd)
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch {
+	case method == "MKCOL" && (resp.StatusCode == 201 || resp.StatusCode == 405):
+		return nil // 405 = bereits existiert → no-op
+	case method == "PUT" && (resp.StatusCode == 201 || resp.StatusCode == 204):
+		return nil
+	case method == "DELETE" && resp.StatusCode == 204:
+		return nil
+	default:
+		return fmt.Errorf("Share %s: HTTP %d", method, resp.StatusCode)
+	}
+}
+
+// sharePutFile legt eine Datei im Share-Ordner an oder überschreibt sie.
+func (d *shareWebDav) sharePutFile(relPath, content string) error {
+	return d.doWrite("PUT", d.urlFor(relPath), strings.NewReader(content))
+}
+
+// shareMkdir legt ein Verzeichnis im Share-Ordner an (MKCOL).
+func (d *shareWebDav) shareMkdir(relPath string) error {
+	return d.doWrite("MKCOL", d.urlFor(relPath), nil)
+}
+
+// shareDeletePath entfernt ein leeres Verzeichnis im Share-Ordner.
+func (d *shareWebDav) shareDeletePath(relPath string) error {
+	return d.doWrite("DELETE", d.urlFor(relPath), nil)
+}
+
 // ── WebDAV-Client (User-JWT, Search) ─────────────────────────
 //
 // Der Proxy (OIDC-gate) prägt pro Request einen User-Reva-JWT und übergibt
@@ -1383,21 +1431,13 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		return sb.String(), trace
 
 	case "write_file", "mkdir", "rmdir":
-		// Write-Tools: nur bei context.write (u != nil + writeRoot != "")
-		if u == nil || u.writeRoot == "" {
+		// Write-Tools: nur bei Blank-Chat (d != nil, Share auf /workspace)
+		if d == nil {
 			trace.Error = "Schreiben nicht verfügbar"
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Schreiben ist für diesen Chat nicht verfügbar.", trace
 		}
-		if u.writeSpaceID == "" {
-			u.writeSpaceID = u.resolvePersonalSpaceID()
-		}
-		if u.writeSpaceID == "" {
-			trace.Error = "persönlicher Space nicht gefunden"
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: persönlicher Space konnte nicht aufgelöst werden.", trace
-		}
-		fullPath, err := safeWritePath(u.writeRoot, relPath, s.cfg.Chat.Write.MaxDepth)
+		fullPath, err := safeWritePath("", relPath, s.cfg.Chat.Write.MaxDepth)
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
@@ -1411,7 +1451,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 				trace.MS = time.Since(start).Milliseconds()
 				return fmt.Sprintf("Fehler: Dateiinhalt zu groß (max. %d Bytes).", s.cfg.Chat.Write.MaxFileBytes), trace
 			}
-			if err := u.putFile(u.writeSpaceID, u.writeRoot, relPath, args.Content); err != nil {
+			if err := d.sharePutFile(relPath, args.Content); err != nil {
 				trace.Error = err.Error()
 				trace.MS = time.Since(start).Milliseconds()
 				return "Fehler: " + err.Error(), trace
@@ -1421,7 +1461,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Datei erfolgreich erstellt: " + fullPath, trace
 		case "mkdir":
-			if err := u.mkdir(u.writeSpaceID, u.writeRoot, relPath); err != nil {
+			if err := d.shareMkdir(relPath); err != nil {
 				trace.Error = err.Error()
 				trace.MS = time.Since(start).Milliseconds()
 				return "Fehler: " + err.Error(), trace
@@ -1430,7 +1470,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Verzeichnis erfolgreich angelegt: " + fullPath + "/", trace
 		case "rmdir":
-			if err := u.deletePath(u.writeSpaceID, u.writeRoot, relPath); err != nil {
+			if err := d.shareDeletePath(relPath); err != nil {
 				trace.Error = err.Error()
 				trace.MS = time.Since(start).Milliseconds()
 				return "Fehler: " + err.Error() + " (nur leere Verzeichnisse können entfernt werden)", trace
@@ -1492,13 +1532,13 @@ type chatAskRequest struct {
 			ResourceID string `json:"resource_id"`
 			Path       string `json:"path"`
 		} `json:"scope"`
-		// Write: Blank-Chat — schreiben in den persönlichen Space.
-		// Root: Verzeichnis relativ zur Space-Root (z. B. "workspace").
-		// SpaceID: ID des persönlichen Spaces (aus der Extension).
+		// Write: Blank-Chat — schreiben in den Workspace-Ordner des
+		// persönlichen Spaces. Die Extension erzeugt einen Public-Link-Share
+		// auf /workspace und schickt token+password. Taki nutzt denselben
+		// shareWebDav-Mechanismus wie der Folder-Chat (Basic Auth).
 		// Leer = keine Write-Tools (Share/Scope-Chat bleibt read-only).
 		Write struct {
-			Root    string `json:"root"`
-			SpaceID string `json:"space_id"`
+			Share chatAskShare `json:"share"`
 		} `json:"write"`
 	} `json:"context"`
 	// Stream: live Fortschritt per Server-Sent-Events
@@ -1816,11 +1856,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, http.StatusBadRequest, "ungültiger Request: " + err.Error())
 		return
 	}
-	writeRoot := strings.Trim(req.Context.Write.Root, "/")
-	if writeRoot != "" && strings.Contains(writeRoot, "..") {
-		writeChatError(w, http.StatusBadRequest, "context.write.root darf keine '..'-Segmente enthalten")
-		return
-	}
+	// Blank-Chat: context.write.share (token+password) — Public-Link-Share
+	// auf /workspace im persönlichen Space. Die Extension erzeugt den Share
+	// (OIDC-gated) und Taki nutzt dieselbe shareWebDav-Auth wie Folder-Chat.
+	hasWriteShare := req.Context.Write.Share.Token != "" && req.Context.Write.Share.Password != ""
 	if len(req.Messages) == 0 {
 		writeChatError(w, http.StatusBadRequest, "messages erforderlich")
 		return
@@ -1843,9 +1882,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			jwt = strings.TrimPrefix(h, bearerPrefix)
 		}
 	}
-	// Blank-Chat: context.write statt context.share — Write-Tools gegen
-	// den persönlichen Space (Personal-Space-Gate liegt auf der Extension).
-	isBlankChat := writeRoot != "" && jwt != ""
+	// Blank-Chat: context.write.share — Write-Tools gegen /workspace.
+	// Der Share wird von der Extension erzeugt (OIDC-gated); Taki nutzt
+	// denselben shareWebDav-Mechanismus wie der Folder-Chat (Basic Auth).
+	isBlankChat := hasWriteShare
 	if isBlankChat {
 		tools = append(tools, chatWriteTools()...)
 	}
@@ -1858,26 +1898,14 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		u = newUserWebDav(s, jwt)
 		u.scopeID = req.Context.Scope.ResourceID
 		u.scopePath = req.Context.Scope.Path
-		if isBlankChat {
-			u.writeRoot = writeRoot
-			// Space-ID aus der Extension validieren: API-Call mit User-JWT
-			// stellt sicher, dass der User auf den Space zugreifen darf.
-			spaceID := req.Context.Write.SpaceID
-			if spaceID != "" && u.validateSpaceAccess(spaceID) {
-				u.writeSpaceID = spaceID
-			}
-		}
 	}
 	searchAvailable := u != nil && u.scopeID != ""
 
 	// System-Prompt (serverseitig, deterministisch)
 	var sysPrompt string
 	if isBlankChat {
-		writeTools := ""
-		if u != nil {
-			writeTools = "Du kannst Dateien in dem Verzeichnis „" + writeRoot + "“ im persönlichen Cloud-Arbeitsbereich des Users mit den Tools mkdir (Verzeichnis anlegen), write_file (Datei erstellen/überschreiben) und rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
-		}
-		sysPrompt = renderChatBlankSystemPrompt(s, writeRoot, writeTools)
+		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools mkdir (Verzeichnis anlegen), write_file (Datei erstellen/überschreiben) und rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
+		sysPrompt = renderChatBlankSystemPrompt(s, "workspace", writeTools)
 	} else {
 		folder := req.Context.FolderName
 		if folder == "" {
@@ -1911,7 +1939,9 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var d *shareWebDav
-	if !isBlankChat {
+	if isBlankChat {
+		d = newShareWebDav(s, req.Context.Write.Share.Token, req.Context.Write.Share.Password)
+	} else {
 		d = newShareWebDav(s, req.Context.Share.Token, req.Context.Share.Password)
 	}
 	toolTraces := make([]toolTrace, 0, 8)
