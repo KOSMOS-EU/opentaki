@@ -1088,12 +1088,10 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 	meta := map[string]string{}
 	dec := xml.NewDecoder(bytes.NewReader(data))
 
-	debug := true // TEMP
-	if debug {
-		log.Printf("DEBUG propfindMeta BODY=%s", string(data))
-	}
-	// elementText liest den Chardate-Inhalt eines Elements (bis EndElement).
-	elementText := func() string {
+	// skipElement liest den kompletten Inhalt eines Elements (bis zum
+	// passenden EndElement) und gibt den Chardate-Text zurück. VERBRAUCHT
+	// also das EndElement — der aufrufende Loop muss danach NICHT depth++.
+	skipElement := func() string {
 		var val string
 		depth := 1
 		for depth > 0 {
@@ -1141,26 +1139,33 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 				case xml.StartElement:
 					switch {
 					case tt.Name.Space == davNS && tt.Name.Local == "href":
-						respHref = elementText()
+						respHref = skipElement()
+						// skipElement hat das EndElement verbraucht → kein depth++
 					case tt.Name.Space == ocNS:
 						if !strings.Contains(tt.Name.Local, ".") && !wantBare[tt.Name.Local] {
+							// gefiltertes Element (keine doc.* / kein bare):
+							// Elementinhalt überspringen, ohne zu zählen
+							skipElement()
 							continue
 						}
 						if respMeta == nil {
 							respMeta = map[string]string{}
 						}
-						if v := elementText(); v != "" {
+						if v := skipElement(); v != "" {
 							respMeta[tt.Name.Local] = v
 						}
+						// skipElement hat das EndElement verbraucht → kein depth++
 					case tt.Name.Space == davNS && wantDAV[tt.Name.Local]:
 						if respMeta == nil {
 							respMeta = map[string]string{}
 						}
-						if v := elementText(); v != "" {
+						if v := skipElement(); v != "" {
 							respMeta[tt.Name.Local] = v
 						}
+						// skipElement hat das EndElement verbraucht → kein depth++
+					default:
+						depth++ // Element nicht konsumiert → zählen
 					}
-					depth++
 				case xml.EndElement:
 					depth--
 				}
@@ -1168,9 +1173,6 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 			// Nur der response des Ziel-Pfads zählt (Hrefs können
 			// unterschiedlich escaped sein → Segment-Vergleich).
 			matched := pathMatches(respHref, d.urlFor(relPath))
-			if debug {
-				log.Printf("DEBUG respHref=%q target=%q matched=%v respMeta_keys=%v", respHref, d.urlFor(relPath), matched, keys(respMeta))
-			}
 			if matched && respMeta != nil {
 				for k, v := range respMeta {
 					meta[k] = v
@@ -1212,16 +1214,6 @@ func pathMatches(href, target string) bool {
 		}
 	}
 	return true
-}
-
-// keys: Sortierte Map-Keys (nur für Logging).
-func keys(m map[string]string) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return ks
 }
 
 // getfile lädt eine Datei (max. maxShareBytes) und liefert Bytes + Content-Type.
@@ -1897,14 +1889,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		// oft nur einen Bruchteil — der Size-Header ist die Wahrheit).
 		fileSize := int64(-1)
 		if meta, metaErr := d.propfindMeta(relPath); metaErr == nil {
-			log.Printf("DEBUG propfindMeta rel=%q err=nil meta_keys=%v gcl=%q", relPath, keys(meta), meta["getcontentlength"])
 			if sz := meta["getcontentlength"]; sz != "" {
 				if n, convErr := strconv.ParseInt(sz, 10, 64); convErr == nil {
 					fileSize = n
 				}
 			}
-		} else {
-			log.Printf("DEBUG propfindMeta rel=%q err=%q", relPath, metaErr.Error())
 		}
 		data, ct, err := d.getfile(relPath)
 		if err != nil {
