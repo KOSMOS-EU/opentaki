@@ -1572,6 +1572,9 @@ type toolTrace struct {
 	Truncated bool   `json:"truncated,omitempty"`
 	Error     string `json:"error,omitempty"`
 	MS        int64  `json:"ms"`
+	// FileSize: tatsächliche Dateigröße (PROPFIND getcontentlength).
+	// Bei Read: Wahrheit über die Datei, unabhängig vom empfangenen Bruchteil.
+	FileSize int64 `json:"file_size,omitempty"`
 }
 
 // runChatTool führt einen Tool-Call aus und liefert (tool-Result, Trace).
@@ -1784,6 +1787,16 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		return sb.String(), trace
 
 	case "Read":
+		// PROPFIND für die tatsächliche Dateigröße (Blind-Read liefert
+		// oft nur einen Bruchteil — der Size-Header ist die Wahrheit).
+		fileSize := int64(-1)
+		if meta, metaErr := d.propfindMeta(relPath); metaErr == nil {
+			if sz := meta["getcontentlength"]; sz != "" {
+				if n, convErr := strconv.ParseInt(sz, 10, 64); convErr == nil {
+					fileSize = n
+				}
+			}
+		}
 		data, ct, err := d.getfile(relPath)
 		if err != nil {
 			trace.Error = err.Error()
@@ -1840,7 +1853,14 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			}
 			trace.Method = method
 			trace.Chars = len(text)
+			trace.FileSize = fileSize
 			trace.MS = time.Since(start).Milliseconds()
+			// Warnung: empfangene Daten kleiner als PROPFIND-Size →
+			// unvollständiges Read (Modell sieht den Hinweis im Text).
+			if fileSize > 0 && int64(len(data)) < fileSize {
+				text += fmt.Sprintf("\n\n[Hinweis: Nur %d von %d Bytes empfangen — die Datei ist unvollständig geladen. "+
+					"Versuche es erneut oder lies mit offset/limit in Abschnitten.]", len(data), fileSize)
+			}
 			return text, trace
 		}
 		// Nicht-editierbar: s.extract (pandoc, pdftotext, etc.)
@@ -1965,6 +1985,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			}
 			trace.Method = "put"
 			trace.Chars = len(args.Content)
+			trace.FileSize = int64(len(args.Content))
 			trace.MS = time.Since(start).Milliseconds()
 			return "Datei erfolgreich erstellt: " + fullPath, trace
 		case "Mkdir":
@@ -2701,8 +2722,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			}
 			// args = die exakte Anfrage (auch bei Duplikaten, die runChatTool
 			// nie erreichen und daher leere trace-Felder haben).
-			log.Printf("chat/ask [%s]: tool=%s args=%q path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
-				sessionID, tc.Function.Name, tc.Function.Arguments, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
+			log.Printf("chat/ask [%s]: tool=%s args=%q path=%q pattern=%q extra=%q ms=%d chars=%d file_size=%d truncated=%v err=%q",
+				sessionID, tc.Function.Name, tc.Function.Arguments, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.FileSize, trace.Truncated, trace.Error)
 			// Duplikate erreichen nur Modell (als Hint) und Journal —
 			// nicht den UI-Trace, um verwirrende Wiedereinträge zu vermeiden.
 			if trace.Method != "duplicate" {
