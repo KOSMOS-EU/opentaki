@@ -866,7 +866,7 @@ func shareAuthError(resp *http.Response) (string, bool) {
 		return "Share-Zugriff verweigert (Password falsch oder Share abgelaufen — bitte Chat neu starten)", true
 	}
 	if resp.StatusCode == 404 {
-		return "Datei/Ordner nicht gefunden (außerhalb des geteilten Ordners?)", true
+		return "Datei/Ordner nicht gefunden. Prüfe den Pfad mit list_directory (Tippfehler?)", true
 	}
 	return "", false
 }
@@ -1794,6 +1794,19 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
+			// 404: Verfügbare Top-Level-Einträge mitschicken, damit das Modell
+			// Tippfehler selbst korrigieren kann.
+			if strings.Contains(err.Error(), "nicht gefunden") {
+				if entries, listErr := d.propfind(""); listErr == nil && len(entries) > 0 {
+					names := make([]string, 0, len(entries))
+					for _, e := range entries {
+						names = append(names, e.Name)
+					}
+					sort.Strings(names)
+					return fmt.Sprintf("Fehler: Datei/Ordner nicht gefunden. Verfügbare Einträge in der Root:\n%s",
+						strings.Join(names, ", ")), trace
+				}
+			}
 			return "Fehler: " + err.Error(), trace
 		}
 		if len(data) == 0 {
