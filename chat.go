@@ -602,8 +602,8 @@ func (s *Server) chatTools() []toolDefinition {
 		}},
 		{Type: "function", Function: toolFunction{
 			Name:        "Read",
-			Description: "Liest eine Datei im geteilten Ordner. Editierbare Typen (code, html, md, txt, …) liefern raw Content; andere Typen (pdf, office, …) den extrahierten Text. Bilder liefern eine VLM-Beschreibung. Große Dateien werden gekürzt. offset/limit ermöglichen zeilenweises Lesen (1-basiert) — außerhalb des Bereichs liefert Read den verfügbaren Inhalt mit Hinweis statt Fehler. Pfade relativ zum geteilten Ordner.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"},"offset":{"type":"integer","description":"Optional: erste Zeile (1-basiert). Nur bei editierbaren Texttypen. Default 1."},"limit":{"type":"integer","description":"Optional: Anzahl der Zeilen. Nur bei editierbaren Texttypen. Default 200."}},"required":["path"]}`),
+			Description: "Liest eine Datei im geteilten Ordner. Editierbare Typen (code, html, md, txt, …) liefern raw Content; andere Typen (pdf, office, …) den extrahierten Text. Bilder liefern eine VLM-Beschreibung. Große Dateien werden auf 500 Zeilen gekürzt — der Abschluss-Hinweis nennt die exakte Fortsetzungs-Zeile, mit der du die Datei vollständig in Abschnitten liest. Pfade relativ zum geteilten Ordner.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"},"offset":{"type":"integer","description":"Optional: erste Zeile (1-basiert). Nur bei editierbaren Texttypen. Default 1."},"limit":{"type":"integer","description":"Optional: Anzahl der Zeilen. Nur bei editierbaren Texttypen. Default 500."}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
 			Name:        "Meta",
@@ -2016,7 +2016,9 @@ func looksLikeImage(data []byte) bool {
 
 // readSegment liefert einen zeilenweisen Ausschnitt eines Text-Dokuments.
 // offset/limit sind 1-basiert. Tolerant: außerhalb des Bereichs liefert
-// die verfügbaren Zeilen + Hinweis statt Fehler.
+// die verfügbaren Zeilen + Hinweis statt Fehler. Bei Kürzung gibt der
+// Hinweis die exakte Fortsetzungs-Position an, damit das Modell die
+// Datei vollständig in Abschnitten lesen kann.
 func (s *Server) readSegment(data string, offset, limit int) (string, string) {
 	lines := strings.Split(data, "\n")
 	totalLines := len(lines)
@@ -2024,7 +2026,7 @@ func (s *Server) readSegment(data string, offset, limit int) (string, string) {
 		offset = 1
 	}
 	if limit < 1 {
-		limit = 200
+		limit = 500
 	}
 	if offset > totalLines {
 		// Tolerant: letzte `limit` Zeilen + Hinweis
@@ -2048,7 +2050,13 @@ func (s *Server) readSegment(data string, offset, limit int) (string, string) {
 	for i := offset - 1; i < end; i++ {
 		fmt.Fprintf(&sb, "%5d  %s\n", i+1, lines[i])
 	}
-	sb.WriteString(fmt.Sprintf("\n[%d von %d Zeilen gezeigt (Zeilen %d–%d)]", end-offset+1, totalLines, offset, end))
+	if end < totalLines {
+		// Angekürzt: exakte Fortsetzungs-Position nennen
+		sb.WriteString(fmt.Sprintf("\n[Zeilen %d–%d von %d Zeilen — FORTSETZUNG: Read mit offset=%d, limit=%d für den Rest]",
+			offset, end, totalLines, end+1, totalLines-end))
+	} else {
+		sb.WriteString(fmt.Sprintf("\n[Alle %d Zeilen gezeigt (Zeilen %d–%d)]", end-offset+1, offset, end))
+	}
 	return sb.String(), "segment"
 }
 
