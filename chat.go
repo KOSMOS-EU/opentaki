@@ -2851,10 +2851,16 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			hasher.Write([]byte{0})
 			hasher.Write([]byte(result))
 			contentHash := hex.EncodeToString(hasher.Sum(nil))
+			// Ein Fehler-Ergebnis ist nie "idempotent erfolgreich": Wenn der
+			// vorherige Edit/Write fehlschlug (z. B. Patch-Kontext nicht
+			// gefunden), darf das Modell den Call wiederholen — wir dürfen
+			// ihm nicht "bereits erfolgreich" melden. Nur ein ERFOLGREICHES
+			// Ergebnis (kein "Fehler:"-Präfix) wird als idempotent behandelt.
+			isError := strings.HasPrefix(result, "Fehler:") || trace.Error != ""
 			if seenContent, isDup := seenToolResults[contentHash]; isDup && seenContent == result {
 				consecutiveDuplicates++
-				if tc.Function.Name == "Write" || tc.Function.Name == "Edit" ||
-					tc.Function.Name == "Mkdir" || tc.Function.Name == "Rmdir" {
+				if !isError && (tc.Function.Name == "Write" || tc.Function.Name == "Edit" ||
+					tc.Function.Name == "Mkdir" || tc.Function.Name == "Rmdir") {
 					result = fmt.Sprintf("OK: Dieser %s-Call mit identischen Parametern wurde bereits "+
 						"erfolgreich ausgeführt (Ergebnis unverändert, %d Zeichen). Die Datei/der "+
 						"Zustand ist bereits aktualisiert. Beende den Turn mit einer Antwort "+
