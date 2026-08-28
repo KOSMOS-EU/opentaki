@@ -268,6 +268,11 @@ func chatWriteTools() []toolDefinition {
 			Description: "Entfernt ein LEERES Verzeichnis im Arbeitsbereich (Pfad relativ zur Root, z. B. \"projekt\"). Nicht-leere Verzeichnisse werden NICHT entfernt (Fehlermeldung).",
 			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad des Verzeichnisses relativ zur Arbeitsbereich-Root"}},"required":["path"]}`),
 		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "read_file_segment",
+			Description: "Liest einen zeilenweisen Ausschnitt einer Datei im Arbeitsbereich (raw, ohne Extraktion). Nutze das, um große Dateien in Teilen zu sehen, statt die gesamte Datei zu laden. Zeilen sind 1-basiert.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Arbeitsbereich-Root"},"offset":{"type":"integer","description":"Erste Zeile (1-basiert). Default 1."},"limit":{"type":"integer","description":"Anzahl der Zeilen. Default 200."}},"required":["path"]}`),
+		}},
 	}
 }
 
@@ -1199,6 +1204,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		Pattern string `json:"pattern"`
 		Extra   string `json:"extra"`
 		Limit   int    `json:"limit"`
+		Offset  int    `json:"offset"`
 		Content string `json:"content"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
@@ -1434,6 +1440,57 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			}
 		}
 		trace.Method = "propfind"
+		trace.Chars = len(sb.String())
+		trace.MS = time.Since(start).Milliseconds()
+		return sb.String(), trace
+
+	case "read_file_segment":
+		// Zeilenweiser Ausschnitt (raw, kein Extract). Nur bei Blank-Chat.
+		if d == nil {
+			trace.Error = "nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: read_file_segment ist nur im Arbeitsbereich verfügbar.", trace
+		}
+		data, _, err := d.getfile(relPath)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		if len(data) == 0 {
+			trace.Method = "empty"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Die Datei existiert, ist aber leer.", trace
+		}
+		lines := strings.Split(string(data), "\n")
+		totalLines := len(lines)
+		offset := args.Offset
+		if offset < 1 {
+			offset = 1
+		}
+		limit := args.Limit
+		if limit < 1 {
+			limit = 200
+		}
+		if offset > totalLines {
+			trace.Method = "segment"
+			trace.Chars = 0
+			trace.MS = time.Since(start).Milliseconds()
+			return fmt.Sprintf("[Datei hat %d Zeilen. offset %d ist außerhalb des Bereichs.]", totalLines, offset), trace
+		}
+		end := offset + limit - 1
+		if end > totalLines {
+			end = totalLines
+		}
+		// Zeilen mit Nummer prefixen (1-basiert)
+		var sb strings.Builder
+		for i := offset - 1; i < end; i++ {
+			fmt.Fprintf(&sb, "%5d  %s\n", i+1, lines[i])
+		}
+		footer := fmt.Sprintf("\n[%d von %d Zeilen gezeigt (Zeilen %d–%d)]", end-offset+1, totalLines, offset, end)
+		sb.WriteString(footer)
+		trace.Method = "segment"
+		trace.Path = relPath
 		trace.Chars = len(sb.String())
 		trace.MS = time.Since(start).Milliseconds()
 		return sb.String(), trace
