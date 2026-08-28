@@ -2481,9 +2481,6 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	var sysPrompt string
 	if isBlankChat {
 		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools mkdir (Verzeichnis anlegen), write_file (Datei erstellen/überschreiben) und rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
-		if searchAvailable {
-			writeTools += "Bei großen Ordnern: erst mit search_item (Dateien) oder search_dir (Verzeichnisse) suchen, statt alles aufzulisten. "
-		}
 		sysPrompt = renderChatBlankSystemPrompt(s, "workspace", writeTools)
 	} else {
 		folder := req.Context.FolderName
