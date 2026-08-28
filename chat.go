@@ -1176,17 +1176,19 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 // pathMatches vergleicht zwei WebDAV-URLs segmentweise (unescaped,
 // case-insensitive). Reva liefert Hrefs im response, deren Escaping
 // (%20 vs. Leerzeichen, doppelte slashes) vom Request-URL abweichen kann.
+// Relative Hrefs ("/dav/...") liefern bei url.Parse ein leeres Path —
+// daher den Slash-Pfad manuell extrahieren.
 func pathMatches(href, target string) bool {
 	var a, b []string
 	if u, err := url.Parse(href); err == nil {
-		a = strings.Split(u.Path, "/")
+		a = strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
 	} else {
-		a = []string{href}
+		a = strings.Split(strings.TrimPrefix(href, "/"), "/")
 	}
 	if u, err := url.Parse(target); err == nil {
-		b = strings.Split(u.Path, "/")
+		b = strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
 	} else {
-		b = []string{target}
+		b = strings.Split(strings.TrimPrefix(target, "/"), "/")
 	}
 	if len(a) != len(b) {
 		return false
