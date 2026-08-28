@@ -21,6 +21,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -2502,7 +2503,7 @@ func truncateChars(s string, n int) string {
 // loopBreakAnswer baut die finale Antwort nach einem serverseitigen
 // Loop-Stopp: eine Nachfrage, kein Fehler. Der Server meldet, was
 // bisher gesehen wurde, der User entscheidet, wie es weitergeht.
-func loopBreakAnswer(reason, lastTool, lastResult string) string {
+func loopBreakAnswer(reason, lastTool, lastResult string, isBlank bool) string {
 	s := "Ich komme mit der aktuellen Vorgabe nicht weiter: " + reason + ".\n"
 	if lastResult != "" {
 		toolNote := ""
@@ -2511,21 +2512,38 @@ func loopBreakAnswer(reason, lastTool, lastResult string) string {
 		}
 		s += "\nBisher gesehen" + toolNote + ":\n" + lastResult + "\n"
 	}
-	s += "\nWie möchtest du weitermachen? Zum Beispiel:\n" +
-		"1) Konkretisieren: präzisere Begriffe, Dokumenttyp (z. B. Rechnung, Bescheid) oder Zeitraum angeben.\n" +
-		"2) Limitieren: auf einen bestimmten Unterordner, Dateityp oder eine Ergebnisanzahl beschränken.\n" +
-		"3) Durchlaufen lassen: ich bewerte den Ordner komplett — das kann mehrere Minuten dauern."
+	if isBlank {
+		s += "\nWie möchtest du weitermachen? Zum Beispiel:\n" +
+			"1) Ich gebe die Änderung in ein paar Sätzen nochmal konkret an (welches Element, welches Verhalten).\n" +
+			"2) Du nimmst mit den bisher gefundenen Stellen eine sinnvolle Version vor und zeigst mir das Ergebnis.\n" +
+			"3) Du baust die Datei neu — ohne den bisherigen Stand zu erhalten."
+	} else {
+		s += "\nWie möchtest du weitermachen? Zum Beispiel:\n" +
+			"1) Konkretisieren: präzisere Begriffe, Dokumenttyp (z. B. Rechnung, Bescheid) oder Zeitraum angeben.\n" +
+			"2) Limitieren: auf einen bestimmten Unterordner, Dateityp oder eine Ergebnisanzahl beschränken.\n" +
+			"3) Durchlaufen lassen: ich bewerte den Ordner komplett — das kann mehrere Minuten dauern."
+	}
 	return s
 }
 
-// loopBreakOptions: die drei Standard-Optionen des serverseitigen
-// Loop-Abbruchs — klickbar für Extensions, die das "options"-Event
-// kennen. Der Text von loopBreakAnswer bleibt für ältere Clients
-// selbsterklärend.
-var loopBreakOptions = []string{
-	"Konkretisieren: Ich gebe jetzt präzisere Begriffe, Dokumenttyp (z. B. Rechnung, Bescheid) oder einen Zeitraum an.",
-	"Limitieren: Beschränke die Auswertung auf einen bestimmten Unterordner, Dateityp oder eine Ergebnisanzahl.",
-	"Durchlaufen lassen: Bewerte den Ordner komplett, das kann mehrere Minuten dauern.",
+// loopBreakOptions: die Standard-Optionen des serverseitigen Loop-Abbruchs
+// — klickbar für Extensions, die das "options"-Event kennen. Der Text von
+// loopBreakAnswer bleibt für ältere Clients selbsterklärend. Blank-Chat
+// (Code-Erstellung) bekommt Code-Optionen, Share-Chat (Dokumenten-Suche)
+// Such-Optionen.
+func loopBreakOptions(blank bool) []string {
+	if blank {
+		return []string{
+			"Konkretisieren: Ich beschreibe die Änderung noch einmal genau — welches Element, welches Verhalten, wo in der Datei.",
+			"Sinnvoll umsetzen: Nimm mit den bisher gefundenen Stellen eine sinnvolle Version vor und zeig mir das Ergebnis.",
+			"Neu bauen: Baue die Datei neu, ohne den bisherigen Stand zu erhalten.",
+		}
+	}
+	return []string{
+		"Konkretisieren: Ich gebe jetzt präzisere Begriffe, Dokumenttyp (z. B. Rechnung, Bescheid) oder einen Zeitraum an.",
+		"Limitieren: Beschränke die Auswertung auf einen bestimmten Unterordner, Dateityp oder eine Ergebnisanzahl.",
+		"Durchlaufen lassen: Bewerte den Ordner komplett, das kann mehrere Minuten dauern.",
+	}
 }
 
 // parsePresentOptions liest die Argumente von present_options
@@ -2667,11 +2685,12 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	toolTraces := make([]toolTrace, 0, 8)
 	answer := ""
 	iterations := 0
-	// Loop-Schutz: Tool-Calls mit identischen Parametern werden nicht
-	// erneut ausgeführt — sie liefern per Definition dasselbe Ergebnis.
-	// stattdessen erhält das Modell einen Hinweis, die Parameter zu
-	// ändern oder den User zu fragen.
-	seenToolCalls := map[string]int{}
+	// Loop-Schutz: Ein Duplikat = gleicher Call (tool + params) UND
+	// identisches Ergebnis-Content. Beide zusammen werden per SHA-256
+	// gehasht und in seenToolResults gespeichert. Gleicher Call mit
+	// ANDEREM Ergebnis ist KEIN Duplikat (z. B. FORTSETZUNG-Read, Grep
+	// der mehr/weniger Treffer liefert) — wird normal ausgeführt.
+	seenToolResults := map[string]string{}
 	// Nach 3 aufeinanderfolgenden Duplikaten bricht der Loop
 	// serverseitig ab — unabhängig vom Modell-Verhalten. Das letzte
 	// tatsächlich ausgeführte Tool + sein (gekürztes) Ergebnis werden
@@ -2817,42 +2836,41 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			callKey := tc.Function.Name + "\x00" + strings.TrimSpace(tc.Function.Arguments)
-			// Read: nur path als Key (offset/limit-Variationen umgehen sonst den Protector)
-			if tc.Function.Name == "Read" {
-				var readArgs struct {
-					Path string `json:"path"`
-				}
-				if json.Unmarshal([]byte(tc.Function.Arguments), &readArgs) == nil && readArgs.Path != "" {
-					callKey = "Read\x00" + readArgs.Path
-				}
-			}
 			var result string
 			var trace toolTrace
-			if prevChars, alreadyRun := seenToolCalls[callKey]; alreadyRun {
+			result, trace = s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
+			// Duplikat-Hash über ALLE relevanten Daten: Tool-Name,
+			// normalisierte Parameter und das Ergebnis-Content. SHA-256.
+			// Gleicher Hash wie zuvor = exakt derselbe Call mit exakt dem
+			// selben Ergebnis → echter Stillstand. Anderes Content (oder
+			// andere Parameter) = neuer Hash → kein Duplikat.
+			hasher := sha256.New()
+			hasher.Write([]byte(tc.Function.Name))
+			hasher.Write([]byte{0})
+			hasher.Write([]byte(strings.TrimSpace(tc.Function.Arguments)))
+			hasher.Write([]byte{0})
+			hasher.Write([]byte(result))
+			contentHash := hex.EncodeToString(hasher.Sum(nil))
+			if seenContent, isDup := seenToolResults[contentHash]; isDup && seenContent == result {
 				consecutiveDuplicates++
-				// Write-Tools sind idempotent: gleiche Parameter = gleiches
-				// Ergebnis. Statt "Wiederholung bringt nichts" melden wir
-				// Erfolg, damit das Modell den Turn beenden kann.
 				if tc.Function.Name == "Write" || tc.Function.Name == "Edit" ||
 					tc.Function.Name == "Mkdir" || tc.Function.Name == "Rmdir" {
 					result = fmt.Sprintf("OK: Dieser %s-Call mit identischen Parametern wurde bereits "+
-						"erfolgreich ausgeführt (letzte Ausführung: %d Zeichen). Die Datei/der "+
+						"erfolgreich ausgeführt (Ergebnis unverändert, %d Zeichen). Die Datei/der "+
 						"Zustand ist bereits aktualisiert. Beende den Turn mit einer Antwort "+
 						"an den User.",
-						tc.Function.Name, prevChars)
+						tc.Function.Name, len(result))
 				} else {
 					result = fmt.Sprintf("Wiederholung: Dieser Tool-Call (tool=%s, identische Parameter) "+
-						"wurde bereits ausgeführt und bringt kein neues Ergebnis (letzte Ausführung: "+
-						"%d Zeichen). Ändere die Parameter (z. B. anderes Pattern, anderes extra, "+
-						"anderer Pfad) oder beende den Turn mit einer Antwort bzw. Frage an den User.",
-						tc.Function.Name, prevChars)
+						"liefert exakt das selbe Ergebnis wie zuvor (%d Zeichen). Ändere die Parameter "+
+						"(z. B. anderes Pattern, anderer Pfad, anderer offset) oder beende den Turn "+
+						"mit einer Antwort bzw. Frage an den User.",
+						tc.Function.Name, len(result))
 				}
 				trace = toolTrace{Tool: tc.Function.Name, Method: "duplicate", Chars: len(result)}
 			} else {
 				consecutiveDuplicates = 0
-				result, trace = s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
-				seenToolCalls[callKey] = len(result)
+				seenToolResults[contentHash] = result
 				if result != "" {
 					lastRealTool = tc.Function.Name
 					lastRealResult = truncateChars(result, 1500)
@@ -2899,8 +2917,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		// im August-Fall) antworten mit Zwischenergebnis + Optionen.
 		if consecutiveDuplicates >= 3 {
 			log.Printf("chat/ask [%s]: loop-break nach %d aufeinanderfolgenden Duplikaten (iteration %d)", sessionID, consecutiveDuplicates, iterations)
-			answer = loopBreakAnswer("die gleiche Anfrage wiederholt lieferte kein neues Ergebnis (Wiederholungsschleife)", lastRealTool, lastRealResult)
-			loopOptions = loopBreakOptions
+			answer = loopBreakAnswer("die gleiche Anfrage wiederholt lieferte kein neues Ergebnis (Wiederholungsschleife)", lastRealTool, lastRealResult, isBlankChat)
+			loopOptions = loopBreakOptions(isBlankChat)
 			break
 		}
 
@@ -2913,8 +2931,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if answer == "" && iterations > 0 {
-		answer = loopBreakAnswer("die Maximalzahl an Iterationen erreicht wurde", lastRealTool, lastRealResult)
-		loopOptions = loopBreakOptions
+		answer = loopBreakAnswer("die Maximalzahl an Iterationen erreicht wurde", lastRealTool, lastRealResult, isBlankChat)
+		loopOptions = loopBreakOptions(isBlankChat)
 	}
 
 	resp := chatAskResponse{
