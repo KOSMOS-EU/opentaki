@@ -695,7 +695,7 @@ func strPtr(s string) *string { return &s }
 
 // llmChatTools führt einen Chat-Completion-Call mit Tools aus.
 // Liefert die Assistenten-Antwort (ggf. mit tool_calls) + FinishReason.
-func (s *Server) llmChatTools(model string, messages []chatToolMessage, tools []toolDefinition) (*chatToolMessage, string, error) {
+func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessage, tools []toolDefinition) (*chatToolMessage, string, error) {
 	s.llmSem <- struct{}{}        // acquire slot
 	defer func() { <-s.llmSem }() // release slot
 	t := s.llmTrackStart()
@@ -717,7 +717,7 @@ func (s *Server) llmChatTools(model string, messages []chatToolMessage, tools []
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		resp, err := s.client.Post(u, "application/json", bytes.NewReader(jsonData))
 		if err != nil {
-			log.Printf("chat LLM error (attempt %d/%d): %v", attempt+1, maxRetries, err)
+			log.Printf("chat LLM error [%s] (attempt %d/%d): %v", sessionID, attempt+1, maxRetries, err)
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
@@ -730,8 +730,8 @@ func (s *Server) llmChatTools(model string, messages []chatToolMessage, tools []
 
 		var chatResp chatToolsResponse
 		if err := json.Unmarshal(respBody, &chatResp); err != nil {
-			log.Printf("chat LLM response parse error (HTTP %d, attempt %d/%d): %v (raw: %.300s)",
-				resp.StatusCode, attempt+1, maxRetries, err, string(respBody))
+			log.Printf("chat LLM response parse error [%s] (HTTP %d, attempt %d/%d): %v (raw: %.300s)",
+				sessionID, resp.StatusCode, attempt+1, maxRetries, err, string(respBody))
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
@@ -748,8 +748,8 @@ func (s *Server) llmChatTools(model string, messages []chatToolMessage, tools []
 		}
 
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			log.Printf("chat LLM HTTP %d (attempt %d/%d), retrying in %v",
-				resp.StatusCode, attempt+1, maxRetries, backoff[attempt])
+			log.Printf("chat LLM HTTP %d [%s] (attempt %d/%d), retrying in %v",
+				resp.StatusCode, sessionID, attempt+1, maxRetries, backoff[attempt])
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
@@ -757,8 +757,8 @@ func (s *Server) llmChatTools(model string, messages []chatToolMessage, tools []
 			return nil, "", fmt.Errorf("LLM-Backend fehlerhaft (HTTP %d)", resp.StatusCode)
 		}
 
-		log.Printf("chat LLM empty response (attempt %d/%d, model=%s, backend=%s, HTTP %d, raw: %.300s)",
-			attempt+1, maxRetries, model, resp.Header.Get("X-Backend"), resp.StatusCode, string(respBody))
+		log.Printf("chat LLM empty response [%s] (attempt %d/%d, model=%s, backend=%s, HTTP %d, raw: %.300s)",
+			sessionID, attempt+1, maxRetries, model, resp.Header.Get("X-Backend"), resp.StatusCode, string(respBody))
 		if attempt < maxRetries-1 {
 			time.Sleep(backoff[attempt])
 			continue
@@ -2534,8 +2534,9 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	log.Printf("chat/ask: blank=%v folder=%q model=%s messages=%d stream=%v search=%v question=%q",
-		isBlankChat, req.Context.FolderName, model, len(req.Messages), req.Stream, searchAvailable, truncateChars(lastUserQuestion, 200))
+	sessionID := fmt.Sprintf("c%04x", time.Now().UnixNano()&0xffffff)
+	log.Printf("chat/ask [%s]: blank=%v folder=%q model=%s messages=%d stream=%v search=%v question=%q",
+		sessionID, isBlankChat, req.Context.FolderName, model, len(req.Messages), req.Stream, searchAvailable, truncateChars(lastUserQuestion, 200))
 
 	// Stream: Live-Fortschritt per SSE. Client-Disconnect bricht die
 	// Iterationen ab. Nicht-flushbarer Writer → Fallback auf JSON-Antwort.
@@ -2576,7 +2577,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		// Toter Client: abgebrochene Verbindung soll keine LLM-Iterationen
 		// mehr verbrennen.
 		if r.Context().Err() != nil {
-			log.Printf("chat/ask: Client-Verbindung abgebrochen, Abbruch nach %d Iteration(en)", iterations-1)
+			log.Printf("chat/ask [%s]: Client-Verbindung abgebrochen, Abbruch nach %d Iteration(en)", sessionID, iterations-1)
 			return
 		}
 		if stream {
@@ -2584,7 +2585,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		msg, finishReason, err := s.llmChatTools(model, messages, tools)
+		msg, finishReason, err := s.llmChatTools(sessionID, model, messages, tools)
 		if err != nil {
 			if stream {
 				sse.event("error", map[string]string{"error": err.Error()})
@@ -2631,8 +2632,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					result = "Die Optionen werden dem User angezeigt; der Turn endet."
 					trace.Chars = len(answer)
 				}
-				log.Printf("chat/ask: tool=present_options valid=%v options=%d args=%q",
-					optionsValid, len(options), tc.Function.Arguments)
+				log.Printf("chat/ask [%s]: tool=present_options valid=%v options=%d args=%q",
+					sessionID, optionsValid, len(options), tc.Function.Arguments)
 				toolTraces = append(toolTraces, trace)
 				if stream {
 					if err := sse.event("tool", map[string]interface{}{
@@ -2700,8 +2701,8 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			}
 			// args = die exakte Anfrage (auch bei Duplikaten, die runChatTool
 			// nie erreichen und daher leere trace-Felder haben).
-			log.Printf("chat/ask: tool=%s args=%q path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
-				tc.Function.Name, tc.Function.Arguments, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
+			log.Printf("chat/ask [%s]: tool=%s args=%q path=%q pattern=%q extra=%q ms=%d chars=%d truncated=%v err=%q",
+				sessionID, tc.Function.Name, tc.Function.Arguments, trace.Path, trace.Pattern, trace.Extra, trace.MS, trace.Chars, trace.Truncated, trace.Error)
 			// Duplikate erreichen nur Modell (als Hint) und Journal —
 			// nicht den UI-Trace, um verwirrende Wiedereinträge zu vermeiden.
 			if trace.Method != "duplicate" {
@@ -2738,7 +2739,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		// kein neues Ergebnis. Statt blind weiterzulaufen (970 Iterationen
 		// im August-Fall) antworten mit Zwischenergebnis + Optionen.
 		if consecutiveDuplicates >= 3 {
-			log.Printf("chat/ask: loop-break nach %d aufeinanderfolgenden Duplikaten (iteration %d)", consecutiveDuplicates, iterations)
+			log.Printf("chat/ask [%s]: loop-break nach %d aufeinanderfolgenden Duplikaten (iteration %d)", sessionID, consecutiveDuplicates, iterations)
 			answer = loopBreakAnswer("die gleiche Anfrage wiederholt lieferte kein neues Ergebnis (Wiederholungsschleife)", lastRealTool, lastRealResult)
 			loopOptions = loopBreakOptions
 			break

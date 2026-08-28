@@ -3925,7 +3925,13 @@ func (s *Server) llmDescribeWithBackend(imagePath, prompt string) (string, strin
 		{Type: "image_url", ImageURL: &imageURL{URL: "data:" + mediaType + ";base64," + b64}},
 	}
 	// OCR stage (grounded bbox OCR, VLM text OCR, CAD reading) — uses ocr.model
-	return s.llmCompleteOCRWithBackend([]chatMessage{{Role: "user", Content: content}})
+	sessionID := fmt.Sprintf("o%04x", time.Now().UnixNano()&0xffffff)
+	log.Printf("ocr/llm [%s]: file=%s (%d bytes, %s)", sessionID, filepath.Base(imagePath), len(imgData), mediaType)
+	return s.llmCompleteOCRSession(sessionID, []chatMessage{{Role: "user", Content: content}})
+}
+
+func (s *Server) llmCompleteOCRSession(sessionID string, messages []chatMessage) (string, string) {
+	return s.llmCompleteOptsBackendModelSession(sessionID, messages, nil, nil, "", s.ocrModel())
 }
 
 func (s *Server) llmVision(dataURL, prompt string) string {
@@ -4015,7 +4021,8 @@ func (s *Server) ocrModel() string {
 // (fallback llm.model). All llmDescribe* calls (page OCR, grounded bbox
 // OCR, CAD vision) go through here.
 func (s *Server) llmCompleteOCRWithBackend(messages []chatMessage) (string, string) {
-	return s.llmCompleteOptsBackendModel(messages, nil, nil, "", s.ocrModel())
+	sessionID := fmt.Sprintf("o%04x", time.Now().UnixNano()&0xffffff)
+	return s.llmCompleteOptsBackendModelSession(sessionID, messages, nil, nil, "", s.ocrModel())
 }
 
 func (s *Server) llmCompleteOptsTrace(messages []chatMessage, rf *responseFormat, tc *traceCtx, label string) string {
@@ -4028,6 +4035,11 @@ func (s *Server) llmCompleteOptsBackend(messages []chatMessage, rf *responseForm
 }
 
 func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *responseFormat, tc *traceCtx, label, model string) (string, string) {
+	sessionID := fmt.Sprintf("%s%04x", strings.TrimSpace(label[:1]), time.Now().UnixNano()&0xffffff)
+	return s.llmCompleteOptsBackendModelSession(sessionID, messages, rf, tc, label, model)
+}
+
+func (s *Server) llmCompleteOptsBackendModelSession(sessionID string, messages []chatMessage, rf *responseFormat, tc *traceCtx, label, model string) (string, string) {
 	s.llmSem <- struct{}{}        // acquire slot
 	defer func() { <-s.llmSem }() // release slot
 	t := s.llmTrackStart()
@@ -4054,7 +4066,7 @@ func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *respons
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		resp, err := s.client.Post(url, "application/json", bytes.NewReader(jsonData))
 		if err != nil {
-			log.Printf("LLM error (attempt %d/%d): %v", attempt+1, maxRetries, err)
+			log.Printf("LLM error [%s] (attempt %d/%d): %v", sessionID, attempt+1, maxRetries, err)
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
@@ -4069,8 +4081,8 @@ func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *respons
 
 		var chatResp chatResponse
 		if err := json.Unmarshal(respBody, &chatResp); err != nil {
-			log.Printf("LLM response parse error (HTTP %d, attempt %d/%d, backend=%s): %v (raw: %.300s)",
-				resp.StatusCode, attempt+1, maxRetries, backend, err, string(respBody))
+			log.Printf("LLM response parse error [%s] (HTTP %d, attempt %d/%d, backend=%s): %v (raw: %.300s)",
+				sessionID, resp.StatusCode, attempt+1, maxRetries, backend, err, string(respBody))
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
@@ -4088,8 +4100,8 @@ func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *respons
 		}
 
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
-			log.Printf("LLM HTTP %d (attempt %d/%d, backend=%s), retrying in %v",
-				resp.StatusCode, attempt+1, maxRetries, backend, backoff[attempt])
+			log.Printf("LLM HTTP %d [%s] (attempt %d/%d, backend=%s), retrying in %v",
+				resp.StatusCode, sessionID, attempt+1, maxRetries, backend, backoff[attempt])
 			if attempt < maxRetries-1 {
 				time.Sleep(backoff[attempt])
 				continue
@@ -4097,8 +4109,8 @@ func (s *Server) llmCompleteOptsBackendModel(messages []chatMessage, rf *respons
 			return "", backend
 		}
 
-		log.Printf("LLM empty response (attempt %d/%d, backend=%s, HTTP %d, raw: %.300s)",
-			attempt+1, maxRetries, backend, resp.StatusCode, string(respBody))
+		log.Printf("LLM empty response [%s] (attempt %d/%d, backend=%s, HTTP %d, raw: %.300s)",
+			sessionID, attempt+1, maxRetries, backend, resp.StatusCode, string(respBody))
 		if attempt < maxRetries-1 {
 			time.Sleep(backoff[attempt])
 			continue
