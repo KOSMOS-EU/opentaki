@@ -1206,6 +1206,16 @@ func pathMatches(href, target string) bool {
 	return true
 }
 
+// keys: Sortierte Map-Keys (nur für Logging).
+func keys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
 // getfile lädt eine Datei (max. maxShareBytes) und liefert Bytes + Content-Type.
 func (d *shareWebDav) getfile(relPath string) ([]byte, string, error) {
 	resp, err := d.do("GET", d.urlFor(relPath), -1, nil)
@@ -1879,11 +1889,14 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		// oft nur einen Bruchteil — der Size-Header ist die Wahrheit).
 		fileSize := int64(-1)
 		if meta, metaErr := d.propfindMeta(relPath); metaErr == nil {
+			log.Printf("DEBUG propfindMeta rel=%q err=nil meta_keys=%v gcl=%q", relPath, keys(meta), meta["getcontentlength"])
 			if sz := meta["getcontentlength"]; sz != "" {
 				if n, convErr := strconv.ParseInt(sz, 10, 64); convErr == nil {
 					fileSize = n
 				}
 			}
+		} else {
+			log.Printf("DEBUG propfindMeta rel=%q err=%q", relPath, metaErr.Error())
 		}
 		data, ct, err := d.getfile(relPath)
 		if err != nil {
