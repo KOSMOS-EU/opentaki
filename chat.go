@@ -2651,11 +2651,23 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			var trace toolTrace
 			if prevChars, alreadyRun := seenToolCalls[callKey]; alreadyRun {
 				consecutiveDuplicates++
-				result = fmt.Sprintf("Wiederholung: Dieser Tool-Call (tool=%s, identische Parameter) "+
-					"wurde bereits ausgeführt und bringt kein neues Ergebnis (letzte Ausführung: "+
-					"%d Zeichen). Ändere die Parameter (z. B. anderes Pattern, anderes extra, "+
-					"anderer Pfad) oder beende den Turn mit einer Antwort bzw. Frage an den User.",
-					tc.Function.Name, prevChars)
+				// Write-Tools sind idempotent: gleiche Parameter = gleiches
+				// Ergebnis. Statt "Wiederholung bringt nichts" melden wir
+				// Erfolg, damit das Modell den Turn beenden kann.
+				if tc.Function.Name == "write_file" || tc.Function.Name == "patch_file" ||
+					tc.Function.Name == "mkdir" || tc.Function.Name == "rmdir" {
+					result = fmt.Sprintf("OK: Dieser %s-Call mit identischen Parametern wurde bereits "+
+						"erfolgreich ausgeführt (letzte Ausführung: %d Zeichen). Die Datei/der "+
+						"Zustand ist bereits aktualisiert. Beende den Turn mit einer Antwort "+
+						"an den User.",
+						tc.Function.Name, prevChars)
+				} else {
+					result = fmt.Sprintf("Wiederholung: Dieser Tool-Call (tool=%s, identische Parameter) "+
+						"wurde bereits ausgeführt und bringt kein neues Ergebnis (letzte Ausführung: "+
+						"%d Zeichen). Ändere die Parameter (z. B. anderes Pattern, anderes extra, "+
+						"anderer Pfad) oder beende den Turn mit einer Antwort bzw. Frage an den User.",
+						tc.Function.Name, prevChars)
+				}
 				trace = toolTrace{Tool: tc.Function.Name, Method: "duplicate", Chars: len(result)}
 			} else {
 				consecutiveDuplicates = 0
