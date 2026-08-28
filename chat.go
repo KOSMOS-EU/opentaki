@@ -1074,36 +1074,22 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 
+	// WICHTIG: mit allprop liefert Reva ein multistatus mit EINEM response
+	// pro Pfadsegment (alle Eltern + das Ziel). Nur der response, dessen
+	// <d:href> dem Ziel-Pfad entspricht, enthält die Metadaten der Datei —
+	// die Elterncollections haben getcontentlength=0 und doc.* leer.
+	// Wir parsen daher pro response und nehmen nur den Ziel-Href.
 	const ocNS = "http://owncloud.org/ns"
 	const davNS = "DAV:"
 	wantBare := map[string]bool{"summary": true, "subject": true, "tags": true}
 	// DAV-Elemente die wir ausserhalb des oc-NS brauchen
 	wantDAV := map[string]bool{"getcontentlength": true, "getcontenttype": true}
-	meta := map[string]string{}
 
+	meta := map[string]string{}
 	dec := xml.NewDecoder(bytes.NewReader(data))
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			break
-		}
-		start, ok := tok.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		// oc-NS: doc.* Felder + bare summary/subject/tags
-		if start.Name.Space == ocNS {
-			if !strings.Contains(start.Name.Local, ".") && !wantBare[start.Name.Local] {
-				continue
-			}
-		} else if start.Name.Space == davNS {
-			if !wantDAV[start.Name.Local] {
-				continue
-			}
-		} else {
-			continue
-		}
-		// Elementinhalt lesen (bis zum passenden EndElement)
+
+	// elementText liest den Chardate-Inhalt eines Elements (bis EndElement).
+	elementText := func() string {
 		var val string
 		depth := 1
 		for depth > 0 {
@@ -1123,11 +1109,99 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 				}
 			}
 		}
-		if v := strings.TrimSpace(val); v != "" {
-			meta[start.Name.Local] = v
+		return strings.TrimSpace(val)
+	}
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if start.Name.Space == davNS && start.Name.Local == "response" {
+			// Einen kompletten <d:response> puffschen: Href erfassen,
+			// erkannte Metadaten sammeln, am Ende nur bei Ziel-Href übernehmen.
+			var respHref string
+			var respMeta map[string]string
+			depth := 1
+			for depth > 0 {
+				t, err := dec.Token()
+				if err != nil {
+					depth = 0
+					break
+				}
+				switch tt := t.(type) {
+				case xml.StartElement:
+					switch {
+					case tt.Name.Space == davNS && tt.Name.Local == "href":
+						respHref = elementText()
+					case tt.Name.Space == ocNS:
+						if !strings.Contains(tt.Name.Local, ".") && !wantBare[tt.Name.Local] {
+							continue
+						}
+						if respMeta == nil {
+							respMeta = map[string]string{}
+						}
+						if v := elementText(); v != "" {
+							respMeta[tt.Name.Local] = v
+						}
+					case tt.Name.Space == davNS && wantDAV[tt.Name.Local]:
+						if respMeta == nil {
+							respMeta = map[string]string{}
+						}
+						if v := elementText(); v != "" {
+							respMeta[tt.Name.Local] = v
+						}
+					}
+					depth++
+				case xml.EndElement:
+					depth--
+				}
+			}
+			// Nur der response des Ziel-Pfads zählt (Hrefs können
+			// unterschiedlich escaped sein → Segment-Vergleich).
+			if pathMatches(respHref, d.urlFor(relPath)) && respMeta != nil {
+				for k, v := range respMeta {
+					meta[k] = v
+				}
+			}
 		}
 	}
 	return meta, nil
+}
+
+// pathMatches vergleicht zwei WebDAV-URLs segmentweise (unescaped,
+// case-insensitive). Reva liefert Hrefs im response, deren Escaping
+// (%20 vs. Leerzeichen, doppelte slashes) vom Request-URL abweichen kann.
+func pathMatches(href, target string) bool {
+	var a, b []string
+	if u, err := url.Parse(href); err == nil {
+		a = strings.Split(u.Path, "/")
+	} else {
+		a = []string{href}
+	}
+	if u, err := url.Parse(target); err == nil {
+		b = strings.Split(u.Path, "/")
+	} else {
+		b = []string{target}
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		av, aerr := url.PathUnescape(a[i])
+		bv, berr := url.PathUnescape(b[i])
+		if aerr != nil || berr != nil {
+			av, bv = a[i], b[i]
+		}
+		if !strings.EqualFold(av, bv) {
+			return false
+		}
+	}
+	return true
 }
 
 // getfile lädt eine Datei (max. maxShareBytes) und liefert Bytes + Content-Type.
@@ -1812,6 +1886,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		data, ct, err := d.getfile(relPath)
 		if err != nil {
 			trace.Error = err.Error()
+			trace.FileSize = fileSize
 			trace.MS = time.Since(start).Milliseconds()
 			// 404: verfügbare Einträge der übergeordneten Ebene liefern
 			if strings.Contains(err.Error(), "nicht gefunden") && relPath != "" {
@@ -1841,22 +1916,23 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Die Datei existiert, ist aber leer (0 Bytes).", trace
 		}
-		// Bild: VLM-Beschreibung
-		if strings.HasPrefix(strings.ToLower(ct), "image/") || looksLikeImage(data) {
-			text, method := s.extractImage(data, ct)
-			if text == "" {
-				trace.Method = method
-				trace.Error = "Bild konnte nicht beschrieben werden"
-				trace.MS = time.Since(start).Milliseconds()
-				return "Fehler: Bild konnte nicht beschrieben werden", trace
-			}
-			trace.Method = method
-			trace.Chars = len(text)
-			trace.MS = time.Since(start).Milliseconds()
-			return text, trace
-		}
-		// Editierbare Texttypen: raw (mit optionaler Segmentierung)
+		// Editierbare Texttypen: raw (mit optionaler Segmentierung).
+		// WICHTIG: vor dem Bild-Check! looksLikeImage() erkennt jede Datei,
+		// die mit "<?xml" oder "<svg" beginnt, als Bild — trifft also auf
+		// ALLE XHTML/XML-Dateien zu. Editierbare Dateien sind immer Text:
+		// nur wenn der Content-Type ein echtes binäres Bild angibt (kein SVG),
+		// darf der VLM-Pfad greifen.
 		if s.cfg.Chat.isEditableFile(relPath) {
+			if ctIsBinaryImage(ct) {
+				text, method := s.extractImage(data, ct)
+				if text != "" {
+					trace.Method = method
+					trace.Chars = len(text)
+					trace.MS = time.Since(start).Milliseconds()
+					return text, trace
+				}
+				// VLM fehlgeschlagen → als Text behandeln (roher Inhalt).
+			}
 			text, method := s.readSegment(string(data), args.Offset, args.Limit)
 			if text == "" {
 				trace.Method = method
@@ -1873,6 +1949,20 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 				text += fmt.Sprintf("\n\n[Hinweis: Nur %d von %d Bytes empfangen — die Datei ist unvollständig geladen. "+
 					"Versuche es erneut oder lies mit offset/limit in Abschnitten.]", len(data), fileSize)
 			}
+			return text, trace
+		}
+		// Bild: VLM-Beschreibung (nur für nicht-editierbare Dateien)
+		if strings.HasPrefix(strings.ToLower(ct), "image/") || looksLikeImage(data) {
+			text, method := s.extractImage(data, ct)
+			if text == "" {
+				trace.Method = method
+				trace.Error = "Bild konnte nicht beschrieben werden"
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: Bild konnte nicht beschrieben werden", trace
+			}
+			trace.Method = method
+			trace.Chars = len(text)
+			trace.MS = time.Since(start).Milliseconds()
 			return text, trace
 		}
 		// Nicht-editierbar: s.extract (pandoc, pdftotext, etc.)
@@ -2047,6 +2137,17 @@ func looksLikeImage(data []byte) bool {
 		return true
 	}
 	return false
+}
+
+// ctIsBinaryImage: Content-Type ist ein echtes rastergrafik-Bild.
+// SVG (image/svg+xml) ist TEXT — wird hier bewusst nicht erfasst, damit
+// editierbare SVG-Dateien über den Raw-Text-Pfad gelesen werden.
+func ctIsBinaryImage(ct string) bool {
+	t := strings.ToLower(ct)
+	if !strings.HasPrefix(t, "image/") {
+		return false
+	}
+	return !strings.Contains(t, "svg")
 }
 
 // readSegment liefert einen zeilenweisen Ausschnitt eines Text-Dokuments.
