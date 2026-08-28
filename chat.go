@@ -1359,7 +1359,15 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			trace.MS = time.Since(start).Milliseconds()
 			return "Die Datei existiert, ist aber leer (0 Bytes).", trace
 		}
-		text, method := s.extract(data, ct)
+		// HTML/XHTML: raw an das Modell (pandoc würde Tags entfernen und
+		// nur den sichtbaren Text liefern — der Code geht verloren).
+		ctLower := strings.ToLower(ct)
+		var text, method string
+		if strings.Contains(ctLower, "text/html") || strings.Contains(ctLower, "xhtml") {
+			text, method = string(data), "raw-html"
+		} else {
+			text, method = s.extract(data, ct)
+		}
 		if strings.HasPrefix(method, "error") || text == "" {
 			trace.Method = method
 			trace.Error = "Inhalt konnte nicht extrahiert werden"
