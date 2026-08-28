@@ -415,9 +415,22 @@ type egrepHit struct {
 // falls die Treffer-Limit erreicht wurde.
 func (s *Server) egrepWalk(d *shareWebDav, rootRel string, re *regexp.Regexp, limit int) ([]egrepHit, int, bool) {
 	maxDepth := s.cfg.Chat.ListDepth
-	entries, _, entryCut, err := d.propfindTree(rootRel, maxDepth, s.cfg.Chat.MaxListings)
-	if err != nil {
-		return nil, 0, false
+	var entries []walkEntry
+	var entryCut bool
+	if rootRel != "" {
+		// Grep auf einer DIREKTEN Datei: propfindTree listet nur
+		// Verzeichnisinhalt → eine Dateipfad liefert keine Einträge.
+		// Daher die Datei selbst als Eintrag nehmen und scannen.
+		meta, mErr := d.propfindMeta(rootRel)
+		if mErr != nil || meta["getcontenttype"] == "" {
+			// Kein Meta → kein Dateipfad (oder nicht vorhanden) →
+			// reguläres Verzeichnis-Listing versuchen.
+			entries, _, entryCut, _ = d.propfindTree(rootRel, maxDepth, s.cfg.Chat.MaxListings)
+		} else {
+			entries = []walkEntry{{Rel: rootRel, IsDir: false}}
+		}
+	} else {
+		entries, _, entryCut, _ = d.propfindTree(rootRel, maxDepth, s.cfg.Chat.MaxListings)
 	}
 	var hits []egrepHit
 	filesScanned := 0
