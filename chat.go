@@ -1088,6 +1088,10 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 	meta := map[string]string{}
 	dec := xml.NewDecoder(bytes.NewReader(data))
 
+	debug := true // TEMP
+	if debug {
+		log.Printf("DEBUG propfindMeta BODY=%s", string(data))
+	}
 	// elementText liest den Chardate-Inhalt eines Elements (bis EndElement).
 	elementText := func() string {
 		var val string
@@ -1163,7 +1167,11 @@ func (d *shareWebDav) propfindMeta(relPath string) (map[string]string, error) {
 			}
 			// Nur der response des Ziel-Pfads zählt (Hrefs können
 			// unterschiedlich escaped sein → Segment-Vergleich).
-			if pathMatches(respHref, d.urlFor(relPath)) && respMeta != nil {
+			matched := pathMatches(respHref, d.urlFor(relPath))
+			if debug {
+				log.Printf("DEBUG respHref=%q target=%q matched=%v respMeta_keys=%v", respHref, d.urlFor(relPath), matched, keys(respMeta))
+			}
+			if matched && respMeta != nil {
 				for k, v := range respMeta {
 					meta[k] = v
 				}
