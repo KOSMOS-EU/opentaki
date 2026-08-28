@@ -1783,6 +1783,27 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
+			// 404: verfügbare Einträge der übergeordneten Ebene liefern
+			if strings.Contains(err.Error(), "nicht gefunden") && relPath != "" {
+				parentPath := relPath
+				if idx := strings.LastIndex(relPath, "/"); idx > 0 {
+					parentPath = relPath[:idx]
+				} else {
+					parentPath = ""
+				}
+				if entries, _, _, listErr := d.propfindTree(parentPath, 1, 50); listErr == nil && len(entries) > 0 {
+					var sb strings.Builder
+					sb.WriteString(fmt.Sprintf("Fehler: %s nicht gefunden.\nVerfügbare Einträge in %s:\n", relPath, relPathOrRoot(parentPath)))
+					for _, e := range entries {
+						line := "  " + e.Rel
+						if e.IsDir {
+							line += "/"
+						}
+						sb.WriteString(line + "\n")
+					}
+					return sb.String(), trace
+				}
+			}
 			return "Fehler: " + err.Error(), trace
 		}
 		if len(data) == 0 {
@@ -2624,6 +2645,15 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			callKey := tc.Function.Name + "\x00" + strings.TrimSpace(tc.Function.Arguments)
+			// Read: nur path als Key (offset/limit-Variationen umgehen sonst den Protector)
+			if tc.Function.Name == "Read" {
+				var readArgs struct {
+					Path string `json:"path"`
+				}
+				if json.Unmarshal([]byte(tc.Function.Arguments), &readArgs) == nil && readArgs.Path != "" {
+					callKey = "Read\x00" + readArgs.Path
+				}
+			}
 			var result string
 			var trace toolTrace
 			if prevChars, alreadyRun := seenToolCalls[callKey]; alreadyRun {
