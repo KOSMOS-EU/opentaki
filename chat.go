@@ -344,10 +344,48 @@ func hunkResult(hunkBody []string, oldPos int, currentLines []string) []string {
 	return out
 }
 
+// normalizeHunkLine normalisiert eine Zeile für den Kontext-Abgleich:
+// Tabs → 4 Spaces (häufigstes Modell-Fehler: Tab im Patch, Spaces in der
+// Datei oder umgekehrt). Trailing \r wird entfernt. Die Space-Anzahl bleibt
+// exakt — ein Indent-Fehler (2 vs. 4 Spaces) ist kein Tab-Problem und wird
+// NICHT verschluckt, sondern als echter Kontext-Abgleich-Fehler gemeldet.
+func normalizeHunkLine(s string) string {
+	s = strings.TrimRight(s, "\r")
+	return strings.ReplaceAll(s, "\t", "    ")
+}
+
+// firstMismatchedKontextLine findet bei Position pos die erste Kontext-
+// zeile, die nicht matcht, und liefert (patchLine, fileLine, fileLineNo).
+// Nur für den Fehler-Hinweis.
+func firstMismatchedKontextLine(currentLines []string, pos int, hunkBody []string) (string, string, int) {
+	p := pos
+	for idx, body := range hunkBody {
+		if body == "" {
+			continue
+		}
+		switch body[0] {
+		case ' ', '-':
+			expected := normalizeHunkLine(body[1:])
+			if p >= len(currentLines) {
+				return body, "<Außerhalb der Datei>", p + 1
+			}
+			actual := normalizeHunkLine(currentLines[p])
+			if expected != actual {
+				return body, currentLines[p], p + 1
+			}
+			p++
+		}
+		_ = idx
+	}
+	return "", "", 0
+}
+
 // applyHunkAt prüft, ob der Hunk bei Position startPos (0-basiert) in
 // currentLines passt. Bei Nichtpassgen wird vor/zurück gesucht
 // (max. 50 Zeilen, wie patch(1)). Liefert die verwendete Position und die
-// Anzahl geänderter Zeilen.
+// Anzahl geänderter Zeilen. Der Fehler-Hinweis zeigt die erste nicht-
+// machende Kontextzeile (Patch vs. Datei) — das Modell kann so einen
+// Indent-Fehler korrigieren, statt blind denselben Patch zu wiederholen.
 func applyHunkAt(currentLines []string, startPos int, hunkBody []string) (int, int, error) {
 	if startPos < 0 {
 		startPos = 0
@@ -360,13 +398,9 @@ func applyHunkAt(currentLines []string, startPos int, hunkBody []string) (int, i
 				continue
 			}
 			switch body[0] {
-			case ' ':
-				if p >= len(currentLines) || strings.TrimRight(currentLines[p], "\r") != strings.TrimRight(body[1:], "\r") {
-					return false
-				}
-				p++
-			case '-':
-				if p >= len(currentLines) || strings.TrimRight(currentLines[p], "\r") != strings.TrimRight(body[1:], "\r") {
+			case ' ', '-':
+				if p >= len(currentLines) ||
+					normalizeHunkLine(currentLines[p]) != normalizeHunkLine(body[1:]) {
 					return false
 				}
 				p++
@@ -397,6 +431,13 @@ func applyHunkAt(currentLines []string, startPos int, hunkBody []string) (int, i
 		if matchesAt(startPos + offset) {
 			return startPos + offset, changed, nil
 		}
+	}
+	// Konkreter Fehler-Hinweis: welche Kontextzeile matcht nicht?
+	patchLine, fileLine, fileLineNo := firstMismatchedKontextLine(currentLines, startPos, hunkBody)
+	if patchLine != "" {
+		return 0, 0, fmt.Errorf(
+			"Hunk-Kontext nicht gefunden (Startzeile %d). Erste abweichende Kontextzeile: Patch hat %q, Datei hat Zeile %d %q. Prüfe den Indent/Whitespace mit Read.",
+			startPos+1, truncateForErr(patchLine), fileLineNo, truncateForErr(fileLine))
 	}
 	return 0, 0, fmt.Errorf(
 		"Hunk-Kontext wurde in der Datei nicht gefunden (Startzeile %d). Nutze Read für den aktuellen Stand.",
