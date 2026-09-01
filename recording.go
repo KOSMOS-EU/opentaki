@@ -74,13 +74,23 @@ type RecordingSession struct {
 }
 
 type RecordingFrag struct {
-	Index    int     `json:"index"`
-	Text     string  `json:"text"`
-	Speaker  string  `json:"speaker"`
-	Start    float64 `json:"start"`
-	End      float64 `json:"end"`
-	Duration float64 `json:"duration"`
-	Status   string  `json:"status"` // "processing" | "done" | "failed"
+	Index    int              `json:"index"`
+	Text     string           `json:"text"`
+	Speaker  string           `json:"speaker"` // dominanter Speaker (Fallback)
+	Start    float64          `json:"start"`
+	End      float64          `json:"end"`
+	Duration float64          `json:"duration"`
+	Status   string           `json:"status"` // "processing" | "done" | "failed"
+	Segments []FragSpeakerSeg `json:"segments,omitempty"` // Speaker-Segmente nach Diarization
+}
+
+// FragSpeakerSeg ist ein Speaker-Segment innerhalb eines Fragments.
+// Wird nach der Session-End-Diarization per Zeit-Overlap berechnet.
+type FragSpeakerSeg struct {
+	Speaker string  `json:"speaker"`
+	Start   float64 `json:"start"` // relative Zeit im Fragment (Sekunden)
+	End     float64 `json:"end"`
+	Text    string  `json:"text"` // Text-Anteil (proportional zur Dauer)
 }
 
 type SpeakerProfile struct {
@@ -114,6 +124,10 @@ func sseWrite(w http.ResponseWriter, flusher http.Flusher, event map[string]any)
 	if flusher != nil {
 		flusher.Flush()
 	}
+}
+
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
 }
 
 // ── RMS-VAD (server-seitig) ──────────────────────────────────
@@ -364,6 +378,12 @@ func (s *Server) handleRecordingSession(w http.ResponseWriter, r *http.Request) 
 		s.recMu.Lock()
 		s.sessions[sessionID] = session
 		s.recMu.Unlock()
+
+		// WebDAV-Verzeichnisse sofort anlegen (MKCOL), damit Fragment-Uploads
+		// während der Aufnahme funktionieren.
+		if body.Share.Token != "" {
+			go s.webdavEnsureDirs(session)
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(session)
@@ -653,6 +673,11 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		}
 
 		session.addFragment(fragmentIdx, text, "unknown", fragDuration, fragAudioLen)
+
+		// Fragment-Audio asynchron per WebDAV hochladen (crash-safe)
+		if session.shareToken != "" {
+			go s.webdavUploadFragment(session, fragmentIdx, fragAudio)
+		}
 
 		sseWrite(w, flusher, map[string]any{
 			"type":     "final",
@@ -978,23 +1003,88 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		}
 	}
 
-	// 3. Pro Fragment: dominante Speaker aus Segment-Overlap
+	// 3. Pro Fragment: Speaker-Segmente aus Diarization-Overlap
 	session.mu.Lock()
 	for fi := range session.Fragments {
 		frag := &session.Fragments[fi]
-		dominantLabel := ""
-		var bestOverlap float64
+		if frag.Duration <= 0 || frag.Text == "" {
+			continue
+		}
+
+		// Diarization-Segmente die mit diesem Fragment überlappen, extrahieren
+		var overlapping []diarizeSegment
 		for _, seg := range result.Segments {
-			overlap := math.Min(frag.End, seg.End) - math.Max(frag.Start, seg.Start)
-			if overlap > bestOverlap {
-				bestOverlap = overlap
-				dominantLabel = seg.Speaker
+			ovStart := math.Max(frag.Start, seg.Start)
+			ovEnd := math.Min(frag.End, seg.End)
+			if ovEnd > ovStart {
+				overlapping = append(overlapping, diarizeSegment{
+					Speaker: seg.Speaker,
+					Start:   ovStart,
+					End:     ovEnd,
+				})
 			}
 		}
-		if dominantLabel != "" {
-			if stableID, ok := speakerProfiles[dominantLabel]; ok {
-				frag.Speaker = stableID
+		if len(overlapping) == 0 {
+			continue
+		}
+
+		// Sortieren nach Start
+		sort.Slice(overlapping, func(i, j int) bool {
+			return overlapping[i].Start < overlapping[j].Start
+		})
+
+		// Text prozentual nach Segment-Dauer aufteilen
+		words := strings.Fields(frag.Text)
+		if len(words) == 0 {
+			continue
+		}
+		totalDuration := frag.End - frag.Start
+
+		var segments []FragSpeakerSeg
+		wordIdx := 0
+		for _, seg := range overlapping {
+			segDur := seg.End - seg.Start
+			if segDur <= 0 {
+				continue
 			}
+			// Anzahl Wörter proportional zur Dauer
+			nWords := int(float64(len(words)) * segDur / totalDuration)
+			if wordIdx+nWords > len(words) {
+				nWords = len(words) - wordIdx
+			}
+			if nWords <= 0 && wordIdx < len(words) {
+				nWords = 1 // mindestens 1 Wort pro Segment
+			}
+			if nWords <= 0 {
+				continue
+			}
+
+			segText := strings.Join(words[wordIdx : wordIdx+nWords], " ")
+			relStart := seg.Start - frag.Start
+			relEnd := seg.End - frag.Start
+			stableID := seg.Speaker
+			if mapped, ok := speakerProfiles[seg.Speaker]; ok {
+				stableID = mapped
+			}
+			segments = append(segments, FragSpeakerSeg{
+				Speaker: stableID,
+				Start:   round2(relStart),
+				End:     round2(relEnd),
+				Text:    segText,
+			})
+			wordIdx += nWords
+		}
+
+		if len(segments) > 0 {
+			frag.Segments = segments
+			// Dominanter Speaker = längstes Segment
+			longest := segments[0]
+			for _, seg := range segments {
+				if seg.End-seg.Start > longest.End-longest.Start {
+					longest = seg
+				}
+			}
+			frag.Speaker = longest.Speaker
 		}
 	}
 	session.mu.Unlock()
@@ -1005,11 +1095,11 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 
 // ── WebDAV-Upload ────────────────────────────────────────────
 
-// webdavUploadRecording legt die Session unter
-// <share-Root>/<yyyy-mm-dd-hh-mm>/<session_id>/ ab (via Public-Link-Share).
+// webdavUploadRecording lädt das finale Transkript + komplette Aufnahme hoch.
+// Fragment-Dateien wurden bereits während der Aufnahme hochgeladen.
 // Liefert den relativen Pfad zurück (leer bei Fehler).
 func (s *Server) webdavUploadRecording(session *RecordingSession, transcript string) string {
-	log.Printf("recording: webdav: start (token=%d chars, passwd=%d chars, audio=%d bytes)",
+	log.Printf("recording: webdav: finale Upload (token=%d chars, passwd=%d chars, audio=%d bytes)",
 		len(session.shareToken), len(session.sharePasswd), len(session.totalAudio))
 	if session.shareToken == "" || session.sharePasswd == "" {
 		log.Printf("recording: webdav: kein Share vorhanden (token=%v passwd=%v)",
@@ -1018,10 +1108,10 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 	}
 
 	dav := newShareWebDav(s, session.shareToken, session.sharePasswd)
-	dateDir := session.Created.Format("2006-01-02")
-	sessionDir := fmt.Sprintf("%s/%s", dateDir, session.ID)
+	sessionDir := webdavSessionDir(session)
 
-	// Verzeichnisse anlegen (MKCOL pro Ebene, 405 = ok)
+	// Verzeichnisse sicherstellen (falls Session-Create-MKCOL fehlgeschlagen ist)
+	dateDir := session.Created.Format("2006-01-02")
 	for _, dir := range []string{dateDir, sessionDir} {
 		if err := dav.shareMkdir(dir); err != nil {
 			log.Printf("recording: webdav: MKCOL %s: %v", dir, err)
@@ -1054,6 +1144,51 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 
 	log.Printf("recording: webdav: Upload abgeschlossen nach %s", sessionDir)
 	return sessionDir
+}
+
+// webdavSessionDir liefert den relativen Session-Pfad (ohne leading /).
+func webdavSessionDir(session *RecordingSession) string {
+	dateDir := session.Created.Format("2006-01-02")
+	return fmt.Sprintf("%s/%s", dateDir, session.ID)
+}
+
+// webdavEnsureDirs legt die WebDAV-Verzeichnisse für eine Session an (MKCOL).
+// Wird beim Session-Start aufgerufen, damit Fragment-Uploads sofort funktionieren.
+func (s *Server) webdavEnsureDirs(session *RecordingSession) {
+	if session.shareToken == "" || session.sharePasswd == "" {
+		return
+	}
+	dav := newShareWebDav(s, session.shareToken, session.sharePasswd)
+	sessionDir := webdavSessionDir(session)
+	dateDir := session.Created.Format("2006-01-02")
+
+	for _, dir := range []string{dateDir, sessionDir} {
+		if err := dav.shareMkdir(dir); err != nil {
+			log.Printf("recording: webdav: MKCOL %s: %v", dir, err)
+			return
+		}
+	}
+	log.Printf("recording: webdav: Verzeichnisse angelegt: %s", sessionDir)
+}
+
+// webdavUploadFragment lädt ein Fragment-Audio asynchron per WebDAV-PUT hoch.
+// wird in einer Goroutine aufgerufen (fire-and-forget).
+func (s *Server) webdavUploadFragment(session *RecordingSession, fragmentIdx int, fragAudio []byte) {
+	samples := decodeAudioToPCM16(fragAudio)
+	if samples == nil {
+		log.Printf("recording: webdav: fragment %d: Audio-Dekodierung fehlgeschlagen", fragmentIdx)
+		return
+	}
+	wavData := pcm16ToWAV(samples)
+	filename := fmt.Sprintf("fragment_%03d.wav", fragmentIdx)
+
+	dav := newShareWebDav(s, session.shareToken, session.sharePasswd)
+	sessionDir := webdavSessionDir(session)
+	if err := dav.sharePutBinary(sessionDir+"/"+filename, wavData); err != nil {
+		log.Printf("recording: webdav: PUT %s: %v", filename, err)
+	} else {
+		log.Printf("recording: webdav: fragment %d hochgeladen (%d bytes)", fragmentIdx, len(wavData))
+	}
 }
 
 // speakerHint beschreibt einen Sprecherwechsel im Transkript.
