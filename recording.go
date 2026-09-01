@@ -148,14 +148,19 @@ func (s *Server) vadIsSilent(rms float64) bool {
 // decodeAudioToPCM16 wandelt Audio-Bytes in PCM16 16kHz mono um.
 // Unterstützt: Raw PCM (Int16 LE) und WebM/OGG (via ffmpeg).
 func decodeAudioToPCM16(audioData []byte) []int16 {
-	// Raw PCM erkennen: gerade Länge, keine Container-Magic
+	if len(audioData) < 2 {
+		return nil
+	}
+	// Raw PCM erkennen: keine Container-Magic
 	isWebM := bytes.HasPrefix(audioData, []byte{0x1A, 0x45, 0xDF, 0xA3})
 	isWAV := bytes.HasPrefix(audioData, []byte("RIFF"))
 	isOGG := bytes.HasPrefix(audioData, []byte("OggS"))
-	log.Printf("recording: decode input: %d bytes, webM=%v wav=%v ogg=%v first4=%x",
-		len(audioData), isWebM, isWAV, isOGG, audioData[:min(4, len(audioData))])
-	if len(audioData) >= 2 && len(audioData)%2 == 0 && !isWebM && !isWAV && !isOGG {
+	if !isWebM && !isWAV && !isOGG {
 		// Raw PCM Int16 LE → direkt konvertieren
+		// Ungerade Länge: letztes Byte verwerfen
+		if len(audioData)%2 != 0 {
+			audioData = audioData[:len(audioData)-1]
+		}
 		numSamples := len(audioData) / 2
 		samples := make([]int16, numSamples)
 		for i := 0; i < numSamples; i++ {
