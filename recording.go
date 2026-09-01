@@ -1043,13 +1043,21 @@ func (s *Server) webdavPut(url string, data []byte) {
 func (s *Server) diarizeAudioBytes(audioData []byte) *diarizeResponse {
 	url := strings.TrimRight(s.cfg.Recording.DiarizeAPIBase, "/") + "/diarize"
 
+	// Audio → WAV (openannote erwartet Container, kein Raw-PCM)
+	samples := decodeAudioToPCM16(audioData)
+	if samples == nil {
+		log.Printf("recording: diarize: Audio-Dekodierung fehlgeschlagen (%d bytes)", len(audioData))
+		return nil
+	}
+	wavData := pcm16ToWAV(samples)
+
 	var buf bytes.Buffer
 	boundary := fmt.Sprintf("----TakiBoundary%d", time.Now().UnixNano())
 	w := NewMultipartWriter(&buf, boundary)
 	if s.cfg.Recording.DiarizeModel != "" {
 		w.WriteField("model", s.cfg.Recording.DiarizeModel)
 	}
-	w.WriteFile("file", "chunk.webm", bytes.NewReader(audioData))
+	w.WriteFile("file", "chunk.wav", bytes.NewReader(wavData))
 	w.Close()
 
 	req, err := http.NewRequest("POST", url, &buf)
