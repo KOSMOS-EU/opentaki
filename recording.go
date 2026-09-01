@@ -618,8 +618,15 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 				defer wg.Done()
 				diarizeResult := s.diarizeAudioBytes(fragAudio)
 				if diarizeResult != nil && len(diarizeResult.Segments) > 0 {
-					speaker = diarizeResult.Segments[0].Speaker
-					// Speaker-Matching + Anreicherung
+					// Dominanter Speaker = längstes Segment
+					var bestDur float64
+					for _, seg := range diarizeResult.Segments {
+						dur := seg.End - seg.Start
+						if dur > bestDur {
+							bestDur = dur
+							speaker = seg.Speaker
+						}
+					}
 					s.enrichSpeakerProfile(session, speaker)
 				}
 			}()
