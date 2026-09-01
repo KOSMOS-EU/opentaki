@@ -69,6 +69,8 @@ type RecordingSession struct {
 	fragIndex       int       // laufende Fragment-Nummer
 	prevTranscript  string    // Transkript bis letzte Sprechpause (Kontext)
 	totalAudio      []byte    // komplettes Audio der Session
+	speakerSeq      int               // nächstes SPEAKER_XX-Nummer
+	rawToStable     map[string]string // pyannote raw-ID → stabile session-ID
 }
 
 type RecordingFrag struct {
@@ -338,11 +340,12 @@ func (s *Server) handleRecordingSession(w http.ResponseWriter, r *http.Request) 
 		sessionID := time.Now().Format("2006-01-02-1504") + "-" + randHex(4)
 
 		session := &RecordingSession{
-			ID:        sessionID,
-			SpaceID:   body.SpaceID,
-			UserID:    r.Header.Get("x-access-token"),
-			Created:   time.Now(),
-			Fragments: []RecordingFrag{},
+			ID:           sessionID,
+			SpaceID:      body.SpaceID,
+			UserID:       r.Header.Get("x-access-token"),
+			Created:      time.Now(),
+			Fragments:    []RecordingFrag{},
+			rawToStable:  map[string]string{},
 		}
 
 		s.recMu.Lock()
@@ -618,15 +621,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 				defer wg.Done()
 				diarizeResult := s.diarizeAudioBytes(fragAudio)
 				if diarizeResult != nil && len(diarizeResult.Segments) > 0 {
-					// Dominanter Speaker = längstes Segment
-					var bestDur float64
-					for _, seg := range diarizeResult.Segments {
-						dur := seg.End - seg.Start
-						if dur > bestDur {
-							bestDur = dur
-							speaker = seg.Speaker
-						}
-					}
+					speaker = session.stableSpeakerID(diarizeResult.Segments)
 					s.enrichSpeakerProfile(session, speaker)
 				}
 			}()
@@ -882,6 +877,57 @@ func (session *RecordingSession) markFragFailed(idx int) {
 }
 
 // ── Speaker-Profile-Anreicherung ─────────────────────────────
+
+// stableSpeakerID mappt eine pyannote-raw-ID auf eine stabile session-weite ID.
+// pyannote nummeriert pro Aufruf neu — SPEAKER_00 in Fragment 3 kann ein
+// anderer Mensch sein als SPEAKER_00 in Fragment 1.
+//
+// Strategie: Erster gesehene Sprecher der Session → SPEAKER_00,
+// zweiter → SPEAKER_01, usw. Innerhalb eines Fragments wird die
+// dominante raw-ID (längstes Segment) als Referenz genommen.
+func (session *RecordingSession) stableSpeakerID(rawSegments []diarizeSegment) string {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if len(rawSegments) == 0 {
+		return "unknown"
+	}
+
+	// Dominante Raw-ID (längstes Segment)
+	var dominant string
+	var bestDur float64
+	for _, seg := range rawSegments {
+		dur := seg.End - seg.Start
+		if dur > bestDur {
+			bestDur = dur
+			dominant = seg.Speaker
+		}
+	}
+
+	// Alle im Fragment vorkommenden Raw-IDs (in Segment-Reihenfolge, dedupliziert)
+	rawIDs := make([]string, 0, len(rawSegments))
+	seenInFrag := map[string]bool{}
+	for _, seg := range rawSegments {
+		if !seenInFrag[seg.Speaker] {
+			seenInFrag[seg.Speaker] = true
+			rawIDs = append(rawIDs, seg.Speaker)
+		}
+	}
+
+	// Neue Raw-IDs registrieren → stabile Nummer vergeben
+	for _, rawID := range rawIDs {
+		if _, known := session.rawToStable[rawID]; !known {
+			session.rawToStable[rawID] = fmt.Sprintf("SPEAKER_%02d", session.speakerSeq)
+			session.speakerSeq++
+		}
+	}
+
+	// Stabile ID der dominanten Raw-ID
+	if stable, ok := session.rawToStable[dominant]; ok {
+		return stable
+	}
+	return "unknown"
+}
 
 // enrichSpeakerProfile: Wenn ein Speaker-Label von Diarization kommt,
 // prüfen ob es einem bekannten Profil zugeordnet werden kann.
