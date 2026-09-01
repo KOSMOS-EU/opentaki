@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -327,28 +328,40 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher.Flush()
 
-	// 1. Whisper Transkription
-	sseWrite(w, flusher, map[string]any{"type": "status", "status": "transcribing"})
+	// 1+2. Whisper + Diarize parallel (unabhängig, gleicher Audio-Buffer)
+	sseWrite(w, flusher, map[string]any{"type": "status", "status": "processing"})
 
-	text := s.whisperTranscribeBytes(audioData)
+	var text string
+	var speaker = "unknown"
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		text = s.whisperTranscribeBytes(audioData)
+	}()
+
+	diarizeBase := s.cfg.Recording.DiarizeAPIBase
+	if diarizeBase != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			diarizeResult := s.diarizeAudioBytes(audioData)
+			if diarizeResult != nil && len(diarizeResult.Segments) > 0 {
+				speaker = diarizeResult.Segments[0].Speaker
+			}
+		}()
+	}
+
+	wg.Wait()
+
 	if text == "" {
 		sseWrite(w, flusher, map[string]any{"type": "error", "message": "Transkription fehlgeschlagen"})
 		return
 	}
 	sseWrite(w, flusher, map[string]any{"type": "final", "text": text, "method": "whisper"})
-
-	// 2. Diarization (optional)
-	speaker := "unknown"
-	diarizeBase := s.cfg.Recording.DiarizeAPIBase
-	if diarizeBase != "" {
-		sseWrite(w, flusher, map[string]any{"type": "status", "status": "diarizing"})
-		diarizeResult := s.diarizeAudioBytes(audioData)
-		if diarizeResult != nil && len(diarizeResult.Segments) > 0 {
-			// Erstes Segment als dominanten Sprecher nehmen
-			seg := diarizeResult.Segments[0]
-			speaker = seg.Speaker
-			sseWrite(w, flusher, map[string]any{"type": "speaker", "speaker": speaker})
-		}
+	if speaker != "unknown" {
+		sseWrite(w, flusher, map[string]any{"type": "speaker", "speaker": speaker})
 	}
 
 	// 3. Session-Update
