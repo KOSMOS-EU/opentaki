@@ -4641,6 +4641,7 @@ func main() {
 	http.HandleFunc("/chat-direct/ask", srv.handleChatDirectAsk)
 	http.HandleFunc("/chat-direct/transcribe", srv.handleChatTranscribe)
 	http.HandleFunc("/recording/session", srv.handleRecordingSession)
+	http.HandleFunc("/recording/session/end", srv.handleRecordingSessionEnd)
 	http.HandleFunc("/recording/chunk", srv.handleRecordingChunk)
 	http.HandleFunc("/recording/sessions", srv.handleRecordingSessions)
 	http.HandleFunc("/recording/speakers", srv.handleRecordingSpeakers)
