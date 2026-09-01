@@ -152,6 +152,8 @@ func decodeAudioToPCM16(audioData []byte) []int16 {
 	isWebM := bytes.HasPrefix(audioData, []byte{0x1A, 0x45, 0xDF, 0xA3})
 	isWAV := bytes.HasPrefix(audioData, []byte("RIFF"))
 	isOGG := bytes.HasPrefix(audioData, []byte("OggS"))
+	log.Printf("recording: decode input: %d bytes, webM=%v wav=%v ogg=%v first4=%x",
+		len(audioData), isWebM, isWAV, isOGG, audioData[:min(4, len(audioData))])
 	if len(audioData) >= 2 && len(audioData)%2 == 0 && !isWebM && !isWAV && !isOGG {
 		// Raw PCM Int16 LE → direkt konvertieren
 		numSamples := len(audioData) / 2
