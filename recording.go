@@ -622,15 +622,23 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 
 	// Fragment fertig → Whisper (SPEAKER wird per Session-End-Diarization nachgeliefert)
 	if fragmentComplete {
+		fragAudio := session.takeFragAudio()
+		fragAudioLen := len(fragAudio)
+
+		// Leeres Fragment (z.B. nur Stille) → überspringen
+		if fragAudioLen < 2 {
+			log.Printf("recording: fragment %d leer (%d bytes), übersprungen", fragmentIdx, fragAudioLen)
+			return
+		}
+
+		fragDuration := float64(fragAudioLen) / 16000.0
+		log.Printf("recording: fragment %d fertig: %d bytes (%.1fs)", fragmentIdx, fragAudioLen, fragDuration)
+
 		sseWrite(w, flusher, map[string]any{
 			"type":     "status",
 			"fragment": fragmentIdx,
 			"status":   "processing",
 		})
-
-		fragAudio := session.takeFragAudio()
-		fragAudioLen := len(fragAudio)
-		fragDuration := float64(fragAudioLen) / 16000.0
 
 		text := s.whisperTranscribeBytes(fragAudio)
 
@@ -1001,6 +1009,8 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 // <share-Root>/<yyyy-mm-dd-hh-mm>/<session_id>/ ab (via Public-Link-Share).
 // Liefert den relativen Pfad zurück (leer bei Fehler).
 func (s *Server) webdavUploadRecording(session *RecordingSession, transcript string) string {
+	log.Printf("recording: webdav: start (token=%d chars, passwd=%d chars, audio=%d bytes)",
+		len(session.shareToken), len(session.sharePasswd), len(session.totalAudio))
 	if session.shareToken == "" || session.sharePasswd == "" {
 		log.Printf("recording: webdav: kein Share vorhanden (token=%v passwd=%v)",
 			session.shareToken != "", session.sharePasswd != "")
@@ -1106,6 +1116,12 @@ func (s *Server) diarizeAudioBytes(audioData []byte) *diarizeResponse {
 		return nil
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		log.Printf("recording: diarize: HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil
+	}
 
 	var result diarizeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
