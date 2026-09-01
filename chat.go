@@ -1334,6 +1334,11 @@ func (d *shareWebDav) sharePutFile(relPath, content string) error {
 	return d.doWrite("PUT", d.urlFor(relPath), strings.NewReader(content))
 }
 
+// sharePutBinary lädt Binärdaten (Audio, PDF) via PUT in den Share.
+func (d *shareWebDav) sharePutBinary(relPath string, data []byte) error {
+	return d.doWrite("PUT", d.urlFor(relPath), bytes.NewReader(data))
+}
+
 // shareMkdir legt ein Verzeichnis im Share-Ordner an (MKCOL).
 func (d *shareWebDav) shareMkdir(relPath string) error {
 	return d.doWrite("MKCOL", d.urlFor(relPath), nil)

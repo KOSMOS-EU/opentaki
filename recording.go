@@ -71,6 +71,8 @@ type RecordingSession struct {
 	totalAudio      []byte    // komplettes Audio der Session
 	speakerSeq      int               // nächstes SPEAKER_XX-Nummer
 	rawToStable     map[string]string // pyannote raw-ID → stabile session-ID
+	shareToken      string            // WebDAV Share-Token (public-files)
+	sharePasswd     string            // WebDAV Share-Password
 }
 
 type RecordingFrag struct {
@@ -337,7 +339,11 @@ func (s *Server) handleRecordingSession(w http.ResponseWriter, r *http.Request) 
 	switch r.Method {
 	case http.MethodPost:
 		var body struct {
-			SpaceID string `json:"space_id"`
+			SpaceID string `json:"space_id"` // veraltet, nur noch für Logging
+			Share   struct {
+				Token    string `json:"token"`
+				Password string `json:"password"`
+			} `json:"share"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeChatError(w, http.StatusBadRequest, "ungültiges JSON: "+err.Error())
@@ -353,6 +359,8 @@ func (s *Server) handleRecordingSession(w http.ResponseWriter, r *http.Request) 
 			Created:      time.Now(),
 			Fragments:    []RecordingFrag{},
 			rawToStable:  map[string]string{},
+			shareToken:   body.Share.Token,
+			sharePasswd:  body.Share.Password,
 		}
 
 		s.recMu.Lock()
@@ -400,7 +408,6 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	session.Done = true
-	userJWT := r.Header.Get("x-access-token")
 	s.recMu.Unlock()
 	log.Printf("recording: session/end: %s space=%s frags=%d audio=%d bytes",
 		body.SessionID, session.SpaceID, len(session.Fragments), len(session.totalAudio))
@@ -449,12 +456,12 @@ Roh-Transkript:
 		}
 	}
 
-	// 3. WebDAV-Upload
+	// 3. WebDAV-Upload (via Public-Link-Share)
 	uploadPath := ""
-	if session.SpaceID != "" {
-		uploadPath = s.webdavUploadRecording(session, finishedTranscript, userJWT)
+	if session.shareToken != "" {
+		uploadPath = s.webdavUploadRecording(session, finishedTranscript)
 	} else {
-		log.Printf("recording: session/end: SpaceID leer, kein WebDAV-Upload")
+		log.Printf("recording: session/end: kein Share, kein WebDAV-Upload")
 	}
 
 	// 4. Response
@@ -955,28 +962,26 @@ func (s *Server) enrichSpeakerProfile(session *RecordingSession, speakerLabel st
 // ── WebDAV-Upload ────────────────────────────────────────────
 
 // webdavUploadRecording legt die Session unter
-// <personal>/recordings/<yyyy-mm-dd-hh-mm>/<session_id>/ ab.
+// <share-Root>/<yyyy-mm-dd-hh-mm>/<session_id>/ ab (via Public-Link-Share).
 // Liefert den relativen Pfad zurück (leer bei Fehler).
-func (s *Server) webdavUploadRecording(session *RecordingSession, transcript string, userJWT string) string {
-	if session.SpaceID == "" {
+func (s *Server) webdavUploadRecording(session *RecordingSession, transcript string) string {
+	if session.shareToken == "" || session.sharePasswd == "" {
+		log.Printf("recording: webdav: kein Share vorhanden (token=%v passwd=%v)",
+			session.shareToken != "", session.sharePasswd != "")
 		return ""
 	}
 
+	dav := newShareWebDav(s, session.shareToken, session.sharePasswd)
 	datetime := session.Created.Format("2006-01-02-1504")
-	basePath := fmt.Sprintf("/recordings/%s/%s", datetime, session.ID)
-	davBase := strings.TrimRight(s.cfg.OpenCloud.URL, "/") + "/dav/spaces"
-	log.Printf("recording: webdav: base=%s space=%s path=%s jwt_len=%d", davBase, session.SpaceID, basePath, len(userJWT))
+	sessionDir := fmt.Sprintf("%s/%s", datetime, session.ID)
 
-	// 1. Verzeichnisse anlegen (MKCOL)
-	for _, dir := range []string{
-		"/recordings",
-		fmt.Sprintf("/recordings/%s", datetime),
-		basePath,
-	} {
-		s.webdavMkcol(davBase+"/"+session.SpaceID+dir, userJWT)
+	// Verzeichnis anlegen (shareMkdir = MKCOL, 405 = ok)
+	if err := dav.shareMkdir(sessionDir); err != nil {
+		log.Printf("recording: webdav: MKCOL %s: %v", sessionDir, err)
+		return ""
 	}
 
-	// 2. Transkript-JSON (inkl. speaker_hints)
+	// Transkript-JSON (inkl. speaker_hints)
 	speakerHints := buildSpeakerHints(session.Fragments)
 	transcriptJSON, _ := json.MarshalIndent(map[string]any{
 		"session_id":    session.ID,
@@ -985,16 +990,22 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 		"fragments":     session.Fragments,
 		"speaker_hints": speakerHints,
 	}, "", "  ")
-	s.webdavPut(davBase+"/"+session.SpaceID+basePath+"/transkript.json", transcriptJSON, userJWT)
-
-	// 3. Audio (komplettes Session-Audio)
-	if len(session.totalAudio) > 0 {
-		s.webdavPut(davBase+"/"+session.SpaceID+basePath+"/aufnahme.webm", session.totalAudio, userJWT)
-	} else {
-		log.Printf("recording: webdav: kein totalAudio (%d bytes)", len(session.totalAudio))
+	if err := dav.sharePutFile(sessionDir+"/transkript.json", string(transcriptJSON)); err != nil {
+		log.Printf("recording: webdav: PUT transkript.json: %v", err)
 	}
 
-	return basePath
+	// Audio (komplettes Session-Audio)
+	if len(session.totalAudio) > 0 {
+		// sharePutFile akzeptiert string — für Binärdaten sharePutBinary nutzen
+		if err := dav.sharePutBinary(sessionDir+"/aufnahme.wav", pcm16ToWAV(decodeAudioToPCM16(session.totalAudio))); err != nil {
+			log.Printf("recording: webdav: PUT aufnahme.wav: %v", err)
+		}
+	} else {
+		log.Printf("recording: webdav: kein totalAudio")
+	}
+
+	log.Printf("recording: webdav: Upload abgeschlossen nach %s", sessionDir)
+	return sessionDir
 }
 
 // speakerHint beschreibt einen Sprecherwechsel im Transkript.
@@ -1022,46 +1033,6 @@ func buildSpeakerHints(frags []RecordingFrag) []speakerHint {
 		}
 	}
 	return hints
-}
-
-// webdavMkcol erzeugt ein WebDAV-Verzeichnis (idempotent).
-func (s *Server) webdavMkcol(url, userJWT string) {
-	req, err := http.NewRequest("MKCOL", url, nil)
-	if err != nil {
-		log.Printf("recording: MKCOL %s: request error: %v", url, err)
-		return
-	}
-	req.Header.Set("x-access-token", userJWT)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		log.Printf("recording: MKCOL %s: %v", url, err)
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 201 && resp.StatusCode != 405 {
-		log.Printf("recording: MKCOL %s: HTTP %d", url, resp.StatusCode)
-	}
-}
-
-// webdavPut lädt eine Datei via WebDAV PUT hoch.
-func (s *Server) webdavPut(url string, data []byte, userJWT string) {
-	req, err := http.NewRequest("PUT", url, bytes.NewReader(data))
-	if err != nil {
-		log.Printf("recording: PUT %s: request error: %v", url, err)
-		return
-	}
-	req.Header.Set("x-access-token", userJWT)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		log.Printf("recording: PUT %s: %v", url, err)
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 201 && resp.StatusCode != 204 {
-		log.Printf("recording: PUT %s: HTTP %d (%d bytes)", url, resp.StatusCode, len(data))
-	} else {
-		log.Printf("recording: PUT %s: ok (%d bytes)", url, len(data))
-	}
 }
 
 // ── Diarization ──────────────────────────────────────────────
