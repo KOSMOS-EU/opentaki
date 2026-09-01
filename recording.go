@@ -580,6 +580,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		writeChatError(w, http.StatusBadRequest, "Feld 'session_id' fehlt")
 		return
 	}
+	log.Printf("recording: chunk session=%s audio=%d bytes", sessionID, len(audioData))
 
 	// SSE-Header
 	flusher, ok := w.(http.Flusher)
@@ -749,6 +750,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	}
 
 	isSilent := s.vadIsSilent(rms)
+	log.Printf("recording: chunk rms=%.4f silent=%v audio=%d bytes", rms, isSilent, len(audioData))
 
 	// Audio in Session-Buffer einhängen
 	session.totalAudio = append(session.totalAudio, audioData...)
