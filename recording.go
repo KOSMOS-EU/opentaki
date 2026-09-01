@@ -43,7 +43,7 @@ type RecordingConfig struct {
 	SpeakerMatch    float64 `yaml:"speaker_match"`      // cosine threshold (default 0.75)
 	MaxChunkMB      int     `yaml:"max_chunk_mb"`       // max size per chunk (default 50)
 	SilenceThresh   float64 `yaml:"silence_thresh"`     // RMS below this = silence (default 0.01)
-	SilenceTimeout  int     `yaml:"silence_timeout_ms"` // ms of silence → fragment end (default 1500)
+	SilenceTimeout  int     `yaml:"silence_timeout_ms"` // ms of silence → fragment end (default 800)
 	PartialInterval int     `yaml:"partial_interval_s"` // seconds between partial transcriptions (default 3)
 	MaxFragmentSec  int     `yaml:"max_fragment_sec"`   // max fragment duration (default 30)
 }
@@ -736,7 +736,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	now := time.Now()
 	silenceTimeout := time.Duration(s.cfg.Recording.SilenceTimeout) * time.Millisecond
 	if s.cfg.Recording.SilenceTimeout <= 0 {
-		silenceTimeout = 1500 * time.Millisecond
+		silenceTimeout = 800 * time.Millisecond
 	}
 	partialInterval := time.Duration(s.cfg.Recording.PartialInterval) * time.Second
 	if s.cfg.Recording.PartialInterval <= 0 {
