@@ -69,9 +69,7 @@ type RecordingSession struct {
 	fragIndex       int       // laufende Fragment-Nummer
 	prevTranscript  string    // Transkript bis letzte Sprechpause (Kontext)
 	totalAudio      []byte    // komplettes Audio der Session
-	speakerSeq      int               // nächstes SPEAKER_XX-Nummer
-	rawToStable     map[string]string // pyannote raw-ID → stabile session-ID
-	shareToken      string            // WebDAV Share-Token (public-files)
+	shareToken      string    // WebDAV Share-Token (public-files)
 	sharePasswd     string            // WebDAV Share-Password
 }
 
@@ -97,8 +95,9 @@ type SpeakerProfile struct {
 // ── Diarize response (openannote format) ────────────────────
 
 type diarizeResponse struct {
-	Segments []diarizeSegment `json:"segments"`
-	Speakers []string         `json:"speakers"`
+	Segments         []diarizeSegment  `json:"segments"`
+	Speakers         []string          `json:"speakers"`
+	SpeakerEmbeddings map[string][]float64 `json:"speaker_embeddings"`
 }
 
 type diarizeSegment struct {
@@ -358,7 +357,6 @@ func (s *Server) handleRecordingSession(w http.ResponseWriter, r *http.Request) 
 			UserID:       r.Header.Get("x-access-token"),
 			Created:      time.Now(),
 			Fragments:    []RecordingFrag{},
-			rawToStable:  map[string]string{},
 			shareToken:   body.Share.Token,
 			sharePasswd:  body.Share.Password,
 		}
@@ -412,7 +410,13 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	log.Printf("recording: session/end: %s space=%s frags=%d audio=%d bytes",
 		body.SessionID, session.SpaceID, len(session.Fragments), len(session.totalAudio))
 
-	// 1. Komplettes Transkript zusammenstellen
+	// 1. Session-End-Diarization: ein pyannote-Call auf komplettes Session-Audio,
+	//    Segmente zeitbasiert auf Fragmente mappen, Speaker-Profile per Embedding anlegen.
+	if s.cfg.Recording.DiarizeAPIBase != "" && len(session.totalAudio) > 0 && len(session.Fragments) > 0 {
+		s.diarizeSessionEnd(session)
+	}
+
+	// 2. Komplettes Transkript zusammenstellen
 	var transcriptBuilder strings.Builder
 	for _, frag := range session.Fragments {
 		if frag.Speaker != "" && frag.Speaker != "unknown" {
@@ -433,7 +437,7 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// 2. LLM-Finalpass (Politur)
+	// 3. LLM-Finalpass (Politur)
 	finishedTranscript := fullTranscript
 	if s.cfg.LLM.APIBase != "" {
 		prompt := fmt.Sprintf(
@@ -456,7 +460,7 @@ Roh-Transkript:
 		}
 	}
 
-	// 3. WebDAV-Upload (via Public-Link-Share)
+	// 4. WebDAV-Upload (via Public-Link-Share)
 	uploadPath := ""
 	if session.shareToken != "" {
 		uploadPath = s.webdavUploadRecording(session, finishedTranscript)
@@ -464,14 +468,14 @@ Roh-Transkript:
 		log.Printf("recording: session/end: kein Share, kein WebDAV-Upload")
 	}
 
-	// 4. Response
+	// 5. Response (inkl. Fragmente mit Speaker-Zuweisung nach Session-End-Diarization)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":     "done",
 		"session_id": body.SessionID,
 		"transcript": finishedTranscript,
 		"upload":     uploadPath,
-		"fragments":  len(session.Fragments),
+		"fragments":  session.Fragments,
 	})
 }
 
@@ -615,7 +619,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Fragment fertig → Whisper + Diarize parallel
+	// Fragment fertig → Whisper (SPEAKER wird per Session-End-Diarization nachgeliefert)
 	if fragmentComplete {
 		sseWrite(w, flusher, map[string]any{
 			"type":     "status",
@@ -624,31 +628,10 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		})
 
 		fragAudio := session.takeFragAudio()
-		fragDuration := session.fragDuration()
+		fragAudioLen := len(fragAudio)
+		fragDuration := float64(fragAudioLen) / 16000.0
 
-		var text string
-		var speaker = "unknown"
-		var wg sync.WaitGroup
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			text = s.whisperTranscribeBytes(fragAudio)
-		}()
-
-		if s.cfg.Recording.DiarizeAPIBase != "" {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				diarizeResult := s.diarizeAudioBytes(fragAudio)
-				if diarizeResult != nil && len(diarizeResult.Segments) > 0 {
-					speaker = session.stableSpeakerID(diarizeResult.Segments)
-					s.enrichSpeakerProfile(session, speaker)
-				}
-			}()
-		}
-
-		wg.Wait()
+		text := s.whisperTranscribeBytes(fragAudio)
 
 		if text == "" {
 			sseWrite(w, flusher, map[string]any{
@@ -660,7 +643,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session.addFragment(fragmentIdx, text, speaker, fragDuration)
+		session.addFragment(fragmentIdx, text, "unknown", fragDuration, fragAudioLen)
 
 		sseWrite(w, flusher, map[string]any{
 			"type":     "final",
@@ -668,19 +651,11 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			"text":     text,
 			"method":   "whisper",
 		})
-		if speaker != "unknown" {
-			sseWrite(w, flusher, map[string]any{
-				"type":     "speaker",
-				"fragment": fragmentIdx,
-				"speaker":  speaker,
-			})
-		}
 
 		sseWrite(w, flusher, map[string]any{
 			"type":     "done",
 			"fragment": fragmentIdx,
 			"text":     text,
-			"speaker":  speaker,
 		})
 	}
 }
@@ -854,23 +829,13 @@ func (session *RecordingSession) takeFragAudio() []byte {
 	return audio
 }
 
-// fragDuration gibt die Dauer des aktuellen Fragments in Sekunden zurück.
-func (session *RecordingSession) fragDuration() float64 {
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.fragAudio == nil {
-		return 0
-	}
-	// Näherung: WebM/Opus ~16 KB/s bei 16kHz
-	return float64(len(session.fragAudio)) / 16000.0
-}
-
 // addFragment fügt ein abgeschlossenes Fragment zur Session hinzu.
-func (session *RecordingSession) addFragment(idx int, text, speaker string, duration float64) {
+// fragAudioLen: Länge des Fragment-Audios in Bytes (vor takeFragAudio).
+func (session *RecordingSession) addFragment(idx int, text, speaker string, duration float64, fragAudioLen int) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	start := float64(len(session.totalAudio) - len(session.fragAudio)) / 16000.0
+	start := float64(len(session.totalAudio) - fragAudioLen) / 16000.0
 	if start < 0 {
 		start = 0
 	}
@@ -897,66 +862,135 @@ func (session *RecordingSession) markFragFailed(idx int) {
 	session.lastPartial = time.Time{}
 }
 
-// ── Speaker-Profile-Anreicherung ─────────────────────────────
+// ── Session-End-Diarization ──────────────────────────────────
 
-// stableSpeakerID mappt eine pyannote-raw-ID auf eine stabile session-weite ID.
-// pyannote nummeriert pro Aufruf neu — SPEAKER_00 in Fragment 3 kann ein
-// anderer Mensch sein als SPEAKER_00 in Fragment 1.
-//
-// Strategie: Erster gesehene Sprecher der Session → SPEAKER_00,
-// zweiter → SPEAKER_01, usw. Innerhalb eines Fragments wird die
-// dominante raw-ID (längstes Segment) als Referenz genommen.
-func (session *RecordingSession) stableSpeakerID(rawSegments []diarizeSegment) string {
+// diarizeSessionEnd führt die Diarization einmal auf dem kompletten
+// Session-Audio aus und mappt die Segmente zeitbasiert auf Fragmente.
+// Pro einzigem Speaker wird ein Envelope-Mean-Embedding berechnet und
+// mit matchSpeaker gegen die Speaker-Profile geprüft.
+func (s *Server) diarizeSessionEnd(session *RecordingSession) {
+	log.Printf("recording: session/end-diarize: start für %s (audio=%d bytes)",
+		session.ID, len(session.totalAudio))
+	start := time.Now()
+
+	result := s.diarizeAudioBytes(session.totalAudio)
+	if result == nil || len(result.Segments) == 0 {
+		log.Printf("recording: session/end-diarize: keine Segmente für %s", session.ID)
+		return
+	}
+	log.Printf("recording: session/end-diarize: %d Segmente, %d Speaker, embeddings=%v",
+		len(result.Segments), len(result.Speakers), len(result.SpeakerEmbeddings) > 0)
+
+	// 1. Pro Speaker: Envelope-Mean aus allen Segments
+	type speakerEnvelope struct {
+		label    string
+		start    float64
+		end      float64
+		envelope []float64
+	}
+	envByLabel := map[string]*speakerEnvelope{}
+	var envelopeOrder []string
+	for _, seg := range result.Segments {
+		env, ok := envByLabel[seg.Speaker]
+		if !ok {
+			env = &speakerEnvelope{label: seg.Speaker, start: seg.Start, end: seg.End, envelope: []float64{}}
+			envByLabel[seg.Speaker] = env
+			envelopeOrder = append(envelopeOrder, seg.Speaker)
+		}
+		// Envelope: frühester Start, spätestes Ende
+		if seg.Start < env.start {
+			env.start = seg.Start
+		}
+		if seg.End > env.end {
+			env.end = seg.End
+		}
+		// Embedding-Vector sammeln
+		if emb, ok := result.SpeakerEmbeddings[seg.Speaker]; ok {
+			env.envelope = append(env.envelope, emb...)
+		}
+	}
+
+	// 2. Stabile Speaker-IDs + Profil-Matching
+	speakerProfiles := map[string]string{} // rawLabel → stabile Session-ID
+	for i, label := range envelopeOrder {
+		stableID := fmt.Sprintf("SPEAKER_%02d", i)
+		speakerProfiles[label] = stableID
+
+		env := envByLabel[label]
+		if len(env.envelope) == 0 {
+			log.Printf("recording: session/end-diarize: %s (%s) kein Embedding", stableID, label)
+			continue
+		}
+
+		// Envelope-Mean
+		numSegments := len(env.envelope) / len(result.SpeakerEmbeddings[label])
+		embDim := len(result.SpeakerEmbeddings[label])
+		meanEmb := make([]float64, embDim)
+		for si := 0; si < numSegments; si++ {
+			for d := 0; d < embDim; d++ {
+				meanEmb[d] += env.envelope[si*embDim+d] / float64(numSegments)
+			}
+		}
+
+		// Cosine-Matching gegen bestehende Profile
+		profile, score, found := s.matchSpeaker(meanEmb)
+		if found {
+			log.Printf("recording: session/end-diarize: %s → Profil %q (%.2f)",
+				stableID, profile.Name, score)
+			// Profil-Count aktualisieren
+			s.speakerMu.Lock()
+			for j, p := range s.speakers {
+				if p.ID == profile.ID {
+					s.speakers[j].LastSeen = time.Now()
+					s.speakers[j].Count++
+					break
+				}
+			}
+			s.saveSpeakersLocked()
+			s.speakerMu.Unlock()
+		} else {
+			log.Printf("recording: session/end-diarize: %s → neues Profil (best=%.2f)",
+				stableID, score)
+			// Neues Profil anlegen
+			now := time.Now()
+			newProfile := SpeakerProfile{
+				ID:        stableID + "_" + session.ID[:13],
+				Name:      stableID,
+				Embedding: meanEmb,
+				FirstSeen: now,
+				LastSeen:  now,
+				Count:     1,
+			}
+			s.speakerMu.Lock()
+			s.speakers = append(s.speakers, newProfile)
+			s.saveSpeakersLocked()
+			s.speakerMu.Unlock()
+		}
+	}
+
+	// 3. Pro Fragment: dominante Speaker aus Segment-Overlap
 	session.mu.Lock()
-	defer session.mu.Unlock()
-
-	if len(rawSegments) == 0 {
-		return "unknown"
-	}
-
-	// Dominante Raw-ID (längstes Segment)
-	var dominant string
-	var bestDur float64
-	for _, seg := range rawSegments {
-		dur := seg.End - seg.Start
-		if dur > bestDur {
-			bestDur = dur
-			dominant = seg.Speaker
+	for fi := range session.Fragments {
+		frag := &session.Fragments[fi]
+		dominantLabel := ""
+		var bestOverlap float64
+		for _, seg := range result.Segments {
+			overlap := math.Min(frag.End, seg.End) - math.Max(frag.Start, seg.Start)
+			if overlap > bestOverlap {
+				bestOverlap = overlap
+				dominantLabel = seg.Speaker
+			}
+		}
+		if dominantLabel != "" {
+			if stableID, ok := speakerProfiles[dominantLabel]; ok {
+				frag.Speaker = stableID
+			}
 		}
 	}
+	session.mu.Unlock()
 
-	// Alle im Fragment vorkommenden Raw-IDs (in Segment-Reihenfolge, dedupliziert)
-	rawIDs := make([]string, 0, len(rawSegments))
-	seenInFrag := map[string]bool{}
-	for _, seg := range rawSegments {
-		if !seenInFrag[seg.Speaker] {
-			seenInFrag[seg.Speaker] = true
-			rawIDs = append(rawIDs, seg.Speaker)
-		}
-	}
-
-	// Neue Raw-IDs registrieren → stabile Nummer vergeben
-	for _, rawID := range rawIDs {
-		if _, known := session.rawToStable[rawID]; !known {
-			session.rawToStable[rawID] = fmt.Sprintf("SPEAKER_%02d", session.speakerSeq)
-			session.speakerSeq++
-		}
-	}
-
-	// Stabile ID der dominanten Raw-ID
-	if stable, ok := session.rawToStable[dominant]; ok {
-		return stable
-	}
-	return "unknown"
-}
-
-// enrichSpeakerProfile: Wenn ein Speaker-Label von Diarization kommt,
-// prüfen ob es einem bekannten Profil zugeordnet werden kann.
-// Aktuell: Label durchreichen (openannote liefert SPEAKER_00 etc.).
-// Später: Embedding-basiertes Matching.
-func (s *Server) enrichSpeakerProfile(session *RecordingSession, speakerLabel string) {
-	// Aktuell nur Log — Embedding-Matching kommt mit wav2vec2-Integration
-	log.Printf("recording: speaker %s in Session %s", speakerLabel, session.ID)
+	log.Printf("recording: session/end-diarize: fertig in %v (%d Speaker, %d Fragmente aktualisiert)",
+		time.Since(start), len(envelopeOrder), len(session.Fragments))
 }
 
 // ── WebDAV-Upload ────────────────────────────────────────────
