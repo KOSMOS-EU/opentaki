@@ -915,12 +915,14 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 		s.webdavMkcol(davBase+"/"+session.SpaceID+dir)
 	}
 
-	// 2. Transkript-JSON
+	// 2. Transkript-JSON (inkl. speaker_hints)
+	speakerHints := buildSpeakerHints(session.Fragments)
 	transcriptJSON, _ := json.MarshalIndent(map[string]any{
-		"session_id": session.ID,
-		"created":    session.Created,
-		"transcript": transcript,
-		"fragments":  session.Fragments,
+		"session_id":    session.ID,
+		"created":       session.Created,
+		"transcript":    transcript,
+		"fragments":     session.Fragments,
+		"speaker_hints": speakerHints,
 	}, "", "  ")
 	s.webdavPut(davBase+"/"+session.SpaceID+basePath+"/transkript.json", transcriptJSON)
 
@@ -930,6 +932,33 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 	}
 
 	return basePath
+}
+
+// speakerHint beschreibt einen Sprecherwechsel im Transkript.
+type speakerHint struct {
+	Time   float64 `json:"time"`
+	Event  string  `json:"event"`
+	From   string  `json:"from"`
+	To     string  `json:"to"`
+}
+
+// buildSpeakerHints erzeugt eine Liste von Speaker-Changes zwischen
+// aufeinanderfolgenden Fragmenten. Zeitstempel = Startzeit des neuen Fragments.
+func buildSpeakerHints(frags []RecordingFrag) []speakerHint {
+	var hints []speakerHint
+	for i := 1; i < len(frags); i++ {
+		prev := frags[i-1]
+		cur := frags[i]
+		if prev.Speaker != "" && cur.Speaker != "" && prev.Speaker != cur.Speaker {
+			hints = append(hints, speakerHint{
+				Time:  cur.Start,
+				Event: "speaker_change",
+				From:  prev.Speaker,
+				To:    cur.Speaker,
+			})
+		}
+	}
+	return hints
 }
 
 // webdavMkcol erzeugt ein WebDAV-Verzeichnis (idempotent).
