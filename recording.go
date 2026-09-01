@@ -1018,13 +1018,15 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 	}
 
 	dav := newShareWebDav(s, session.shareToken, session.sharePasswd)
-	datetime := session.Created.Format("2006-01-02-1504")
-	sessionDir := fmt.Sprintf("%s/%s", datetime, session.ID)
+	dateDir := session.Created.Format("2006-01-02")
+	sessionDir := fmt.Sprintf("%s/%s", dateDir, session.ID)
 
-	// Verzeichnis anlegen (shareMkdir = MKCOL, 405 = ok)
-	if err := dav.shareMkdir(sessionDir); err != nil {
-		log.Printf("recording: webdav: MKCOL %s: %v", sessionDir, err)
-		return ""
+	// Verzeichnisse anlegen (MKCOL pro Ebene, 405 = ok)
+	for _, dir := range []string{dateDir, sessionDir} {
+		if err := dav.shareMkdir(dir); err != nil {
+			log.Printf("recording: webdav: MKCOL %s: %v", dir, err)
+			return ""
+		}
 	}
 
 	// Transkript-JSON (inkl. speaker_hints)
