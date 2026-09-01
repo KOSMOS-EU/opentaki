@@ -90,6 +90,7 @@ type Config struct {
 		URL string `yaml:"url"` // Pod-Mode: http://127.0.0.1:9200
 	} `yaml:"opencloud"`
 	Chat ChatConfig `yaml:"chat"`
+	Recording RecordingConfig `yaml:"recording"`
 }
 
 // DocMetaConfig controls structured metadata extraction from documents.
@@ -217,6 +218,12 @@ type Server struct {
 	// OCR layer filters and cache (TAKI_LAYER_CONF_MIN / TAKI_LAYER_CACHE_MAX)
 	layerConfMin  int // drop VLM regions with self-reported conf below this
 	layerCacheMax int // max cached OCR layers (LRU by mtime)
+
+	// Recording (near-live Transkription)
+	recMu     sync.Mutex
+	sessions  map[string]*RecordingSession
+	speakerMu sync.RWMutex
+	speakers  []SpeakerProfile
 }
 
 // traceCtx carries per-request debug context through the pipeline.
@@ -630,6 +637,7 @@ func NewServer(cfg Config) *Server {
 		ocrPDF:        ocrPDF,
 		layerConfMin:  layerConfMin,
 		layerCacheMax: layerCacheMax,
+		sessions:      make(map[string]*RecordingSession),
 	}
 }
 
@@ -4632,6 +4640,10 @@ func main() {
 	http.HandleFunc("/chat/tools", srv.handleChatTools)
 	http.HandleFunc("/chat-direct/ask", srv.handleChatDirectAsk)
 	http.HandleFunc("/chat-direct/transcribe", srv.handleChatTranscribe)
+	http.HandleFunc("/recording/session", srv.handleRecordingSession)
+	http.HandleFunc("/recording/chunk", srv.handleRecordingChunk)
+	http.HandleFunc("/recording/sessions", srv.handleRecordingSessions)
+	http.HandleFunc("/recording/speakers", srv.handleRecordingSpeakers)
 	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/stats", srv.handleStats)
 	http.HandleFunc("/tika", srv.handleHealth)

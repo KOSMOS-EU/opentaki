@@ -73,6 +73,15 @@ chat:
   list_depth: 3            # max. Verzeichnisebenen im rekursiven list_directory
   system_prompt_file: ""   # default: /etc/open_taki/prompts/chat_system.txt (taka-prompts-Paket)
 
+# Recording (near-live Transkription)
+# Diarization via openannote (pyannote) über microllm Service-Proxy
+recording:
+  diarize_api_base: ""     # e.g. "http://microllm:8012/svc/steno-ml"
+  diarize_model: ""        # e.g. "pyannote/speaker-diarization-3.1" (leer = Default)
+  speaker_store: ""        # e.g. "/data/speakers.json" (leer = kein Store)
+  max_chunk_mb: 50         # max. Audio-Chunk-Größe in MB
+  session_dir: ".recordings"
+
 # Routing (active with X-Taki-Protocol: v2)
 routing:
   vector: always
