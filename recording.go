@@ -876,10 +876,9 @@ func (session *RecordingSession) addFragment(idx int, text, speaker string, dura
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	// totalAudio ist ein Byte-Buffer (raw PCM/WebM), nicht Samples.
-	// Für PCM16: 2 Bytes pro Sample. Für WebM: unzuverlässig —
-	// daher cumulative Sample-Counter nutzen.
-	start := float64(session.totalSamples - session.fragSamplesAtStart) / 16000.0
+	// fragSamplesAtStart = totalSamples zum Fragment-Start.
+	// Das ist der absolute Start-Offset in der Session.
+	start := float64(session.fragSamplesAtStart) / 16000.0
 	if start < 0 {
 		start = 0
 	}
