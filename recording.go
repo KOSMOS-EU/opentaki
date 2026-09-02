@@ -1033,71 +1033,35 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			return overlapping[i].Start < overlapping[j].Start
 		})
 
-		// Aufeinanderfolgende Segmente desselben Speakers mergen (Gap < 2s)
-		var merged []diarizeSegment
+		// Dominanter Speaker pro Fragment: Speaker mit der längsten
+		// Gesamt-Overlap-Dauer. Pyannote erzeugt Overlap + Mikro-Segmente,
+		// daher nur Gesamt-Dauer summieren statt per-Segment-Splitting.
+		speakerDur := map[string]float64{}
 		for _, seg := range overlapping {
-			if len(merged) > 0 && merged[len(merged)-1].Speaker == seg.Speaker &&
-				seg.Start-merged[len(merged)-1].End < 2.0 {
-				merged[len(merged)-1].End = seg.End
-			} else {
-				merged = append(merged, seg)
+			speakerDur[seg.Speaker] += seg.End - seg.Start
+		}
+		dominant := ""
+		var bestDur float64
+		for sp, dur := range speakerDur {
+			if dur > bestDur {
+				bestDur = dur
+				dominant = sp
 			}
 		}
-		overlapping = merged
-
-		// Text prozentual nach Segment-Dauer aufteilen
-		words := strings.Fields(frag.Text)
-		if len(words) == 0 {
+		if dominant == "" {
 			continue
 		}
-		totalDuration := frag.End - frag.Start
-
-		var segments []FragSpeakerSeg
-		wordIdx := 0
-		for _, seg := range overlapping {
-			segDur := seg.End - seg.Start
-			if segDur <= 0 {
-				continue
-			}
-			// Anzahl Wörter proportional zur Dauer
-			nWords := int(float64(len(words)) * segDur / totalDuration)
-			if wordIdx+nWords > len(words) {
-				nWords = len(words) - wordIdx
-			}
-			if nWords <= 0 && wordIdx < len(words) {
-				nWords = 1 // mindestens 1 Wort pro Segment
-			}
-			if nWords <= 0 {
-				continue
-			}
-
-			segText := strings.Join(words[wordIdx : wordIdx+nWords], " ")
-			relStart := seg.Start - frag.Start
-			relEnd := seg.End - frag.Start
-			stableID := seg.Speaker
-			if mapped, ok := speakerProfiles[seg.Speaker]; ok {
-				stableID = mapped
-			}
-			segments = append(segments, FragSpeakerSeg{
-				Speaker: stableID,
-				Start:   round2(relStart),
-				End:     round2(relEnd),
-				Text:    segText,
-			})
-			wordIdx += nWords
+		stableID := dominant
+		if mapped, ok := speakerProfiles[dominant]; ok {
+			stableID = mapped
 		}
-
-		if len(segments) > 0 {
-			frag.Segments = segments
-			// Dominanter Speaker = längstes Segment
-			longest := segments[0]
-			for _, seg := range segments {
-				if seg.End-seg.Start > longest.End-longest.Start {
-					longest = seg
-				}
-			}
-			frag.Speaker = longest.Speaker
-		}
+		frag.Speaker = stableID
+		frag.Segments = []FragSpeakerSeg{{
+			Speaker: stableID,
+			Start:   0,
+			End:     round2(frag.Duration),
+			Text:    frag.Text,
+		}}
 	}
 	session.mu.Unlock()
 
