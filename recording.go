@@ -661,8 +661,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		fragDuration := float64(fragAudioLen) / 16000.0
-		log.Printf("recording: fragment %d fertig: %d bytes (%.1fs)", fragmentIdx, fragAudioLen, fragDuration)
+		log.Printf("recording: fragment %d fertig: %d bytes (%.1fs)", fragmentIdx, fragAudioLen, float64(fragAudioLen)/16000.0)
 
 		sseWrite(w, flusher, map[string]any{
 			"type":     "status",
@@ -682,7 +681,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session.addFragment(fragmentIdx, text, "unknown", fragDuration, fragAudioLen)
+		session.addFragment(fragmentIdx, text, "unknown")
 
 		// Fragment-Audio asynchron per WebDAV hochladen (crash-safe)
 		if session.shareToken != "" {
@@ -830,8 +829,15 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		session.fragAudio = append(session.fragAudio, audioData...)
 	}
 
+	// Fragment-Ende: letztes Sprach-Sample (silenceSinceSamples), nicht totalSamples.
+	// totalSamples enthält die Stille nach dem letzten Wort.
+	fragEndSamples := session.totalSamples
+	if session.silenceSinceSamples > 0 {
+		fragEndSamples = session.silenceSinceSamples
+	}
+
 	fragCompleteByDuration := false
-	if session.fragAudio != nil && session.totalSamples-session.fragStartSamples >= maxFragmentSamples {
+	if session.fragAudio != nil && fragEndSamples-session.fragStartSamples >= maxFragmentSamples {
 		fragCompleteByDuration = true
 	}
 
@@ -867,16 +873,24 @@ func (session *RecordingSession) takeFragAudio() []byte {
 }
 
 // addFragment fügt ein abgeschlossenes Fragment zur Session hinzu.
-// fragAudioLen: Länge des Fragment-Audios in Bytes (vor takeFragAudio).
-func (session *RecordingSession) addFragment(idx int, text, speaker string, duration float64, fragAudioLen int) {
+func (session *RecordingSession) addFragment(idx int, text, speaker string) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	// fragStartSamples = totalSamples zum Fragment-Start.
-	// Das ist der absolute Start-Offset in der Session.
+	// fragStartSamples = totalSamples zum Fragment-Start (absolute Session-Zeit).
+	// silenceSinceSamples = totalSamples bei letztem Sprach-Sample (Fragment-Ende).
 	start := float64(session.fragStartSamples) / 16000.0
 	if start < 0 {
 		start = 0
+	}
+	// Fragment-Ende: letztes Sprach-Sample, nicht totalSamples (das enthält Stille)
+	endSamples := session.totalSamples
+	if session.silenceSinceSamples > 0 {
+		endSamples = session.silenceSinceSamples
+	}
+	end := float64(endSamples) / 16000.0
+	if end < start {
+		end = start
 	}
 
 	session.Fragments = append(session.Fragments, RecordingFrag{
@@ -884,8 +898,8 @@ func (session *RecordingSession) addFragment(idx int, text, speaker string, dura
 		Text:     text,
 		Speaker:  speaker,
 		Start:    start,
-		End:      start + duration,
-		Duration: duration,
+		End:      end,
+		Duration: end - start,
 		Status:   "done",
 	})
 	session.prevTranscript = text
@@ -1056,12 +1070,17 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		}
 		var spans []span
 		for _, seg := range overlapping {
-			if len(spans) > 0 && seg.Start <= spans[len(spans)-1].end {
+			// Segment auf Fragment-Start clampen (Fragment beginnt erst hier)
+			clampedStart := seg.Start
+			if clampedStart < frag.Start {
+				clampedStart = frag.Start
+			}
+			if len(spans) > 0 && clampedStart <= spans[len(spans)-1].end {
 				// Overlap: dominante Stimme der Kombination bestimmen
 				last := &spans[len(spans)-1]
-				ovWith := seg.Start
-				if ovWith < last.end {
-					ovWith = last.end
+				ovWith := clampedStart
+				if ovWith < last.start {
+					ovWith = last.start
 				}
 				lastDur := last.end - ovWith
 				segDur := seg.End - ovWith
@@ -1072,7 +1091,7 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 					last.end = seg.End
 				}
 			} else {
-				spans = append(spans, span{seg.Start, seg.End, seg.Speaker})
+				spans = append(spans, span{clampedStart, seg.End, seg.Speaker})
 			}
 		}
 
