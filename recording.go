@@ -1026,11 +1026,15 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			continue
 		}
 
-		// Diarization-Segmente die mit diesem Fragment überlappen, extrahieren
+		// Diarization-Segmente die mit diesem Fragment überlappen, extrahieren.
+		// Segmente < 1s ignorieren (pyannote-Mikro-Artefakte bei Overlap/Noise).
 		var overlapping []diarizeSegment
 		for _, seg := range result.Segments {
 			ovStart := math.Max(frag.Start, seg.Start)
 			ovEnd := math.Min(frag.End, seg.End)
+			if ovEnd-ovStart < 1.0 {
+				continue
+			}
 			if ovEnd > ovStart {
 				overlapping = append(overlapping, diarizeSegment{
 					Speaker: seg.Speaker,
@@ -1123,6 +1127,7 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			startIdx int
 			endIdx   int // exklusiv
 		}
+		const minWords = 4 // Sub-Fragmente mit < 4 Wörtern werden zusammengeführt
 		var subs []subFrag
 		for wi := 0; wi < len(words); {
 			spk := wordSpk[wi]
@@ -1132,6 +1137,40 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			}
 			subs = append(subs, subFrag{spk, wi, end})
 			wi = end
+		}
+
+		// Mikro-Fragmente (< minWords) mit Nachbar zusammenführen
+		if len(subs) > 1 {
+			merged := []subFrag{subs[0]}
+			for i := 1; i < len(subs); i++ {
+				cur := subs[i]
+				prev := &merged[len(merged)-1]
+				curWords := cur.endIdx - cur.startIdx
+				if curWords < minWords {
+					// Zu kurz → in vorheriges aufnehmen
+					prev.endIdx = cur.endIdx
+					continue
+				}
+				// Prüfen ob vorheriges jetzt zu kurz ist
+				prevWords := prev.endIdx - prev.startIdx
+				if prevWords < minWords && len(merged) > 1 {
+					pprev := &merged[len(merged)-2]
+					pprev.endIdx = prev.endIdx
+					merged = merged[:len(merged)-1]
+					continue
+				}
+				merged = append(merged, cur)
+			}
+			// Letztes kann auch zu kurz sein
+			if len(merged) > 1 {
+				last := &merged[len(merged)-1]
+				lastWords := last.endIdx - last.startIdx
+				if lastWords < minWords {
+					merged[len(merged)-2].endIdx = last.endIdx
+					merged = merged[:len(merged)-1]
+				}
+			}
+			subs = merged
 		}
 
 		// Sub-Fragmente als neue Fragments schreiben
