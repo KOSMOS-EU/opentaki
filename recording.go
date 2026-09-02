@@ -216,6 +216,15 @@ func decodeAudioToPCM16(audioData []byte) []int16 {
 
 // pcm16ToWAV wrappt PCM16 16kHz mono in einen WAV-Container.
 // Nötig weil Whisper-API (vLLM) WAV erwartet.
+// pcm16ToBytes konvertiert []int16 zu raw PCM16-Bytes (little-endian).
+func pcm16ToBytes(samples []int16) []byte {
+	b := make([]byte, len(samples)*2)
+	for i, s := range samples {
+		binary.LittleEndian.PutUint16(b[i*2:], uint16(s))
+	}
+	return b
+}
+
 func pcm16ToWAV(samples []int16) []byte {
 	numSamples := uint32(len(samples))
 	byteRate := uint32(16000 * 2 * 1) // 16kHz, 16-bit, mono
@@ -787,9 +796,9 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	isSilent := s.vadIsSilent(rms)
 	log.Printf("recording: chunk rms=%.4f silent=%v audio=%d bytes", rms, isSilent, len(audioData))
 
-	// Audio in Session-Buffer einhängen
-	session.totalAudio = append(session.totalAudio, audioData...)
+	// Audio in Session-Buffer einhängen (nur PCM16, nicht rohes WebM)
 	if samples != nil {
+		session.totalAudio = append(session.totalAudio, pcm16ToBytes(samples)...)
 		session.totalSamples += len(samples)
 	}
 
