@@ -1012,11 +1012,17 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		}
 	}
 
-	// 3. Pro Fragment: Speaker-Segmente aus Diarization-Overlap
+	// 3. Pro Fragment: Speaker-Wechsel-Erkennung + Fragment-Splitting
+	//    Große VAD-Fragmente (164s in Sitzungen) enthalten mehrere Sprecher.
+	//    Nach der Diarization an Speaker-Wechsel-Grenzen aufteilen,
+	//    Text pro Zeitspanne proportional verteilen.
 	session.mu.Lock()
-	for fi := range session.Fragments {
-		frag := &session.Fragments[fi]
+	newFrags := make([]RecordingFrag, 0, len(session.Fragments))
+	splitCount := 0
+
+	for _, frag := range session.Fragments {
 		if frag.Duration <= 0 || frag.Text == "" {
+			newFrags = append(newFrags, frag)
 			continue
 		}
 
@@ -1034,6 +1040,7 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			}
 		}
 		if len(overlapping) == 0 {
+			newFrags = append(newFrags, frag)
 			continue
 		}
 
@@ -1042,40 +1049,128 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			return overlapping[i].Start < overlapping[j].Start
 		})
 
-		// Dominanter Speaker pro Fragment: Speaker mit der längsten
-		// Gesamt-Overlap-Dauer. Pyannote erzeugt Overlap + Mikro-Segmente,
-		// daher nur Gesamt-Dauer summieren statt per-Segment-Splitting.
-		speakerDur := map[string]float64{}
-		for _, seg := range overlapping {
-			speakerDur[seg.Speaker] += seg.End - seg.Start
+		// Überlappende Segmente zu Zeitspannen mit dominanter Stimme zusammenfassen
+		// (pyannote-Overlap: bei 2 Speakern gleichzeitig gewinnt der mit mehr Dauer)
+		type span struct {
+			start, end float64
+			speaker    string
 		}
-		dominant := ""
-		var bestDur float64
-		for sp, dur := range speakerDur {
-			if dur > bestDur {
-				bestDur = dur
-				dominant = sp
+		var spans []span
+		for _, seg := range overlapping {
+			if len(spans) > 0 && seg.Start <= spans[len(spans)-1].end {
+				// Overlap: dominante Stimme der Kombination bestimmen
+				last := &spans[len(spans)-1]
+				ovWith := seg.Start
+				if ovWith < last.end {
+					ovWith = last.end
+				}
+				lastDur := last.end - ovWith
+				segDur := seg.End - ovWith
+				if segDur > lastDur {
+					last.speaker = seg.Speaker
+				}
+				if seg.End > last.end {
+					last.end = seg.End
+				}
+			} else {
+				spans = append(spans, span{seg.Start, seg.End, seg.Speaker})
 			}
 		}
-		if dominant == "" {
+
+		// Fallback: nur eine Zeitspanne → dominanter Speaker, kein Split
+		if len(spans) <= 1 {
+			sp := spans[0]
+			stableID := sp.speaker
+			if mapped, ok := speakerProfiles[sp.speaker]; ok {
+				stableID = mapped
+			}
+			frag.Speaker = stableID
+			frag.Segments = []FragSpeakerSeg{{
+				Speaker: stableID,
+				Start:   0,
+				End:     round2(frag.Duration),
+				Text:    frag.Text,
+			}}
+			newFrags = append(newFrags, frag)
 			continue
 		}
-		stableID := dominant
-		if mapped, ok := speakerProfiles[dominant]; ok {
-			stableID = mapped
+
+		// Fragment an Speaker-Wechsel-Grenzen splitten
+		words := strings.Fields(frag.Text)
+		if len(words) == 0 {
+			newFrags = append(newFrags, frag)
+			continue
 		}
-		frag.Speaker = stableID
-		frag.Segments = []FragSpeakerSeg{{
-			Speaker: stableID,
-			Start:   0,
-			End:     round2(frag.Duration),
-			Text:    frag.Text,
-		}}
+
+		// Pro Wort: Zeitspanne bestimmen → Speaker zuordnen
+		// Wort i liegt bei relativer Zeit i/N * Duration im Fragment
+		wordSpk := make([]string, len(words))
+		for wi, _ := range words {
+			relTime := float64(wi) / float64(len(words)) * frag.Duration
+			absTime := frag.Start + relTime
+			wordSpk[wi] = spans[0].speaker // Fallback: erste Span
+			for _, sp := range spans {
+				if absTime >= sp.start && absTime < sp.end {
+					wordSpk[wi] = sp.speaker
+					break
+				}
+			}
+		}
+
+		// Kontiguierte Wortgruppen mit gleichem Speaker zusammenfassen
+		type subFrag struct {
+			speaker  string
+			startIdx int
+			endIdx   int // exklusiv
+		}
+		var subs []subFrag
+		for wi := 0; wi < len(words); {
+			spk := wordSpk[wi]
+			end := wi + 1
+			for end < len(words) && wordSpk[end] == spk {
+				end++
+			}
+			subs = append(subs, subFrag{spk, wi, end})
+			wi = end
+		}
+
+		// Sub-Fragmente als neue Fragments schreiben
+		for _, sf := range subs {
+			stableID := sf.speaker
+			if mapped, ok := speakerProfiles[sf.speaker]; ok {
+				stableID = mapped
+			}
+			subText := strings.Join(words[sf.startIdx:sf.endIdx], " ")
+			relStart := float64(sf.startIdx) / float64(len(words)) * frag.Duration
+			relEnd := float64(sf.endIdx) / float64(len(words)) * frag.Duration
+			newFrags = append(newFrags, RecordingFrag{
+				Index:    frag.Index,
+				Text:     subText,
+				Speaker:  stableID,
+				Start:    round2(frag.Start + relStart),
+				End:      round2(frag.Start + relEnd),
+				Duration: round2(relEnd - relStart),
+				Status:   "done",
+				Segments: []FragSpeakerSeg{{
+					Speaker: stableID,
+					Start:   0,
+					End:     round2(relEnd - relStart),
+					Text:    subText,
+				}},
+			})
+		}
+		splitCount++
 	}
+
+	// Neue Fragment-Liste ersetzen (Index neu vergeben)
+	for i := range newFrags {
+		newFrags[i].Index = i + 1
+	}
+	session.Fragments = newFrags
 	session.mu.Unlock()
 
-	log.Printf("recording: session/end-diarize: fertig in %v (%d Speaker, %d Fragmente aktualisiert)",
-		time.Since(start), len(envelopeOrder), len(session.Fragments))
+	log.Printf("recording: session/end-diarize: fertig in %v (%d Speaker, %d Fragmente, %d gesplittet)",
+		time.Since(start), len(envelopeOrder), len(newFrags), splitCount)
 }
 
 // ── WebDAV-Upload ────────────────────────────────────────────
