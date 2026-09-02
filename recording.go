@@ -69,6 +69,8 @@ type RecordingSession struct {
 	fragIndex       int       // laufende Fragment-Nummer
 	prevTranscript  string    // Transkript bis letzte Sprechpause (Kontext)
 	totalAudio      []byte    // komplettes Audio der Session
+	totalSamples    int       // kumulierte PCM-Samples (für korrektes Timing)
+	fragSamplesAtStart int   // totalSamples zum Fragment-Start
 	shareToken      string    // WebDAV Share-Token (public-files)
 	sharePasswd     string            // WebDAV Share-Password
 }
@@ -787,6 +789,9 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 
 	// Audio in Session-Buffer einhängen
 	session.totalAudio = append(session.totalAudio, audioData...)
+	if samples != nil {
+		session.totalSamples += len(samples)
+	}
 
 	// VAD-State-Machine
 	fragmentComplete := false
@@ -818,6 +823,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 			session.fragStart = now
 			session.fragIndex++
 			session.lastPartial = time.Time{}
+			session.fragSamplesAtStart = session.totalSamples
 		}
 
 		// Audio zum aktuellen Fragment hinzufügen
@@ -870,7 +876,10 @@ func (session *RecordingSession) addFragment(idx int, text, speaker string, dura
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	start := float64(len(session.totalAudio) - fragAudioLen) / 16000.0
+	// totalAudio ist ein Byte-Buffer (raw PCM/WebM), nicht Samples.
+	// Für PCM16: 2 Bytes pro Sample. Für WebM: unzuverlässig —
+	// daher cumulative Sample-Counter nutzen.
+	start := float64(session.totalSamples - session.fragSamplesAtStart) / 16000.0
 	if start < 0 {
 		start = 0
 	}
