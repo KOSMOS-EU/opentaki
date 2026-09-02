@@ -1033,6 +1033,18 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			return overlapping[i].Start < overlapping[j].Start
 		})
 
+		// Aufeinanderfolgende Segmente desselben Speakers mergen (Gap < 2s)
+		var merged []diarizeSegment
+		for _, seg := range overlapping {
+			if len(merged) > 0 && merged[len(merged)-1].Speaker == seg.Speaker &&
+				seg.Start-merged[len(merged)-1].End < 2.0 {
+				merged[len(merged)-1].End = seg.End
+			} else {
+				merged = append(merged, seg)
+			}
+		}
+		overlapping = merged
+
 		// Text prozentual nach Segment-Dauer aufteilen
 		words := strings.Fields(frag.Text)
 		if len(words) == 0 {
