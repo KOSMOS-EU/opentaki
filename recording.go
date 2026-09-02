@@ -61,16 +61,15 @@ type RecordingSession struct {
 	// Server-seitiger State (nicht serialisiert)
 	mu              sync.Mutex
 	fragAudio       []byte    // rohe Audio-Bytes des aktuellen Fragments
-	fragStart       time.Time // Zeitpunkt Fragment-Start
-	lastSilence     time.Time // letzter Zeitpunkt mit Stille
+	fragStartSamples int      // totalSamples zum Fragment-Start (Audio-Zeit)
+	lastSilence     int       // totalSamples bei letzter Stille (Audio-Zeit)
 	speechActive    bool      // aktuell in Sprechphase
-	silenceSince    time.Time // seit wann Stille
-	lastPartial     time.Time // letzter Partial-Transcribe
+	silenceSinceSamples int   // totalSamples seit Stille beginnt (Audio-Zeit)
+	lastPartialSamples int    // totalSamples beim letzten Partial-Transcribe (Audio-Zeit)
 	fragIndex       int       // laufende Fragment-Nummer
 	prevTranscript  string    // Transkript bis letzte Sprechpause (Kontext)
-	totalAudio      []byte    // komplettes Audio der Session
+	totalAudio      []byte    // komplettes Audio der Session (PCM16)
 	totalSamples    int       // kumulierte PCM-Samples (für korrektes Timing)
-	fragSamplesAtStart int   // totalSamples zum Fragment-Start
 	shareToken      string    // WebDAV Share-Token (public-files)
 	sharePasswd     string            // WebDAV Share-Password
 }
@@ -772,18 +771,17 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	now := time.Now()
-	silenceTimeout := time.Duration(s.cfg.Recording.SilenceTimeout) * time.Millisecond
-	if s.cfg.Recording.SilenceTimeout <= 0 {
-		silenceTimeout = 800 * time.Millisecond
+	silenceTimeoutMs := s.cfg.Recording.SilenceTimeout
+	if silenceTimeoutMs <= 0 {
+		silenceTimeoutMs = 800
 	}
-	partialInterval := time.Duration(s.cfg.Recording.PartialInterval) * time.Second
-	if s.cfg.Recording.PartialInterval <= 0 {
-		partialInterval = 3 * time.Second
+	partialIntervalSec := s.cfg.Recording.PartialInterval
+	if partialIntervalSec <= 0 {
+		partialIntervalSec = 3
 	}
-	maxFragment := time.Duration(s.cfg.Recording.MaxFragmentSec) * time.Second
-	if s.cfg.Recording.MaxFragmentSec <= 0 {
-		maxFragment = 30 * time.Second
+	maxFragmentSec := s.cfg.Recording.MaxFragmentSec
+	if maxFragmentSec <= 0 {
+		maxFragmentSec = 30
 	}
 
 	// Audio dekodieren + RMS
@@ -802,58 +800,47 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		session.totalSamples += len(samples)
 	}
 
-	// VAD-State-Machine
+	// VAD-State-Machine (Audio-Zeit basierend auf totalSamples, nicht Wall-Clock)
 	fragmentComplete := false
+	silenceTimeoutSamples := silenceTimeoutMs * 16 // ms → samples (16kHz: 16 samples/ms)
+	maxFragmentSamples := maxFragmentSec * 16000   // sec → samples
+	partialIntervalSamples := partialIntervalSec * 16000
 
 	if isSilent {
-		if !session.silenceSince.IsZero() {
-			// Bereits in Stille → Timer läuft
-			silenceDur := now.Sub(session.silenceSince)
-			if silenceDur >= silenceTimeout {
-				// Sprechpause lang genug → Fragment fertig
+		if session.silenceSinceSamples > 0 {
+			silenceDurSamples := session.totalSamples - session.silenceSinceSamples
+			if silenceDurSamples >= silenceTimeoutSamples {
 				fragmentComplete = true
 			}
 		} else {
-			// Stille beginnt
-			session.silenceSince = now
+			session.silenceSinceSamples = session.totalSamples
 		}
 		session.speechActive = false
 	} else {
-		// Sprache erkannt
-		if !session.silenceSince.IsZero() {
-			// Stille war kürzer als Timeout → nicht wirklich Pause
-			// (z.B. Komma-Pause), weiter sprechen
-			session.silenceSince = time.Time{}
+		if session.silenceSinceSamples > 0 {
+			session.silenceSinceSamples = 0
 		}
 		session.speechActive = true
 
-		// Neues Fragment starten (wenn noch keins offen)
 		if session.fragAudio == nil {
-			session.fragStart = now
+			session.fragStartSamples = session.totalSamples
 			session.fragIndex++
-			session.lastPartial = time.Time{}
-			session.fragSamplesAtStart = session.totalSamples
+			session.lastPartialSamples = 0
 		}
-
-		// Audio zum aktuellen Fragment hinzufügen
 		session.fragAudio = append(session.fragAudio, audioData...)
 	}
 
-	// Max-Fragment-Dauer
 	fragCompleteByDuration := false
-	if session.fragAudio != nil && now.Sub(session.fragStart) >= maxFragment {
+	if session.fragAudio != nil && session.totalSamples-session.fragStartSamples >= maxFragmentSamples {
 		fragCompleteByDuration = true
 	}
 
-	// Partial-Transkription prüfen
 	var partialText string
 	if !isSilent && session.fragAudio != nil &&
-		session.lastPartial.IsZero() ||
-		(!isSilent && session.fragAudio != nil &&
-			now.Sub(session.lastPartial) >= partialInterval) {
-		// Partial: Whisper auf bisherigem Fragment-Teil
+		(session.lastPartialSamples == 0 ||
+			session.totalSamples-session.lastPartialSamples >= partialIntervalSamples) {
 		partialText = s.whisperTranscribeBytes(session.fragAudio)
-		session.lastPartial = now
+		session.lastPartialSamples = session.totalSamples
 	}
 
 	// Fragment abschließen (VAD oder Duration)
@@ -872,9 +859,9 @@ func (session *RecordingSession) takeFragAudio() []byte {
 	defer session.mu.Unlock()
 	audio := session.fragAudio
 	session.fragAudio = nil
-	session.silenceSince = time.Time{}
+	session.silenceSinceSamples = 0
 	session.speechActive = false
-	session.lastPartial = time.Time{}
+	session.lastPartialSamples = 0
 	session.prevTranscript = ""
 	return audio
 }
@@ -885,9 +872,9 @@ func (session *RecordingSession) addFragment(idx int, text, speaker string, dura
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	// fragSamplesAtStart = totalSamples zum Fragment-Start.
+	// fragStartSamples = totalSamples zum Fragment-Start.
 	// Das ist der absolute Start-Offset in der Session.
-	start := float64(session.fragSamplesAtStart) / 16000.0
+	start := float64(session.fragStartSamples) / 16000.0
 	if start < 0 {
 		start = 0
 	}
@@ -909,9 +896,9 @@ func (session *RecordingSession) markFragFailed(idx int) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.fragAudio = nil
-	session.silenceSince = time.Time{}
+	session.silenceSinceSamples = 0
 	session.speechActive = false
-	session.lastPartial = time.Time{}
+	session.lastPartialSamples = 0
 }
 
 // ── Session-End-Diarization ──────────────────────────────────
