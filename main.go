@@ -223,7 +223,7 @@ type Server struct {
 	recMu     sync.Mutex
 	sessions  map[string]*RecordingSession
 	speakerMu sync.RWMutex
-	speakers  []SpeakerProfile
+	speakerData speakerStoreData
 }
 
 // traceCtx carries per-request debug context through the pipeline.
@@ -4627,6 +4627,7 @@ func main() {
 	log.Printf("  Chat:      /chat/ask (opencloud=%s, model=%s, max_iter=%d, chat_token=%v)", cfg.OpenCloud.URL, cfg.Chat.DefaultModel, cfg.Chat.MaxIterations, cfg.Chat.ChatToken.Secret != "")
 
 	srv := NewServer(cfg)
+	srv.loadSpeakers()
 
 	http.HandleFunc("/tika/text", srv.handleTikaText)
 	http.HandleFunc("/tika/pdf2chat", srv.handlePdf2Chat)
@@ -4645,6 +4646,7 @@ func main() {
 	http.HandleFunc("/recording/chunk", srv.handleRecordingChunk)
 	http.HandleFunc("/recording/sessions", srv.handleRecordingSessions)
 	http.HandleFunc("/recording/speakers", srv.handleRecordingSpeakers)
+	http.HandleFunc("/recording/speakers/link", srv.handleRecordingSpeakerLink)
 	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/stats", srv.handleStats)
 	http.HandleFunc("/tika", srv.handleHealth)

@@ -94,13 +94,27 @@ type FragSpeakerSeg struct {
 	Text    string  `json:"text"` // Text-Anteil (proportional zur Dauer)
 }
 
+// SpeakerPerson = die Person (stabil, user-definiert).
+// Ein Person hat 0..n Profile (pro Session-Erkennung).
+type SpeakerPerson struct {
+	ID   string `json:"id"`   // "person_<sha8>"
+	Name string `json:"name"` // "Anna Brandis"
+}
+
+// SpeakerProfile = eine erkannte Stimme, gehört zu einer Person.
 type SpeakerProfile struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Embedding []float64 `json:"embedding"`
+	ID        string    `json:"id"`        // "profile_<sha8>"
+	PersonID  string    `json:"person_id"` // → SpeakerPerson.ID
+	Embedding []float64 `json:"embedding"` // 512d pyannote
+	Source    string    `json:"source"`    // Session-ID woher
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
-	Count     int       `json:"count"`
+}
+
+// speakerStoreData ist die JSON-Struktur in speakers.json.
+type speakerStoreData struct {
+	Persons  []SpeakerPerson  `json:"persons"`
+	Profiles []SpeakerProfile `json:"profiles"`
 }
 
 // ── Diarize response (openannote format) ────────────────────
@@ -268,14 +282,15 @@ func (s *Server) loadSpeakersLocked() {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.speakers = []SpeakerProfile{}
+			s.speakerData = speakerStoreData{Persons: []SpeakerPerson{}, Profiles: []SpeakerProfile{}}
 			return
 		}
 		log.Printf("recording: speaker load error: %v", err)
 		return
 	}
-	if err := json.Unmarshal(data, &s.speakers); err != nil {
+	if err := json.Unmarshal(data, &s.speakerData); err != nil {
 		log.Printf("recording: speaker parse error: %v", err)
+		s.speakerData = speakerStoreData{Persons: []SpeakerPerson{}, Profiles: []SpeakerProfile{}}
 	}
 }
 
@@ -290,7 +305,7 @@ func (s *Server) saveSpeakersLocked() {
 	if path == "" {
 		return
 	}
-	data, err := json.MarshalIndent(s.speakers, "", "  ")
+	data, err := json.MarshalIndent(s.speakerData, "", "  ")
 	if err != nil {
 		log.Printf("recording: speaker save error: %v", err)
 		return
@@ -303,6 +318,54 @@ func (s *Server) saveSpeakersLocked() {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		log.Printf("recording: speaker write error: %v", err)
 	}
+}
+
+// findPersonByName sucht eine Person nach Name (case-insensitive).
+// Liefert (person, index) oder (nil, -1).
+func (s *Server) findPersonByName(name string) (*SpeakerPerson, int) {
+	for i, p := range s.speakerData.Persons {
+		if strings.EqualFold(p.Name, name) {
+			return &s.speakerData.Persons[i], i
+		}
+	}
+	return nil, -1
+}
+
+// findOrCreatePerson holt eine Person per Name oder legt sie an.
+// Rufer muss speakerMu halten.
+func (s *Server) findOrCreatePerson(name string) SpeakerPerson {
+	person, _ := s.findPersonByName(name)
+	if person != nil {
+		return *person
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(name)))
+	newPerson := SpeakerPerson{
+		ID:   "person_" + hex.EncodeToString(sum[:4]),
+		Name: name,
+	}
+	s.speakerData.Persons = append(s.speakerData.Persons, newPerson)
+	return newPerson
+}
+
+// findProfileByEmbeddingAndPerson findet ein bestehendes Profil für eine Person
+// mit Cosine > threshold. Liefert (profile, index) oder (nil, -1).
+func (s *Server) findProfileByEmbeddingAndPerson(personID string, embedding []float64, threshold float64) (*SpeakerProfile, int) {
+	bestIdx := -1
+	bestScore := 0.0
+	for i, p := range s.speakerData.Profiles {
+		if p.PersonID != personID {
+			continue
+		}
+		score := cosineSimilarity(embedding, p.Embedding)
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 && bestScore >= threshold {
+		return &s.speakerData.Profiles[bestIdx], bestIdx
+	}
+	return nil, -1
 }
 
 // cosineSimilarity berechnet die Cosine-Similarität zweier Vektoren.
@@ -322,10 +385,17 @@ func cosineSimilarity(a, b []float64) float64 {
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
-// matchSpeaker findet das beste Speaker-Profil für einen Speaker-Label.
-// openannote liefert "SPEAKER_00", "SPEAKER_01" etc. Wir mappen das
-// über die Embeddings in SpeakerProfile.
-func (s *Server) matchSpeaker(embedding []float64) (SpeakerProfile, float64, bool) {
+// matchSpeakerResult ist das Ergebnis eines Speaker-Matches.
+type matchSpeakerResult struct {
+	PersonID string
+	Person   SpeakerPerson
+	Score    float64
+	Matched  bool
+}
+
+// matchSpeaker findet die beste Person per Embedding-Cosine gegen ALLE Profile.
+// Liefert (Person, Score, Matched).
+func (s *Server) matchSpeaker(embedding []float64) matchSpeakerResult {
 	s.speakerMu.RLock()
 	defer s.speakerMu.RUnlock()
 
@@ -334,21 +404,55 @@ func (s *Server) matchSpeaker(embedding []float64) (SpeakerProfile, float64, boo
 		threshold = 0.75
 	}
 
-	bestProfile := SpeakerProfile{}
+	var bestPerson SpeakerPerson
 	bestScore := 0.0
 
-	for _, profile := range s.speakers {
+	for _, profile := range s.speakerData.Profiles {
 		score := cosineSimilarity(embedding, profile.Embedding)
 		if score > bestScore {
 			bestScore = score
-			bestProfile = profile
+			// Person nach ID holen
+			for _, p := range s.speakerData.Persons {
+				if p.ID == profile.PersonID {
+					bestPerson = p
+					break
+				}
+			}
 		}
 	}
 
 	if bestScore >= threshold {
-		return bestProfile, bestScore, true
+		return matchSpeakerResult{PersonID: bestPerson.ID, Person: bestPerson, Score: bestScore, Matched: true}
 	}
-	return SpeakerProfile{}, bestScore, false
+	return matchSpeakerResult{Score: bestScore, Matched: false}
+}
+
+// addProfileForSession legt ein Profil für eine Person an (oder aktualisiert existentes).
+// Rufer muss speakerMu halten.
+func (s *Server) addProfileForSession(personID string, embedding []float64, sourceSessionID string) {
+	threshold := s.cfg.Recording.SpeakerMatch
+	if threshold <= 0 {
+		threshold = 0.75
+	}
+
+	// Bestehendes Profil für diese Person mit ähnlichem Embedding?
+	if existing, idx := s.findProfileByEmbeddingAndPerson(personID, embedding, threshold); existing != nil {
+		existing.LastSeen = time.Now()
+		s.speakerData.Profiles[idx] = *existing
+		return
+	}
+
+	// Neues Profil anlegen
+	sum := sha256.Sum256([]byte(sourceSessionID))
+	profile := SpeakerProfile{
+		ID:        "profile_" + hex.EncodeToString(sum[:4]),
+		PersonID:  personID,
+		Embedding: embedding,
+		Source:    sourceSessionID,
+		FirstSeen: time.Now(),
+		LastSeen:  time.Now(),
+	}
+	s.speakerData.Profiles = append(s.speakerData.Profiles, profile)
 }
 
 // ── Routes ───────────────────────────────────────────────────
@@ -703,7 +807,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleRecordingSpeakers: GET = Liste, PUT = Profil anlegen/aktualisieren.
+// handleRecordingSpeakers: GET = Personen + Profile auflisten.
 func (s *Server) handleRecordingSpeakers(w http.ResponseWriter, r *http.Request) {
 	if !s.chatVerifyToken(w, r) {
 		return
@@ -712,50 +816,77 @@ func (s *Server) handleRecordingSpeakers(w http.ResponseWriter, r *http.Request)
 	switch r.Method {
 	case http.MethodGet:
 		s.speakerMu.RLock()
-		speakers := make([]SpeakerProfile, len(s.speakers))
-		copy(speakers, s.speakers)
+		data := s.speakerData
 		s.speakerMu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(speakers)
+		json.NewEncoder(w).Encode(data)
 
 	case http.MethodPut:
-		var profile SpeakerProfile
-		if err := json.NewDecoder(r.Body).Decode(&profile); err != nil {
+		// Person anlegen: {name: "Anna Brandis"}
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeChatError(w, http.StatusBadRequest, "ungültiges JSON: "+err.Error())
 			return
 		}
-		if profile.ID == "" {
-			sum := sha256.Sum256([]byte(profile.Name + time.Now().Format(time.RFC3339)))
-			profile.ID = hex.EncodeToString(sum[:8])
+		if body.Name == "" {
+			writeChatError(w, http.StatusBadRequest, "name fehlt")
+			return
 		}
-		if profile.FirstSeen.IsZero() {
-			profile.FirstSeen = time.Now()
-		}
-		profile.LastSeen = time.Now()
-		profile.Count++
 
 		s.speakerMu.Lock()
-		found := false
-		for i, existing := range s.speakers {
-			if existing.ID == profile.ID {
-				s.speakers[i] = profile
-				found = true
-				break
-			}
-		}
-		if !found {
-			s.speakers = append(s.speakers, profile)
-		}
+		person := s.findOrCreatePerson(body.Name)
 		s.saveSpeakersLocked()
 		s.speakerMu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(profile)
+		json.NewEncoder(w).Encode(person)
 
 	default:
 		http.Error(w, "GET or PUT only", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleRecordingSpeakerLink: PUT — SPEAKER_XX aus Session an Person binden.
+// {session_id, speaker_id, person_name, embedding}
+func (s *Server) handleRecordingSpeakerLink(w http.ResponseWriter, r *http.Request) {
+	if !s.chatVerifyToken(w, r) {
+		return
+	}
+	if r.Method != http.MethodPut {
+		http.Error(w, "PUT only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		SessionID  string    `json:"session_id"`
+		SpeakerID  string    `json:"speaker_id"`   // "SPEAKER_00"
+		PersonName string    `json:"person_name"`  // "Anna Brandis"
+		Embedding  []float64 `json:"embedding"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeChatError(w, http.StatusBadRequest, "ungültiges JSON: "+err.Error())
+		return
+	}
+	if body.PersonName == "" {
+		writeChatError(w, http.StatusBadRequest, "person_name fehlt")
+		return
+	}
+
+	s.speakerMu.Lock()
+	person := s.findOrCreatePerson(body.PersonName)
+	if len(body.Embedding) > 0 {
+		s.addProfileForSession(person.ID, body.Embedding, body.SessionID)
+	}
+	s.saveSpeakersLocked()
+	s.speakerMu.Unlock()
+
+	log.Printf("recording: speaker link: %s → %s (%s)", body.SpeakerID, person.Name, person.ID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(person)
 }
 
 // ── Core: Audio-Chunk Verarbeitung + VAD ─────────────────────
@@ -963,11 +1094,12 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		}
 	}
 
-	// 2. Stabile Speaker-IDs + Profil-Matching
-	speakerProfiles := map[string]string{} // rawLabel → stabile Session-ID
+	// 2. Stabile Speaker-IDs + Person-Matching per Embedding
+	//    speakerDisplay: rawLabel → Anzeigename (Person-Name oder SPEAKER_XX)
+	speakerDisplay := map[string]string{}
 	for i, label := range envelopeOrder {
 		stableID := fmt.Sprintf("SPEAKER_%02d", i)
-		speakerProfiles[label] = stableID
+		speakerDisplay[label] = stableID // Default: Session-ID
 
 		env := envByLabel[label]
 		if len(env.envelope) == 0 {
@@ -985,40 +1117,38 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			}
 		}
 
-		// Cosine-Matching gegen bestehende Profile
-		profile, score, found := s.matchSpeaker(meanEmb)
-		if found {
-			log.Printf("recording: session/end-diarize: %s → Profil %q (%.2f)",
-				stableID, profile.Name, score)
-			// Profil-Count aktualisieren
-			s.speakerMu.Lock()
-			for j, p := range s.speakers {
-				if p.ID == profile.ID {
-					s.speakers[j].LastSeen = time.Now()
-					s.speakers[j].Count++
+		// Cosine-Matching gegen ALLE Profile → Person
+		match := s.matchSpeaker(meanEmb)
+		s.speakerMu.Lock()
+		if match.Matched {
+			speakerDisplay[label] = match.Person.Name
+			log.Printf("recording: session/end-diarize: %s → Person %q (%.2f)",
+				stableID, match.Person.Name, match.Score)
+			s.addProfileForSession(match.PersonID, meanEmb, session.ID)
+		} else {
+			// Unbekannte Stimme: "Unbekannt"-Person anlegen, Profil mit Embedding speichern
+			unbekannt := SpeakerPerson{
+				ID:   "person_unknown",
+				Name: "Unbekannt",
+			}
+			// Bestehende "Unbekannt"-Person suchen
+			for _, p := range s.speakerData.Persons {
+				if p.ID == "person_unknown" {
+					unbekannt = p
 					break
 				}
 			}
-			s.saveSpeakersLocked()
-			s.speakerMu.Unlock()
-		} else {
-			log.Printf("recording: session/end-diarize: %s → neues Profil (best=%.2f)",
-				stableID, score)
-			// Neues Profil anlegen
-			now := time.Now()
-			newProfile := SpeakerProfile{
-				ID:        stableID + "_" + session.ID[:13],
-				Name:      stableID,
-				Embedding: meanEmb,
-				FirstSeen: now,
-				LastSeen:  now,
-				Count:     1,
+			if unbekannt.ID != "person_unknown" {
+				// Noch nicht angelegt
+				s.speakerData.Persons = append(s.speakerData.Persons, unbekannt)
 			}
-			s.speakerMu.Lock()
-			s.speakers = append(s.speakers, newProfile)
-			s.saveSpeakersLocked()
-			s.speakerMu.Unlock()
+			speakerDisplay[label] = stableID // bleibt SPEAKER_XX bis User benennt
+			log.Printf("recording: session/end-diarize: %s → unbekannt (best=%.2f), Profil gespeichert",
+				stableID, match.Score)
+			s.addProfileForSession("person_unknown", meanEmb, session.ID)
 		}
+		s.saveSpeakersLocked()
+		s.speakerMu.Unlock()
 	}
 
 	// 3. Pro Fragment: Speaker-Wechsel-Erkennung + Fragment-Splitting
@@ -1099,7 +1229,7 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		if len(spans) <= 1 {
 			sp := spans[0]
 			stableID := sp.speaker
-			if mapped, ok := speakerProfiles[sp.speaker]; ok {
+			if mapped, ok := speakerDisplay[sp.speaker]; ok {
 				stableID = mapped
 			}
 			frag.Speaker = stableID
@@ -1190,7 +1320,7 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		// Sub-Fragmente als neue Fragments schreiben
 		for _, sf := range subs {
 			stableID := sf.speaker
-			if mapped, ok := speakerProfiles[sf.speaker]; ok {
+			if mapped, ok := speakerDisplay[sf.speaker]; ok {
 				stableID = mapped
 			}
 			subText := strings.Join(words[sf.startIdx:sf.endIdx], " ")
