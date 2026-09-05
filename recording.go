@@ -1391,8 +1391,8 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 		"fragments":     session.Fragments,
 		"speaker_hints": speakerHints,
 	}, "", "  ")
-	if err := dav.sharePutFile(sessionDir+"/transkript.json", string(transcriptJSON)); err != nil {
-		log.Printf("recording: webdav: PUT transkript.json: %v", err)
+	if err := dav.sharePutFile(sessionDir+"/transkript.trs", string(transcriptJSON)); err != nil {
+		log.Printf("recording: webdav: PUT transkript.trs: %v", err)
 	}
 
 	// Audio (komplettes Session-Audio)
