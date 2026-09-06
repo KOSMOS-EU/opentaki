@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -223,7 +224,7 @@ type Server struct {
 	recMu     sync.Mutex
 	sessions  map[string]*RecordingSession
 	speakerMu sync.RWMutex
-	speakerData speakerStoreData
+	speakerDB *sql.DB
 }
 
 // traceCtx carries per-request debug context through the pipeline.
@@ -628,7 +629,7 @@ func NewServer(cfg Config) *Server {
 		log.Printf("  Layer cache: %s/layers (conf min %d, max %d entries)",
 			workDir, layerConfMin, layerCacheMax)
 	}
-	return &Server{
+	srv := &Server{
 		cfg:           cfg,
 		methodStats:   make(map[string]*methodStat),
 		client:        client,
@@ -639,6 +640,13 @@ func NewServer(cfg Config) *Server {
 		layerCacheMax: layerCacheMax,
 		sessions:      make(map[string]*RecordingSession),
 	}
+
+	// Speaker-Store initialisieren (SQLite)
+	if err := srv.initSpeakerStore(); err != nil {
+		log.Printf("recording: speaker store init: %v", err)
+	}
+
+	return srv
 }
 
 // ── Main handlers ────────────────────────────────────────────
@@ -4627,7 +4635,6 @@ func main() {
 	log.Printf("  Chat:      /chat/ask (opencloud=%s, model=%s, max_iter=%d, chat_token=%v)", cfg.OpenCloud.URL, cfg.Chat.DefaultModel, cfg.Chat.MaxIterations, cfg.Chat.ChatToken.Secret != "")
 
 	srv := NewServer(cfg)
-	srv.loadSpeakers()
 
 	http.HandleFunc("/tika/text", srv.handleTikaText)
 	http.HandleFunc("/tika/pdf2chat", srv.handlePdf2Chat)

@@ -78,7 +78,7 @@ chat:
 recording:
   diarize_api_base: ""     # e.g. "http://microllm:8012/svc/steno-ml"
   diarize_model: ""        # e.g. "pyannote/speaker-diarization-3.1" (leer = Default)
-  speaker_store: ""        # e.g. "/data/speakers.json" (leer = kein Store)
+  speaker_store: ""        # SQLite-DB Pfad (leer = /data/speakers.db)
   max_chunk_mb: 50         # max. Audio-Chunk-Größe in MB
   session_dir: ".recordings"
 
