@@ -1603,6 +1603,7 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 		"transcript":    transcript,
 		"fragments":     session.Fragments,
 		"speaker_hints": speakerHints,
+		"audio_file":    "aufnahme.wav",
 	}, "", "  ")
 	if err := dav.sharePutFile(sessionDir+"/transkript.trs", string(transcriptJSON)); err != nil {
 		log.Printf("recording: webdav: PUT transkript.trs: %v", err)
