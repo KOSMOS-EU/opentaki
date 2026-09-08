@@ -10,7 +10,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/DIST"
 
 TAG="${1:-latest}"
-FULL_IMAGE="${DOCKER_REGISTRY}/${DOCKER_NS}/${IMAGE}:${TAG}"
+REGISTRY="${PUSH_REGISTRY:-ghcr.io}"
+NS="${PUSH_NS:-kosmos-eu}"
+IMAGE="${APP:-open_taki}"
+FULL_IMAGE="${REGISTRY}/${NS}/${IMAGE}:${TAG}"
 COMPOSE_DIR="/nu/container/${TARGET}/compose"
 CONF="${COMPOSE_DIR}/compose.nuhost6.conf"
 
