@@ -123,6 +123,7 @@ type SpeakerProfile struct {
 // SpeakerRef identifiziert einen Sprecher in einem Fragment.
 type SpeakerRef struct {
 	PersonName string
+	PersonID   int // Person-Table-ID (für addProfileForSession)
 	ProfileID  int // 0 = nicht gesetzt (erstes Profil)
 }
 
@@ -1450,7 +1451,10 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 			}
 		}
 	}
-	const windowAlignThreshold = 0.60
+	// 0.80 statt 0.60: verschiedene Sprecher haben typischerweise 0.5-0.7 Cosine.
+	// Nur derselbe Sprecher mit leicht variierendem Embedding (unterschiedliche
+	// Windows) liegt zuverlässig ≥ 0.80.
+	const windowAlignThreshold = 0.80
 	if bestScore >= windowAlignThreshold && bestRef.PersonName != "" {
 		session.liveSpeakerMap[label] = bestRef
 		session.liveSpeakerEmb[label] = emb
@@ -1464,16 +1468,16 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 	var ref SpeakerRef
 	if match.Matched {
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
-		ref = SpeakerRef{PersonName: match.Person.Name, ProfileID: pid}
+		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
 		log.Printf("recording: live-diarize: label %s → %q (match=%.2f)", label, match.Person.Name, match.Score)
 	} else if match.Score >= 0.70 && strings.HasPrefix(match.Person.Name, "SPEAKER_") {
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
-		ref = SpeakerRef{PersonName: match.Person.Name, ProfileID: pid}
+		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
 		log.Printf("recording: live-diarize: label %s → %q (unbekannt-zone=%.2f)", label, match.Person.Name, match.Score)
 	} else {
 		person := s.createGlobalSpeaker()
 		pid := s.addProfileForSession(person.ID, emb, session.ID)
-		ref = SpeakerRef{PersonName: person.Name, ProfileID: pid}
+		ref = SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
 		log.Printf("recording: live-diarize: label %s → neue Person %q (best=%.2f)", label, person.Name, match.Score)
 	}
 	s.speakerMu.Unlock()
@@ -1580,13 +1584,54 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			}
 		}
 
+		// 1a. Session-lokales Live-Match: wenn der Rolling-Window-Pfad
+		//     diesen Sprecher schon zugeordnet hat, wiederverwenden.
+		//     Verhindert dass Session-End eine neue Person anlegt, wenn
+		//     die Envelope-Mean nicht gegen globale Profile matcht.
+		session.mu.Lock()
+		liveRef := SpeakerRef{}
+		liveMatched := false
+		if len(session.liveSpeakerEmb) > 0 {
+			var bestLiveScore float64
+			for _, emb := range session.liveSpeakerEmb {
+				if sc := cosineSimilarity(meanEmb, emb); sc > bestLiveScore {
+					bestLiveScore = sc
+				}
+			}
+			// 0.75: Envelope-Mean aus 30+ Segmenten vs. Einzel-Window-Embedding
+			// kann abweichen. 0.80 wäre zu streng, 0.60 zu locker.
+			if bestLiveScore >= 0.75 {
+				// Besten Embedding finden und zugehörigen Ref
+				for l, emb := range session.liveSpeakerEmb {
+					if sc := cosineSimilarity(meanEmb, emb); sc >= 0.75 {
+						if ref, ok := session.liveSpeakerMap[l]; ok {
+							liveRef = ref
+							liveMatched = true
+							log.Printf("recording: session/end-diarize: %s → Live-Speaker %q (cosine=%.2f)",
+								label, ref.PersonName, sc)
+							break
+						}
+					}
+				}
+			}
+		}
+		session.mu.Unlock()
+
+		if liveMatched {
+			s.speakerMu.Lock()
+			profileID := s.addProfileForSession(liveRef.PersonID, meanEmb, session.ID)
+			speakerDisplay[label] = SpeakerRef{PersonName: liveRef.PersonName, PersonID: liveRef.PersonID, ProfileID: profileID}
+			s.speakerMu.Unlock()
+			continue
+		}
+
 		// Cosine-Matching gegen ALLE Profile → Person
 		match := s.matchSpeaker(meanEmb)
 		s.speakerMu.Lock()
 		if match.Matched {
 			// Bekannte Person: Profil updaten oder anlegen
 			profileID := s.addProfileForSession(match.Person.ID, meanEmb, session.ID)
-			speakerDisplay[label] = SpeakerRef{PersonName: match.Person.Name, ProfileID: profileID}
+			speakerDisplay[label] = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: profileID}
 			log.Printf("recording: session/end-diarize: %s → Person %q (profile %d, %.2f)",
 				label, match.Person.Name, profileID, match.Score)
 		} else {
@@ -1600,13 +1645,13 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			if match.Score >= unknownToUnknownThreshold &&
 				strings.HasPrefix(match.Person.Name, "SPEAKER_") {
 				profileID := s.addProfileForSession(match.Person.ID, meanEmb, session.ID)
-				speakerDisplay[label] = SpeakerRef{PersonName: match.Person.Name, ProfileID: profileID}
+				speakerDisplay[label] = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: profileID}
 				log.Printf("recording: session/end-diarize: %s → wiederverwende %q (profile %d, score=%.2f, unbekannt-zone)",
 					label, match.Person.Name, profileID, match.Score)
 			} else {
 				person := s.createGlobalSpeaker()
 				profileID := s.addProfileForSession(person.ID, meanEmb, session.ID)
-				speakerDisplay[label] = SpeakerRef{PersonName: person.Name, ProfileID: profileID}
+				speakerDisplay[label] = SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: profileID}
 				log.Printf("recording: session/end-diarize: %s → neue Person %q (profile %d, best=%.2f)",
 					label, person.Name, profileID, match.Score)
 			}
