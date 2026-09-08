@@ -81,6 +81,9 @@ recording:
   speaker_store: ""        # SQLite-DB Pfad (leer = /data/speakers.db)
   max_chunk_mb: 50         # max. Audio-Chunk-Größe in MB
   session_dir: ".recordings"
+  live_diarize: false      # Rolling-Window-Diarization (Live-Speaker während Aufnahme)
+  live_window_sec: 60      # Rolling-Window-Länge in Sekunden
+  live_overlap_sec: 10     # Overlap für Label-Alignment zwischen Windows
 
 # Routing (active with X-Taki-Protocol: v2)
 routing:

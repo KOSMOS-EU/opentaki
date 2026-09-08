@@ -47,6 +47,9 @@ type RecordingConfig struct {
 	SilenceTimeout  int     `yaml:"silence_timeout_ms"` // ms of silence → fragment end (default 800)
 	PartialInterval int     `yaml:"partial_interval_s"` // seconds between partial transcriptions (default 3)
 	MaxFragmentSec  int     `yaml:"max_fragment_sec"`   // max fragment duration (default 30)
+	LiveDiarize     bool    `yaml:"live_diarize"`       // Rolling-Window-Diarization (default false)
+	LiveWindowSec   int     `yaml:"live_window_sec"`    // Rolling-Window-Länge in Sekunden (default 60)
+	LiveOverlapSec  int     `yaml:"live_overlap_sec"`   // Overlap für Label-Alignment (default 10)
 }
 
 // ── Types ────────────────────────────────────────────────────
@@ -72,7 +75,13 @@ type RecordingSession struct {
 	totalAudio      []byte    // komplettes Audio der Session (PCM16)
 	totalSamples    int       // kumulierte PCM-Samples (für korrektes Timing)
 	shareToken      string    // WebDAV Share-Token (public-files)
-	sharePasswd     string            // WebDAV Share-Password
+	sharePasswd     string    // WebDAV Share-Password
+
+	// Rolling-Window-Diarization (Live-Speaker)
+	windowCursorSamples int                 // höchstes totalSamples mit Live-Speaker
+	liveSpeakerByFrag   map[int]string      // Fragment-Index → Speaker-Name
+	liveSpeakerMap      map[string]SpeakerRef // pyannote-Label → stabile SpeakerRef (session-lokal)
+	liveSpeakerEmb      map[string][]float64  // pyannote-Label → Embedding (für Alignment)
 }
 
 type RecordingFrag struct {
@@ -653,6 +662,9 @@ func (s *Server) handleRecordingSession(w http.ResponseWriter, r *http.Request) 
 			Fragments:    []RecordingFrag{},
 			shareToken:   body.Share.Token,
 			sharePasswd:  body.Share.Password,
+			liveSpeakerByFrag: make(map[int]string),
+			liveSpeakerMap:    make(map[string]SpeakerRef),
+			liveSpeakerEmb:    make(map[string][]float64),
 		}
 
 		s.recMu.Lock()
@@ -964,6 +976,19 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			"text":     text,
 			"method":   "whisper",
 		})
+
+		// Rolling-Window-Diarization: Live-Speaker für das fertige Fragment
+		if s.cfg.Recording.LiveDiarize && s.cfg.Recording.DiarizeAPIBase != "" {
+			liveSpeaker := s.diarizeWindowLive(session, fragmentIdx)
+			if liveSpeaker != "" {
+				session.addFragmentSpeaker(fragmentIdx, liveSpeaker)
+				sseWrite(w, flusher, map[string]any{
+					"type":     "speaker",
+					"fragment": fragmentIdx,
+					"speaker":  liveSpeaker,
+				})
+			}
+		}
 
 		sseWrite(w, flusher, map[string]any{
 			"type":     "done",
@@ -1277,6 +1302,217 @@ func (session *RecordingSession) markFragFailed(idx int) {
 }
 
 // ── Session-End-Diarization ──────────────────────────────────
+
+// ── Rolling-Window-Diarization (Live-Speaker) ────────────────────
+
+// diarizeWindowLive führt eine Rolling-Window-Diarization durch.
+// WICHTIG: session.mu wird NICHT gehalten (wird in handleRecordingChunk aufgerufen).
+// Returns Speaker-Name für das Fragment das soeben fertig wurde, oder "".
+func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx int) string {
+	windowSec := s.cfg.Recording.LiveWindowSec
+	if windowSec <= 0 {
+		windowSec = 60
+	}
+	overlapSec := s.cfg.Recording.LiveOverlapSec
+	if overlapSec <= 0 {
+		overlapSec = 10
+	}
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	// Genug Audio seit letztem Cursor?
+	if session.totalSamples-session.windowCursorSamples < windowSec*16000 {
+		return ""
+	}
+
+	// Window berechnen: [cursor - overlap, cursor + window]
+	winEndSamples := session.windowCursorSamples + windowSec*16000
+	if winEndSamples > session.totalSamples {
+		winEndSamples = session.totalSamples
+	}
+	winStartSamples := session.windowCursorSamples - overlapSec*16000
+	if winStartSamples < 0 {
+		winStartSamples = 0
+	}
+	// Defensive: Window muss im totalAudio-Bereich liegen
+	if winEndSamples*2 > len(session.totalAudio) {
+		winEndSamples = len(session.totalAudio) / 2
+	}
+	if winEndSamples-winStartSamples < 3*16000 {
+		return ""
+	}
+
+	// Sub-Window von totalAudio (raw PCM16)
+	windowAudio := session.totalAudio[winStartSamples*2 : winEndSamples*2]
+	result := s.diarizeAudioBytes(windowAudio)
+	if result == nil || len(result.Segments) == 0 {
+		return ""
+	}
+
+	// Per Label: Embedding extrahieren + Envelope [start, end] berechnen
+	type windowEnv struct {
+		start, end float64
+		emb        []float64
+	}
+	envByLabel := make(map[string]*windowEnv)
+	var labelOrder []string
+	for _, seg := range result.Segments {
+		e, ok := envByLabel[seg.Speaker]
+		if !ok {
+			e = &windowEnv{start: seg.Start, end: seg.End}
+			envByLabel[seg.Speaker] = e
+			labelOrder = append(labelOrder, seg.Speaker)
+		}
+		if seg.Start < e.start {
+			e.start = seg.Start
+		}
+		if seg.End > e.end {
+			e.end = seg.End
+		}
+	}
+	for _, label := range labelOrder {
+		if emb, ok := result.SpeakerEmbeddings[label]; ok {
+			envByLabel[label].emb = emb
+		}
+	}
+
+	// Label-Alignment: pyannote-Label → stabile SpeakerRef
+	labelRefs := make(map[string]SpeakerRef)
+	for _, label := range labelOrder {
+		emb := envByLabel[label].emb
+		if len(emb) == 0 {
+			continue
+		}
+		ref, ok := s.alignWindowLabel(session, label, emb)
+		if ok {
+			labelRefs[label] = ref
+		}
+	}
+
+	// Segmente auf absolute Session-Zeit umrechnen
+	winStartSec := float64(winStartSamples) / 16000.0
+	var absSegs []diarizeSegment
+	for _, seg := range result.Segments {
+		absSegs = append(absSegs, diarizeSegment{
+			Speaker: seg.Speaker,
+			Start:   winStartSec + seg.Start,
+			End:     winStartSec + seg.End,
+		})
+	}
+
+	// Fragmente im Window-Zeitfenster [cursor, winEnd] zuweisen
+	cursorSec := float64(session.windowCursorSamples) / 16000.0
+	winEndSec := float64(winEndSamples) / 16000.0
+	for i := range session.Fragments {
+		frag := &session.Fragments[i]
+		mid := (frag.Start + frag.End) / 2
+		if mid < cursorSec || mid > winEndSec {
+			continue
+		}
+		ref := dominantSpeakerAt(absSegs, labelRefs, mid)
+		if ref.PersonName == "" {
+			continue
+		}
+		name := ref.String()
+		session.liveSpeakerByFrag[frag.Index] = name
+		if frag.Speaker == "" || frag.Speaker == "unknown" {
+			frag.Speaker = name
+		}
+	}
+
+	// Cursor vorrücken
+	session.windowCursorSamples = winEndSamples
+
+	log.Printf("recording: live-diarize: window [%.0f-%.0f]s → %d Speaker, cursor=%.0fs",
+		cursorSec, winEndSec, len(labelRefs), winEndSec)
+
+	return session.liveSpeakerByFrag[completedFragIdx]
+}
+
+// alignWindowLabel aligniert ein pyannote-Window-Label auf eine stabile SpeakerRef.
+// Drei Stufen: Identity, Cosine-Alignment, Global Profile Match.
+// Precondition: session.mu wird vom Caller gehalten (KEIN Lock hier).
+func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb []float64) (SpeakerRef, bool) {
+	// 1. Identity: Label existiert schon in der Session
+	if ref, ok := session.liveSpeakerMap[label]; ok {
+		return ref, true
+	}
+
+	// 2. Cosine-Alignment gegen bekannte stable Refs (nur bei ≥2 Labels)
+	bestRef := SpeakerRef{}
+	bestScore := 0.0
+	for l, r := range session.liveSpeakerMap {
+		if e, ok := session.liveSpeakerEmb[l]; ok && len(e) > 0 {
+			if sc := cosineSimilarity(emb, e); sc > bestScore {
+				bestScore = sc
+				bestRef = r
+			}
+		}
+	}
+	const windowAlignThreshold = 0.60
+	if bestScore >= windowAlignThreshold && bestRef.PersonName != "" {
+		session.liveSpeakerMap[label] = bestRef
+		session.liveSpeakerEmb[label] = emb
+		log.Printf("recording: live-diarize: label %s → %q (cosine=%.2f)", label, bestRef.PersonName, bestScore)
+		return bestRef, true
+	}
+
+	// 3. Global Profile Match (REUSE matchSpeaker + create/addProfile Logik)
+	match := s.matchSpeaker(emb)
+	s.speakerMu.Lock()
+	var ref SpeakerRef
+	if match.Matched {
+		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
+		ref = SpeakerRef{PersonName: match.Person.Name, ProfileID: pid}
+		log.Printf("recording: live-diarize: label %s → %q (match=%.2f)", label, match.Person.Name, match.Score)
+	} else if match.Score >= 0.70 && strings.HasPrefix(match.Person.Name, "SPEAKER_") {
+		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
+		ref = SpeakerRef{PersonName: match.Person.Name, ProfileID: pid}
+		log.Printf("recording: live-diarize: label %s → %q (unbekannt-zone=%.2f)", label, match.Person.Name, match.Score)
+	} else {
+		person := s.createGlobalSpeaker()
+		pid := s.addProfileForSession(person.ID, emb, session.ID)
+		ref = SpeakerRef{PersonName: person.Name, ProfileID: pid}
+		log.Printf("recording: live-diarize: label %s → neue Person %q (best=%.2f)", label, person.Name, match.Score)
+	}
+	s.speakerMu.Unlock()
+
+	session.liveSpeakerMap[label] = ref
+	session.liveSpeakerEmb[label] = emb
+	return ref, true
+}
+
+// dominantSpeakerAt findet den Speaker mit der längsten Abdeckung an absMid.
+// Bei Overlap: längeres Segment gewinnt.
+func dominantSpeakerAt(segs []diarizeSegment, labelRefs map[string]SpeakerRef, absMid float64) SpeakerRef {
+	bestDur := 0.0
+	var best SpeakerRef
+	for _, seg := range segs {
+		if absMid >= seg.Start && absMid < seg.End {
+			dur := seg.End - seg.Start
+			if dur > bestDur {
+				bestDur = dur
+				best = labelRefs[seg.Speaker]
+			}
+		}
+	}
+	return best
+}
+
+// addFragmentSpeaker setzt den Speaker für ein Fragment (wenn noch unknown).
+func (session *RecordingSession) addFragmentSpeaker(idx int, speaker string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for i := range session.Fragments {
+		if session.Fragments[i].Index == idx {
+			if session.Fragments[i].Speaker == "" || session.Fragments[i].Speaker == "unknown" {
+				session.Fragments[i].Speaker = speaker
+			}
+			break
+		}
+	}
+}
 
 // diarizeSessionEnd führt die Diarization einmal auf dem kompletten
 // Session-Audio aus und mappt die Segmente zeitbasiert auf Fragmente.
