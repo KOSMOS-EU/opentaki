@@ -1354,12 +1354,26 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			log.Printf("recording: session/end-diarize: %s → Person %q (profile %d, %.2f)",
 				label, match.Person.Name, profileID, match.Score)
 		} else {
-			// Unbekannte Stimme: globale SPEAKER_XX Person anlegen
-			person := s.createGlobalSpeaker()
-			profileID := s.addProfileForSession(person.ID, meanEmb, session.ID)
-			speakerDisplay[label] = SpeakerRef{PersonName: person.Name, ProfileID: profileID}
-			log.Printf("recording: session/end-diarize: %s → neue Person %q (profile %d, best=%.2f)",
-				label, person.Name, profileID, match.Score)
+			// Unbekannte Stimme.
+			// Falls der Score in der "Unbekannt-Zone" liegt (0.70–0.75) und die
+			// beste Person noch ein SPEAKER_XX ist (nicht manuell benannt),
+			// wiederverwenden statt neu anlegen — verhindert dass derselbe
+			// unbekannte Sprecher in zwei Sessions zwei verschiedene SPEAKER_XX
+			// bekommt.
+			const unknownToUnknownThreshold = 0.70
+			if match.Score >= unknownToUnknownThreshold &&
+				strings.HasPrefix(match.Person.Name, "SPEAKER_") {
+				profileID := s.addProfileForSession(match.Person.ID, meanEmb, session.ID)
+				speakerDisplay[label] = SpeakerRef{PersonName: match.Person.Name, ProfileID: profileID}
+				log.Printf("recording: session/end-diarize: %s → wiederverwende %q (profile %d, score=%.2f, unbekannt-zone)",
+					label, match.Person.Name, profileID, match.Score)
+			} else {
+				person := s.createGlobalSpeaker()
+				profileID := s.addProfileForSession(person.ID, meanEmb, session.ID)
+				speakerDisplay[label] = SpeakerRef{PersonName: person.Name, ProfileID: profileID}
+				log.Printf("recording: session/end-diarize: %s → neue Person %q (profile %d, best=%.2f)",
+					label, person.Name, profileID, match.Score)
+			}
 		}
 		s.speakerMu.Unlock()
 	}
@@ -1484,7 +1498,7 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			startIdx int
 			endIdx   int // exklusiv
 		}
-		const minWords = 4 // Sub-Fragmente mit < 4 Wörtern werden zusammengeführt
+		const minWords = 2 // Sub-Fragmente mit < 2 Wörtern werden zusammengeführt
 		var subs []subFrag
 		for wi := 0; wi < len(words); {
 			spk := wordSpk[wi]
