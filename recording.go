@@ -740,6 +740,20 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	}
 	fullTranscript := transcriptBuilder.String()
 
+	// 3a. WebDAV-Upload (auch bei leerem Transkript — Audio-File hochladen)
+	if session.shareToken != "" && len(session.totalAudio) > 0 {
+		uploadPath := s.webdavUploadRecording(session, fullTranscript)
+		if uploadPath != "" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"status":     "done",
+				"transcript": "",
+				"upload":     uploadPath,
+				"message":    "Kein Transkript, Audio hochgeladen",
+			})
+			return
+		}
+	}
 	if fullTranscript == "" {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
