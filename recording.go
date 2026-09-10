@@ -768,13 +768,18 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	finishedTranscript := fullTranscript
 	if s.cfg.LLM.APIBase != "" {
 		prompt := fmt.Sprintf(
-			`Du erhältst ein Roh-Transkript einer Audio-Aufnahme. Korrigiere:
+			`Du erhältst ein Roh-Transkript einer Audio-Aufnahme. Korrigiere NUR:
 - Tippfehler und Erkennungsfehler
 - Fehlende Satzzeichen (Punkte, Kommas, Frage-/Ausrufezeichen)
 - Grammatik und Rechtschreibung
-- Übermäßige Wiederholungen (Füllwörter)
+- Füllwörter (äh, ähm, also also)
 
-Behalte die Sprecher-Zuordnungen bei ([Name]: Text).
+WICHTIG:
+- Füge KEINE neuen Wörter, Sätze, Floskeln oder Formulierungen hinzu.
+- Erfinde KEINEN Inhalt. NUR was im Roh-Transkript steht.
+- Entferne KEINE inhaltlichen Aussagen.
+- Behalte die Sprecher-Zuordnungen bei ([Name]: Text).
+
 Gib NUR den korrigierten Text zurück, keine Erklärungen.
 
 Roh-Transkript:
@@ -2223,6 +2228,13 @@ func (s *Server) whisperTranscribeBytes(audioData []byte) string {
 		log.Printf("recording: Audio-Dekodierung fehlgeschlagen (%d bytes)", len(audioData))
 		return ""
 	}
+
+	// Stille am Anfang/Ende trimmen (Whisper erfindet bei Stille Floskeln wie "Vielen Dank")
+	samples = trimSilence(samples)
+	if len(samples) < 1600 { // < 100ms → zu kurz, überspringen
+		return ""
+	}
+
 	wavData := pcm16ToWAV(samples)
 
 	var buf bytes.Buffer
@@ -2253,6 +2265,55 @@ func (s *Server) whisperTranscribeBytes(audioData []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(wr.Text)
+}
+
+// trimSilence entfernt Stille (RMS < 0.008) von Anfang und Ende des Audio.
+// Whisper erfindet bei Stille/Rauschen Floskeln ("Vielen Dank", "Thank you").
+func trimSilence(samples []int16) []int16 {
+	const threshold = 0.008 // etwas unter der VAD-Schwelle (0.01)
+	const frameSize = 320   // 20ms bei 16kHz
+
+	if len(samples) < frameSize*2 {
+		return samples
+	}
+
+	// Erstes nicht-stilles Frame finden
+	start := 0
+	for start+frameSize <= len(samples) {
+		frame := samples[start : start+frameSize]
+		if rmsFromPCM16(frame) >= threshold {
+			break
+		}
+		start += frameSize
+	}
+
+	// Letztes nicht-stilles Frame finden
+	end := len(samples)
+	for end-start > frameSize {
+		fStart := end - frameSize
+		if rmsFromPCM16(samples[fStart:end]) >= threshold {
+			break
+		}
+		end -= frameSize
+	}
+
+	// 50ms Padding behalten (damit Konsonanten nicht abgeschnitten werden)
+	padding := 800 // 50ms bei 16kHz
+	if start > padding {
+		start -= padding
+	} else {
+		start = 0
+	}
+	if end < len(samples)-padding {
+		end += padding
+	} else {
+		end = len(samples)
+	}
+
+	if start >= end {
+		return samples
+	}
+	return samples[start:end]
 }
 
 // ── Helpers ──────────────────────────────────────────────────
