@@ -1002,6 +1002,25 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 					"fragment": fragmentIdx,
 					"speaker":  liveSpeaker,
 				})
+
+				// LLM Word-Boundary-Correction: prüfen ob die letzten Wörter
+				// des VORHERIGEN Fragments zum aktuellen Speaker gehören.
+				wordCount := s.llmSplitCheck(session, fragmentIdx)
+				if wordCount > 0 {
+					session.mu.Lock()
+					prevIdx := 0
+					if len(session.Fragments) >= 2 {
+						prevIdx = session.Fragments[len(session.Fragments)-2].Index
+					}
+					session.mu.Unlock()
+					session.applyLlmSplit(prevIdx, wordCount, liveSpeaker)
+					sseWrite(w, flusher, map[string]any{
+						"type":     "split",
+						"fragment": prevIdx,
+						"words":    wordCount,
+						"speaker":  liveSpeaker,
+					})
+				}
 			}
 		}
 
@@ -1529,6 +1548,143 @@ func (session *RecordingSession) addFragmentSpeaker(idx int, speaker string) {
 			}
 			break
 		}
+	}
+}
+
+// ── LLM Word-Boundary-Correction (Live) ─────────────────────────────
+
+// llmSplitPrompt ist der Prompt für die Wort-Grenzen-Korrektur.
+// Das LLM prüft ob am Ende des vorherigen Fragments Wörter stehen die
+// zum aktuellen (neuen) Sprecher gehören.
+const llmSplitPrompt = `Du bist ein Transkript-Korrekter. Mehrere Sprecher wechseln sich ab.
+Die Tonerkennung schlägt manchmal Wörter des neuen Sprechers dem
+vorherigen zu (Sprecherwechsel zu spät erkannt).
+
+Kontext:
+--- [%s] %s ---
+%s
+
+--- [%s] %s ---
+%s
+
+--- [%s] %s ---
+%s
+
+Prüfe: Hängen am ENDE des 2. Abschnitts Wörter, die inhaltlich/syntaktisch
+zum 3. Abschnitt gehören? Achte auf Satzanfänge ("Wenn", "Und", "Dass",
+"60 Prozent" etc.), Subjekt-Prädikat-Strukturen, Konjunktionen.
+
+Wenn JA: Gib die ANZAHL der Wörter am Ende des 2. Abschnitts an die zum
+3. Abschnitt gehören.
+SPLIT: <Anzahl>
+BEGRÜNDUNG: <eine Zeile>
+
+Wenn NEIN:
+SPLIT: NONE
+BEGRÜNDUNG: <eine Zeile>`
+
+// llmSplitCheck ruft das LLM auf um zu prüfen ob die letzten Wörter des
+// vorherigen Fragments zum aktuellen (neuen) Sprecher gehören.
+// Liefert die Wort-Anzahl (0 = kein Split).
+func (s *Server) llmSplitCheck(session *RecordingSession, newFragIdx int) int {
+	session.mu.Lock()
+	frags := make([]RecordingFrag, len(session.Fragments))
+	copy(frags, session.Fragments)
+	session.mu.Unlock()
+
+	if len(frags) < 2 {
+		return 0
+	}
+
+	// prev = das Fragment vor dem neuen, cur = das neue, next = ggf. das nach dem neuen
+	// In der Live-Pipeline: das "neue" Fragment ist das letzte in der Liste.
+	prev := frags[len(frags)-2]
+	cur := frags[len(frags)-1]
+
+	// Für besseren Kontext: das Fragment VOR dem prev (falls vorhanden)
+	var contextFrag RecordingFrag
+	if len(frags) >= 3 {
+		contextFrag = frags[len(frags)-3]
+	} else {
+		contextFrag = RecordingFrag{Speaker: "(none)", Text: "(kein vorheriges Fragment)"}
+	}
+
+	fmtCtx := fmt.Sprintf("%.1f-%.1fs", contextFrag.Start, contextFrag.End)
+	fmtPrev := fmt.Sprintf("%.1f-%.1fs", prev.Start, prev.End)
+	fmtCur := fmt.Sprintf("%.1f-%.1fs", cur.Start, cur.End)
+
+	prompt := fmt.Sprintf(llmSplitPrompt,
+		fmtCtx, contextFrag.Speaker, contextFrag.Text,
+		fmtPrev, prev.Speaker, prev.Text,
+		fmtCur, cur.Speaker, cur.Text,
+	)
+
+	messages := []chatMessage{
+		{Role: "user", Content: prompt},
+	}
+	result, _ := s.llmCompleteOptsBackend(messages, nil, nil, "split")
+
+	// Parse: "SPLIT: N" oder "SPLIT: NONE"
+	for _, line := range strings.Split(result, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToUpper(line), "SPLIT:") {
+			val := strings.TrimSpace(strings.TrimPrefix(line, "SPLIT:"))
+			val = strings.TrimPrefix(strings.TrimPrefix(val, "SPLIT:"), ":")
+			if strings.EqualFold(val, "NONE") || val == "" {
+				return 0
+			}
+			var n int
+			if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 && n < len(strings.Fields(prev.Text)) {
+				log.Printf("recording: llm-split: fragment %d, letzte %d Wörter → Speaker %s",
+					prev.Index, n, cur.Speaker)
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// applyLlmSplit spaltet ein Fragment: die letzten <wordCount> Wörter
+// bekommen den Speaker des nächsten Fragments.
+func (session *RecordingSession) applyLlmSplit(fragIdx int, wordCount int, nextSpeaker string) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	for i := range session.Fragments {
+		if session.Fragments[i].Index != fragIdx {
+			continue
+		}
+		frag := &session.Fragments[i]
+		words := strings.Fields(frag.Text)
+		if wordCount >= len(words) {
+			return
+		}
+
+		splitAt := len(words) - wordCount
+		partA := strings.Join(words[:splitAt], " ")
+		partB := strings.Join(words[splitAt:], " ")
+
+		// Zeit-Split proportional zu Wortanzahl
+		duration := frag.End - frag.Start
+		splitTime := frag.Start + duration*float64(splitAt)/float64(len(words))
+
+		// Fragment A bleibt, Fragment B wird neu angehängt
+		frag.Text = partA
+		frag.End = splitTime
+		frag.Duration = splitTime - frag.Start
+
+		newFrag := RecordingFrag{
+			Index:    fragIdx + 1000, // eindeutiger Sub-Index
+			Text:     partB,
+			Speaker:  nextSpeaker,
+			Start:    splitTime,
+			End:      frag.End,
+			Duration: frag.End - splitTime,
+			Status:   "split",
+		}
+		// Nach dem alten Fragment einfügen
+		session.Fragments = append(session.Fragments[:i+1], append([]RecordingFrag{newFrag}, session.Fragments[i+1:]...)...)
+		break
 	}
 }
 
