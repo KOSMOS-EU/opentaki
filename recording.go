@@ -1262,8 +1262,16 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	}
 
 	fragCompleteByDuration := false
-	if session.fragAudio != nil && fragEndSamples-session.fragStartSamples >= maxFragmentSamples {
-		fragCompleteByDuration = true
+	if session.fragAudio != nil {
+		fragDurSamples := fragEndSamples - session.fragStartSamples
+		if fragDurSamples >= maxFragmentSamples {
+			fragCompleteByDuration = true
+			log.Printf("recording: fragment %d duration-end: %.1fs >= max %.1fs",
+				session.fragIndex, float64(fragDurSamples)/16000.0, float64(maxFragmentSamples)/16000.0)
+		} else if fragDurSamples%16000 < 160 { // ~1s logging
+			log.Printf("recording: fragment %d duration: %.1fs / max %.1fs",
+				session.fragIndex, float64(fragDurSamples)/16000.0, float64(maxFragmentSamples)/16000.0)
+		}
 	}
 
 	var partialText string
