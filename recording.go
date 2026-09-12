@@ -954,6 +954,11 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 
 	// Fragment fertig → Whisper (SPEAKER wird per Session-End-Diarization nachgeliefert)
 	if fragmentComplete {
+		// Duration aus Sample-Count berechnen (korrekt für PCM16 und WebM)
+		session.mu.Lock()
+		fragDurSec := float64(session.totalSamples-session.fragStartSamples) / 16000.0
+		session.mu.Unlock()
+
 		fragAudio := session.takeFragAudio()
 		fragAudioLen := len(fragAudio)
 
@@ -963,7 +968,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("recording: fragment %d fertig: %d bytes (%.1fs)", fragmentIdx, fragAudioLen, float64(fragAudioLen)/16000.0)
+		log.Printf("recording: fragment %d fertig: %d bytes (%.1fs)", fragmentIdx, fragAudioLen, fragDurSec)
 
 		sseWrite(w, flusher, map[string]any{
 			"type":     "status",
@@ -1262,16 +1267,8 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	}
 
 	fragCompleteByDuration := false
-	if session.fragAudio != nil {
-		fragDurSamples := fragEndSamples - session.fragStartSamples
-		if fragDurSamples >= maxFragmentSamples {
-			fragCompleteByDuration = true
-			log.Printf("recording: fragment %d duration-end: %.1fs >= max %.1fs",
-				session.fragIndex, float64(fragDurSamples)/16000.0, float64(maxFragmentSamples)/16000.0)
-		} else if fragDurSamples%16000 < 160 { // ~1s logging
-			log.Printf("recording: fragment %d duration: %.1fs / max %.1fs",
-				session.fragIndex, float64(fragDurSamples)/16000.0, float64(maxFragmentSamples)/16000.0)
-		}
+	if session.fragAudio != nil && fragEndSamples-session.fragStartSamples >= maxFragmentSamples {
+		fragCompleteByDuration = true
 	}
 
 	var partialText string
@@ -1635,6 +1632,9 @@ func (s *Server) llmSplitCheck(session *RecordingSession, newFragIdx int) int {
 	messages := []chatMessage{
 		{Role: "user", Content: prompt},
 	}
+	log.Printf("recording: llm-split-check: fragment %d, prev=[%s] cur=[%s]",
+		prev.Index, prev.Speaker, cur.Speaker)
+
 	result, _ := s.llmCompleteOptsBackend(messages, nil, nil, "split")
 
 	// Parse: "SPLIT: N" oder "SPLIT: NONE"
@@ -1644,6 +1644,7 @@ func (s *Server) llmSplitCheck(session *RecordingSession, newFragIdx int) int {
 			val := strings.TrimSpace(strings.TrimPrefix(line, "SPLIT:"))
 			val = strings.TrimPrefix(strings.TrimPrefix(val, "SPLIT:"), ":")
 			if strings.EqualFold(val, "NONE") || val == "" {
+				log.Printf("recording: llm-split-check: fragment %d → NONE", prev.Index)
 				return 0
 			}
 			var n int
