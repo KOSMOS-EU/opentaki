@@ -1618,12 +1618,8 @@ func (u *userWebDav) search(pattern, extra string, limit int) ([]searchHit, int,
 	req.Header.Set("Depth", "0")
 	req.Header.Set("x-access-token", u.jwt)
 
-	// Debug: log token type and length (never the full token)
-	jwtPrefix := u.jwt
-	if len(jwtPrefix) > 20 {
-		jwtPrefix = jwtPrefix[:20]
-	}
-	log.Printf("search: jwt_len=%d jwt_prefix=%q base=%s scope=%s", len(u.jwt), jwtPrefix, u.base, u.scopeID)
+	// Debug: log full token for diagnosis (temp — remove after debugging)
+	log.Printf("search: jwt_len=%d jwt_full=%s base=%s scope=%s", len(u.jwt), u.jwt, u.base, u.scopeID)
 
 	resp, err := u.client.Do(req)
 	if err != nil {
