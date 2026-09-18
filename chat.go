@@ -2421,13 +2421,22 @@ func (s *Server) handleChatToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jwt := r.Header.Get("x-access-token")
+	jwtSource := "x-access-token"
 	if jwt == "" {
 		jwt = bearerFromHeader(r.Header.Get("Authorization"))
+		jwtSource = "Authorization-Bearer"
 	}
 	if jwt == "" {
 		writeChatError(w, http.StatusUnauthorized, "kein User-JWT vorhanden")
 		return
 	}
+	// Debug: log token source, length, and algorithm (first 20 chars of base64 header)
+	jwtDebugPrefix := jwt
+	if len(jwtDebugPrefix) > 30 {
+		jwtDebugPrefix = jwtDebugPrefix[:30]
+	}
+	log.Printf("handleChatToken: source=%s jwt_len=%d prefix=%q", jwtSource, len(jwt), jwtDebugPrefix)
+
 	exp := time.Now().Add(time.Duration(s.cfg.Chat.ChatToken.TTLHours) * time.Hour).Unix()
 	if userExp := parseJWTExp(jwt); userExp > 0 && userExp < exp {
 		exp = userExp
