@@ -1610,16 +1610,17 @@ func (u *userWebDav) search(pattern, extra string, limit int) ([]searchHit, int,
 	body := fmt.Sprintf(
 		`<?xml version="1.0" encoding="utf-8"?>\n<oc:search-files xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">\n  <oc:search>\n    <oc:pattern>%s</oc:pattern>\n    <oc:limit>%d</oc:limit>\n  </oc:search>\n</oc:search-files>`,
 		escapeXML(blevePattern), limit)
-	req, err := http.NewRequest("REPORT", u.base+"/dav/spaces", strings.NewReader(body))
+	// Search goes through the Proxy (OpenCloud URL) so the Proxy handles
+	// OIDC→Reva-JWT conversion. Direct WebDAV access (base) skips the Proxy
+	// and DismantleToken cannot validate OIDC tokens (PS256 vs HS256).
+	searchBase := strings.TrimRight(u.s.cfg.OpenCloud.URL, "/")
+	req, err := http.NewRequest("REPORT", searchBase+"/dav/spaces", strings.NewReader(body))
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
 	req.Header.Set("Depth", "0")
-	req.Header.Set("x-access-token", u.jwt)
-
-	// Debug: log full token for diagnosis (temp — remove after debugging)
-	log.Printf("search: jwt_len=%d jwt_full=%s base=%s scope=%s", len(u.jwt), u.jwt, u.base, u.scopeID)
+	req.Header.Set("Authorization", "Bearer "+u.jwt)
 
 	resp, err := u.client.Do(req)
 	if err != nil {
