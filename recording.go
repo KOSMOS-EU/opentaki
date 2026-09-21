@@ -1894,11 +1894,14 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 
 	// 2. Fragmente: Speaker aus Live-Window setzen (falls noch "unknown")
 	session.mu.Lock()
+	log.Printf("recording: finalize: liveByFrag=%v", liveByFrag)
 	for i := range session.Fragments {
 		frag := &session.Fragments[i]
-		if (frag.Speaker == "" || frag.Speaker == "unknown") {
+		log.Printf("recording: finalize: frag %d speaker=%q", frag.Index, frag.Speaker)
+		if frag.Speaker == "" || frag.Speaker == "unknown" {
 			if name, ok := liveByFrag[frag.Index]; ok {
 				frag.Speaker = name
+				log.Printf("recording: finalize: frag %d → %s (from liveByFrag)", frag.Index, name)
 			}
 		}
 	}
