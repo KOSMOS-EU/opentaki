@@ -1665,8 +1665,12 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 	// Fragmente im Window-Zeitfenster [cursor, winEnd] zuweisen
 	cursorSec := float64(session.windowCursorSamples) / 16000.0
 	winEndSec := float64(winEndSamples) / 16000.0
-	log.Printf("recording: live-diarize: zuweise Fragmente [%.0f-%.0f]s, %d absSegs, %d labelRefs",
-		cursorSec, winEndSec, len(absSegs), len(labelRefs))
+	log.Printf("recording: live-diarize: zuweise Fragmente [%.0f-%.0f]s, %d absSegs, %d labelRefs, winStartSec=%.1f",
+		cursorSec, winEndSec, len(absSegs), len(labelRefs), winStartSec)
+	if len(absSegs) > 0 {
+		log.Printf("recording: live-diarize: absSegs[0]=[%.1f-%.1f] absSegs[-1]=[%.1f-%.1f]",
+			absSegs[0].Start, absSegs[0].End, absSegs[len(absSegs)-1].Start, absSegs[len(absSegs)-1].End)
+	}
 	for i := range session.Fragments {
 		frag := &session.Fragments[i]
 		mid := (frag.Start + frag.End) / 2
