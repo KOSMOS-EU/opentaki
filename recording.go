@@ -40,6 +40,8 @@ import (
 type RecordingConfig struct {
 	DiarizeAPIBase  string  `yaml:"diarize_api_base"`   // e.g. "http://microllm:8012/svc/steno-ml"
 	DiarizeModel    string  `yaml:"diarize_model"`      // e.g. "pyannote/speaker-diarization-3.1"
+	MinSpeakers     int     `yaml:"min_speakers"`       // Hint an pyannote: mind. N Speaker (default 2)
+	MaxSpeakers     int     `yaml:"max_speakers"`       // Hint an pyannote: max N Speaker (0 = unbegrenzt)
 	SpeakerStore    string  `yaml:"speaker_store"`      // SQLite-DB Pfad (leer = /data/speakers.db)
 	SpeakerMatch    float64 `yaml:"speaker_match"`      // cosine threshold (default 0.65)
 	MaxChunkMB      int     `yaml:"max_chunk_mb"`       // max size per chunk (default 50)
@@ -2415,6 +2417,14 @@ func (s *Server) diarizeAudioBytes(audioData []byte) *diarizeResponse {
 	w := NewMultipartWriter(&buf, boundary)
 	if s.cfg.Recording.DiarizeModel != "" {
 		w.WriteField("model", s.cfg.Recording.DiarizeModel)
+	}
+	minSp := s.cfg.Recording.MinSpeakers
+	if minSp <= 0 {
+		minSp = 2 // Default: mindestens 2 Speaker erwarten
+	}
+	w.WriteField("min_speakers", fmt.Sprintf("%d", minSp))
+	if s.cfg.Recording.MaxSpeakers > 0 {
+		w.WriteField("max_speakers", fmt.Sprintf("%d", s.cfg.Recording.MaxSpeakers))
 	}
 	w.WriteFile("file", "chunk.wav", bytes.NewReader(wavData))
 	w.Close()
