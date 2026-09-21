@@ -1665,14 +1665,18 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 	// Fragmente im Window-Zeitfenster [cursor, winEnd] zuweisen
 	cursorSec := float64(session.windowCursorSamples) / 16000.0
 	winEndSec := float64(winEndSamples) / 16000.0
+	log.Printf("recording: live-diarize: zuweise Fragmente [%.0f-%.0f]s, %d absSegs, %d labelRefs",
+		cursorSec, winEndSec, len(absSegs), len(labelRefs))
 	for i := range session.Fragments {
 		frag := &session.Fragments[i]
 		mid := (frag.Start + frag.End) / 2
 		if mid < cursorSec || mid > winEndSec {
+			log.Printf("recording: live-diarize: frag %d mid=%.1f außerhalb [%.0f-%.0f]", frag.Index, mid, cursorSec, winEndSec)
 			continue
 		}
 		ref := dominantSpeakerAt(absSegs, labelRefs, mid)
 		if ref.PersonName == "" {
+			log.Printf("recording: live-diarize: frag %d mid=%.1f kein Speaker (kein Segment trifft)", frag.Index, mid)
 			continue
 		}
 		name := ref.String()
@@ -1680,6 +1684,7 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 		if frag.Speaker == "" || frag.Speaker == "unknown" {
 			frag.Speaker = name
 		}
+		log.Printf("recording: live-diarize: frag %d → %s", frag.Index, name)
 	}
 
 	// Cursor vorrücken
