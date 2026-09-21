@@ -77,6 +77,9 @@ type RecordingSession struct {
 	shareToken      string    // WebDAV Share-Token (public-files)
 	sharePasswd     string    // WebDAV Share-Password
 
+	// Async Word-Timestamps: WaitGroup für laufende DTW-Goroutines
+	wordWg sync.WaitGroup
+
 	// Rolling-Window-Diarization (Live-Speaker)
 	windowCursorSamples int                 // höchstes totalSamples mit Live-Speaker
 	liveSpeakerByFrag   map[int]string      // Fragment-Index → Speaker-Name
@@ -769,6 +772,13 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// 0c. Auf laufende async Word-Timestamp-Fetches warten.
+	//     Ohne diesen Wait fehlen Word-Timestamps für Fragmente deren DTW-Goroutine
+	//     noch nicht fertig ist (z.B. Fragment 2 bei 4 Fragmenten).
+	log.Printf("recording: session/end: warte auf async word-timestamps...")
+	session.wordWg.Wait()
+	log.Printf("recording: session/end: alle word-timestamps da")
+
 	// 1. Session-End-Diarization: ein pyannote-Call auf komplettes Session-Audio,
 	//    Segmente zeitbasiert auf Fragmente mappen, Speaker-Profile per Embedding anlegen.
 	if s.cfg.Recording.DiarizeAPIBase != "" && len(session.totalAudio) > 0 && len(session.Fragments) > 0 {
@@ -1046,10 +1056,13 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 
 		// Word-Timestamps asynchron nachholen (DTW, ~10s auf RTX)
 		// Werden beim Session-End für präzise Speaker-Grenzen verwendet.
+		// WaitGroup: Session-End wartet auf alle laufenden Word-Fetches.
 		session.mu.Lock()
 		fragStartSec := float64(session.fragStartSamples) / 16000.0
 		session.mu.Unlock()
+		session.wordWg.Add(1)
 		go func(fIdx int, audio []byte, startSec float64) {
+			defer session.wordWg.Done()
 			result := s.whisperTranscribeWithWords(audio, startSec)
 			if len(result.Words) > 0 {
 				session.mu.Lock()
