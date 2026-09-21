@@ -783,13 +783,20 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 
 	// 1. Finales Diarize-Window: Falls das Rolling-Window nie gefeuert hat
 	//    (Aufnahme kürzer als live_window_sec), einmalig auf dem gesamten Audio laufen.
+	// Finales Diarize-Window: wenn es unzugeordnete Fragmente gibt
+	// (kein Live-Window gelaufen, oder Fragmente jenseits des letzten Windows)
 	session.mu.Lock()
-	needsFinalWindow := session.windowCursorSamples == 0 && len(session.totalAudio) > 0
+	hasUnassigned := false
+	for _, frag := range session.Fragments {
+		if frag.Speaker == "" || frag.Speaker == "unknown" {
+			hasUnassigned = true
+			break
+		}
+	}
+	needsFinalWindow := hasUnassigned && len(session.totalAudio) > 0
 	session.mu.Unlock()
 	if needsFinalWindow && s.cfg.Recording.DiarizeAPIBase != "" {
-		log.Printf("recording: session/end: finales Diarize-Window (Audio < %ds, kein Live-Window gelaufen)",
-			s.cfg.Recording.LiveWindowSec)
-		// Simuliere ein Window auf dem gesamten Audio
+		log.Printf("recording: session/end: finales Diarize-Window (unzugeordnete Fragmente)")
 		s.diarizeWindowFinal(session)
 	}
 
