@@ -1761,13 +1761,30 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 func dominantSpeakerAt(segs []diarizeSegment, labelRefs map[string]SpeakerRef, absMid float64) SpeakerRef {
 	bestDur := 0.0
 	var best SpeakerRef
+	hits := 0
 	for _, seg := range segs {
 		if absMid >= seg.Start && absMid < seg.End {
+			hits++
 			dur := seg.End - seg.Start
 			if dur > bestDur {
 				bestDur = dur
 				best = labelRefs[seg.Speaker]
 			}
+		}
+	}
+	if hits == 0 {
+		// Fallback: nächstes Segment suchen
+		minDist := math.MaxFloat64
+		for _, seg := range segs {
+			midSeg := (seg.Start + seg.End) / 2
+			dist := math.Abs(midSeg - absMid)
+			if dist < minDist {
+				minDist = dist
+				best = labelRefs[seg.Speaker]
+			}
+		}
+		if best.PersonName != "" {
+			log.Printf("recording: dominantSpeakerAt: mid=%.1f kein exakter Hit, Fallback auf nächstes Segment (dist=%.1f)", absMid, minDist)
 		}
 	}
 	return best
