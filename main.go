@@ -328,7 +328,14 @@ type chatResponse struct {
 }
 
 type whisperResponse struct {
-	Text string `json:"text"`
+	Text  string         `json:"text"`
+	Words []whisperWord  `json:"words,omitempty"` // verbose_json: Wort-Timestamps
+}
+
+type whisperWord struct {
+	Word  string  `json:"word"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
 }
 
 // ── Response types ───────────────────────────────────────────

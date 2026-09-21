@@ -84,6 +84,13 @@ type RecordingSession struct {
 	liveSpeakerEmb      map[string][]float64  // pyannote-Label → Embedding (für Alignment)
 }
 
+// WordTimestamp ist ein Wort mit absolutem Zeitstempel (Session-Zeit).
+type WordTimestamp struct {
+	Word  string  `json:"word"`
+	Start float64 `json:"start"` // absolute Zeit (Session-Sekunden)
+	End   float64 `json:"end"`
+}
+
 type RecordingFrag struct {
 	Index    int              `json:"index"`
 	Text     string           `json:"text"`
@@ -93,6 +100,7 @@ type RecordingFrag struct {
 	Duration float64          `json:"duration"`
 	Status   string           `json:"status"` // "processing" | "done" | "failed"
 	Segments []FragSpeakerSeg `json:"segments,omitempty"` // Speaker-Segmente nach Diarization
+	Words    []WordTimestamp  `json:"words,omitempty"`    // Wort-Timestamps von Whisper (verbose_json)
 }
 
 // FragSpeakerSeg ist ein Speaker-Segment innerhalb eines Fragments.
@@ -1009,9 +1017,14 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			"status":   "processing",
 		})
 
-		text := s.whisperTranscribeBytes(fragAudio)
+		// Fragment-Startzeit für absolute Word-Timestamps
+		session.mu.Lock()
+		fragStartSec := float64(session.fragStartSamples) / 16000.0
+		session.mu.Unlock()
 
-		if text == "" {
+		result := s.whisperTranscribeVerbose(fragAudio, fragStartSec)
+
+		if result.Text == "" {
 			sseWrite(w, flusher, map[string]any{
 				"type":     "error",
 				"fragment": fragmentIdx,
@@ -1021,7 +1034,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session.addFragment(fragmentIdx, text, "unknown")
+		session.addFragmentWithWords(fragmentIdx, result.Text, "unknown", result.Words)
 
 		// Fragment-Audio asynchron per WebDAV hochladen (crash-safe)
 		if session.shareToken != "" {
@@ -1031,7 +1044,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		sseWrite(w, flusher, map[string]any{
 			"type":     "final",
 			"fragment": fragmentIdx,
-			"text":     text,
+			"text":     result.Text,
 			"method":   "whisper",
 		})
 
@@ -1070,7 +1083,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		sseWrite(w, flusher, map[string]any{
 			"type":     "done",
 			"fragment": fragmentIdx,
-			"text":     text,
+			"text":     result.Text,
 		})
 	}
 }
@@ -1337,6 +1350,11 @@ func (session *RecordingSession) takeFragAudio() []byte {
 
 // addFragment fügt ein abgeschlossenes Fragment zur Session hinzu.
 func (session *RecordingSession) addFragment(idx int, text, speaker string) {
+	session.addFragmentWithWords(idx, text, speaker, nil)
+}
+
+// addFragmentWithWords fügt ein Fragment mit optionalen Wort-Timestamps hinzu.
+func (session *RecordingSession) addFragmentWithWords(idx int, text, speaker string, words []WordTimestamp) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
@@ -1364,6 +1382,7 @@ func (session *RecordingSession) addFragment(idx int, text, speaker string) {
 		End:      end,
 		Duration: end - start,
 		Status:   "done",
+		Words:    words,
 	})
 	session.prevTranscript = text
 }
@@ -1397,15 +1416,19 @@ func (s *Server) flushPendingFragment(session *RecordingSession) {
 	}
 	session.mu.Unlock()
 
+	session.mu.Lock()
+	fragStartSec := float64(session.fragStartSamples) / 16000.0
+	session.mu.Unlock()
+
 	log.Printf("recording: flush pending fragment %d (%d bytes)", fragmentIdx, len(fragAudio))
-	text := s.whisperTranscribeBytes(fragAudio)
-	if text == "" {
+	result := s.whisperTranscribeVerbose(fragAudio, fragStartSec)
+	if result.Text == "" {
 		log.Printf("recording: flush fragment %d: Whisper lieferte leeren Text", fragmentIdx)
 		return
 	}
 
-	session.addFragment(fragmentIdx, text, "unknown")
-	log.Printf("recording: flush fragment %d ok (%d chars)", fragmentIdx, len(text))
+	session.addFragmentWithWords(fragmentIdx, result.Text, "unknown", result.Words)
+	log.Printf("recording: flush fragment %d ok (%d chars, %d words)", fragmentIdx, len(result.Text), len(result.Words))
 
 	// Fragment-Audio auch per WebDAV hochladen
 	if session.shareToken != "" {
@@ -2024,7 +2047,9 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			continue
 		}
 
-		// Text auf Segmente verteilen (proportional i/N)
+		// Text auf Segmente verteilen.
+		// Wenn Word-Timestamps vorhanden: echte Zeiten pro Wort.
+		// Sonst Fallback: proportional i/N.
 		words := strings.Fields(frag.Text)
 		if len(words) == 0 {
 			speakerStr := "unknown"
@@ -2035,10 +2060,36 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			continue
 		}
 
-		// Pro Wort: Speaker aus Zeitspanne bestimmen
+		// Wort-zu-Zeit-Zuordnung: echte Timestamps oder i/N-Schätzung
+		type wordWithTime struct {
+			word    string
+			absTime float64 // Zeitpunkt des Wort-Starts (absolute Session-Zeit)
+		}
+		wordsWithTime := make([]wordWithTime, len(words))
+
+		if len(frag.Words) >= len(words) {
+			// Whisper Word-Timestamps vorhanden → echte Zeiten
+			for wi := range words {
+				wordsWithTime[wi] = wordWithTime{
+					word:    words[wi],
+					absTime: frag.Words[wi].Start,
+				}
+			}
+			log.Printf("recording: diarize: fragment %d using %d word timestamps", frag.Index, len(frag.Words))
+		} else {
+			// Fallback: proportional i/N
+			for wi := range words {
+				wordsWithTime[wi] = wordWithTime{
+					word:    words[wi],
+					absTime: frag.Start + float64(wi)/float64(len(words))*frag.Duration,
+				}
+			}
+		}
+
+		// Pro Wort: Speaker aus Diarization-Zeitspanne bestimmen
 		wordSpeakers := make([]string, len(words))
-		for wi := range words {
-			absTime := frag.Start + float64(wi)/float64(len(words))*frag.Duration
+		for wi := range wordsWithTime {
+			absTime := wordsWithTime[wi].absTime
 			wordSpeakers[wi] = merged[0].speaker // Fallback
 			for _, sp := range merged {
 				if absTime >= sp.start && absTime < sp.end {
@@ -2060,8 +2111,11 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 				speakerStr = ref.String()
 			}
 			segText := strings.Join(words[segStart:wi], " ")
-			absStart := frag.Start + float64(segStart)/float64(len(words))*frag.Duration
-			absEnd := frag.Start + float64(wi)/float64(len(words))*frag.Duration
+			absStart := wordsWithTime[segStart].absTime
+			absEnd := frag.End // letzte Gruppe geht bis Fragment-Ende
+			if wi < len(words) {
+				absEnd = wordsWithTime[wi].absTime
+			}
 			segments = append(segments, FragSpeakerSeg{
 				Speaker: speakerStr,
 				Start:   round2(absStart),
@@ -2352,22 +2406,27 @@ func (s *Server) diarizeAudioBytes(audioData []byte) *diarizeResponse {
 
 // ── Whisper (bytes statt file) ──────────────────────────────
 
-// whisperTranscribeBytes transkribiert Audio-Bytes.
-// WebM/Opus → WAV (16kHz PCM) → Whisper-API.
-func (s *Server) whisperTranscribeBytes(audioData []byte) string {
-	url := strings.TrimRight(s.cfg.Whisper.APIBase, "/") + "/audio/transcriptions"
+// whisperTranscribeResult enthält Text und optionale Wort-Timestamps.
+type whisperTranscribeResult struct {
+	Text  string
+	Words []WordTimestamp // leer wenn verbose_json nicht unterstützt
+}
 
-	// WebM → WAV umwandeln
+// whisperTranscribeVerbose transkribiert Audio-Bytes mit Wort-Timestamps.
+// Fordert verbose_json + word timestamps an. Fallback auf normalen Text wenn
+// das Backend keine Word-Timestamps liefert.
+func (s *Server) whisperTranscribeVerbose(audioData []byte, fragStartSec float64) whisperTranscribeResult {
+	whisperURL := strings.TrimRight(s.cfg.Whisper.APIBase, "/") + "/audio/transcriptions"
+
 	samples := decodeAudioToPCM16(audioData)
 	if samples == nil {
 		log.Printf("recording: Audio-Dekodierung fehlgeschlagen (%d bytes)", len(audioData))
-		return ""
+		return whisperTranscribeResult{}
 	}
 
-	// Stille am Anfang/Ende trimmen (Whisper erfindet bei Stille Floskeln wie "Vielen Dank")
 	samples = trimSilence(samples)
-	if len(samples) < 1600 { // < 100ms → zu kurz, überspringen
-		return ""
+	if len(samples) < 1600 {
+		return whisperTranscribeResult{}
 	}
 
 	wavData := pcm16ToWAV(samples)
@@ -2377,29 +2436,63 @@ func (s *Server) whisperTranscribeBytes(audioData []byte) string {
 	w := NewMultipartWriter(&buf, boundary)
 	w.WriteField("model", s.cfg.Whisper.Model)
 	w.WriteField("language", "de")
+	w.WriteField("response_format", "verbose_json")
+	w.WriteField("timestamp_granularities", "word")
 	w.WriteFile("file", "audio.wav", bytes.NewReader(wavData))
 	w.Close()
 
-	req, err := http.NewRequest("POST", url, &buf)
+	req, err := http.NewRequest("POST", whisperURL, &buf)
 	if err != nil {
 		log.Printf("recording: whisper request error: %v", err)
-		return ""
+		return whisperTranscribeResult{}
 	}
 	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
 		log.Printf("recording: whisper error: %v", err)
-		return ""
+		return whisperTranscribeResult{}
 	}
 	defer resp.Body.Close()
 
-	var wr whisperResponse
-	if err := json.NewDecoder(resp.Body).Decode(&wr); err != nil {
-		log.Printf("recording: whisper decode error: %v", err)
-		return ""
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	if err != nil {
+		log.Printf("recording: whisper read error: %v", err)
+		return whisperTranscribeResult{}
 	}
-	return strings.TrimSpace(wr.Text)
+
+	var wr whisperResponse
+	if err := json.Unmarshal(body, &wr); err != nil {
+		log.Printf("recording: whisper decode error: %v (body: %s)", err, string(body[:min(200, len(body))]))
+		return whisperTranscribeResult{}
+	}
+
+	text := strings.TrimSpace(wr.Text)
+	if text == "" {
+		return whisperTranscribeResult{}
+	}
+
+	// Word-Timestamps auf absolute Session-Zeit umrechnen
+	var words []WordTimestamp
+	if len(wr.Words) > 0 {
+		for _, ww := range wr.Words {
+			words = append(words, WordTimestamp{
+				Word:  strings.TrimSpace(ww.Word),
+				Start: round2(fragStartSec + ww.Start),
+				End:   round2(fragStartSec + ww.End),
+			})
+		}
+		log.Printf("recording: whisper verbose: %d words with timestamps", len(words))
+	}
+
+	return whisperTranscribeResult{Text: text, Words: words}
+}
+
+// whisperTranscribeBytes transkribiert Audio-Bytes (einfacher Modus, nur Text).
+// Wird für Partials und Live-Chunks verwendet (keine Timestamps nötig).
+func (s *Server) whisperTranscribeBytes(audioData []byte) string {
+	result := s.whisperTranscribeVerbose(audioData, 0)
+	return result.Text
 }
 
 // trimSilence entfernt Stille (RMS < 0.008) von Anfang und Ende des Audio.
