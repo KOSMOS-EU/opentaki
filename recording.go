@@ -1017,14 +1017,10 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			"status":   "processing",
 		})
 
-		// Fragment-Startzeit für absolute Word-Timestamps
-		session.mu.Lock()
-		fragStartSec := float64(session.fragStartSamples) / 16000.0
-		session.mu.Unlock()
+		// Schnelle Transkription (nur Text, kein DTW) für sofortige SSE-Response
+		text := s.whisperTranscribeBytes(fragAudio)
 
-		result := s.whisperTranscribeVerbose(fragAudio, fragStartSec)
-
-		if result.Text == "" {
+		if text == "" {
 			sseWrite(w, flusher, map[string]any{
 				"type":     "error",
 				"fragment": fragmentIdx,
@@ -1034,7 +1030,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session.addFragmentWithWords(fragmentIdx, result.Text, "unknown", result.Words)
+		session.addFragment(fragmentIdx, text, "unknown")
 
 		// Fragment-Audio asynchron per WebDAV hochladen (crash-safe)
 		if session.shareToken != "" {
@@ -1044,9 +1040,29 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		sseWrite(w, flusher, map[string]any{
 			"type":     "final",
 			"fragment": fragmentIdx,
-			"text":     result.Text,
+			"text":     text,
 			"method":   "whisper",
 		})
+
+		// Word-Timestamps asynchron nachholen (DTW, ~10s auf RTX)
+		// Werden beim Session-End für präzise Speaker-Grenzen verwendet.
+		session.mu.Lock()
+		fragStartSec := float64(session.fragStartSamples) / 16000.0
+		session.mu.Unlock()
+		go func(fIdx int, audio []byte, startSec float64) {
+			result := s.whisperTranscribeWithWords(audio, startSec)
+			if len(result.Words) > 0 {
+				session.mu.Lock()
+				for i := range session.Fragments {
+					if session.Fragments[i].Index == fIdx {
+						session.Fragments[i].Words = result.Words
+						log.Printf("recording: fragment %d word-timestamps nachgeholt (%d words)", fIdx, len(result.Words))
+						break
+					}
+				}
+				session.mu.Unlock()
+			}
+		}(fragmentIdx, fragAudio, fragStartSec)
 
 		// Rolling-Window-Diarization: Live-Speaker für das fertige Fragment
 		if s.cfg.Recording.LiveDiarize && s.cfg.Recording.DiarizeAPIBase != "" {
@@ -1083,7 +1099,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 		sseWrite(w, flusher, map[string]any{
 			"type":     "done",
 			"fragment": fragmentIdx,
-			"text":     result.Text,
+			"text":     text,
 		})
 	}
 }
@@ -1420,15 +1436,29 @@ func (s *Server) flushPendingFragment(session *RecordingSession) {
 	fragStartSec := float64(session.fragStartSamples) / 16000.0
 	session.mu.Unlock()
 
+	// Schnelle Transkription (nur Text)
 	log.Printf("recording: flush pending fragment %d (%d bytes)", fragmentIdx, len(fragAudio))
-	result := s.whisperTranscribeVerbose(fragAudio, fragStartSec)
-	if result.Text == "" {
+	text := s.whisperTranscribeBytes(fragAudio)
+	if text == "" {
 		log.Printf("recording: flush fragment %d: Whisper lieferte leeren Text", fragmentIdx)
 		return
 	}
 
-	session.addFragmentWithWords(fragmentIdx, result.Text, "unknown", result.Words)
-	log.Printf("recording: flush fragment %d ok (%d chars, %d words)", fragmentIdx, len(result.Text), len(result.Words))
+	session.addFragment(fragmentIdx, text, "unknown")
+
+	// Word-Timestamps synchron nachholen (Session-End wartet ohnehin)
+	wordResult := s.whisperTranscribeWithWords(fragAudio, fragStartSec)
+	if len(wordResult.Words) > 0 {
+		session.mu.Lock()
+		for i := range session.Fragments {
+			if session.Fragments[i].Index == fragmentIdx {
+				session.Fragments[i].Words = wordResult.Words
+				break
+			}
+		}
+		session.mu.Unlock()
+	}
+	log.Printf("recording: flush fragment %d ok (%d chars, %d words)", fragmentIdx, len(text), len(wordResult.Words))
 
 	// Fragment-Audio auch per WebDAV hochladen
 	if session.shareToken != "" {
@@ -2412,23 +2442,63 @@ type whisperTranscribeResult struct {
 	Words []WordTimestamp // leer wenn verbose_json nicht unterstützt
 }
 
-// whisperTranscribeVerbose transkribiert Audio-Bytes mit Wort-Timestamps.
-// Fordert verbose_json + word timestamps an. Fallback auf normalen Text wenn
-// das Backend keine Word-Timestamps liefert.
-func (s *Server) whisperTranscribeVerbose(audioData []byte, fragStartSec float64) whisperTranscribeResult {
+// whisperTranscribeBytes transkribiert Audio-Bytes — schneller Modus, nur Text.
+// Für Live-Chunks und Partials (keine Timestamps, kein DTW-Overhead).
+func (s *Server) whisperTranscribeBytes(audioData []byte) string {
 	whisperURL := strings.TrimRight(s.cfg.Whisper.APIBase, "/") + "/audio/transcriptions"
 
 	samples := decodeAudioToPCM16(audioData)
 	if samples == nil {
-		log.Printf("recording: Audio-Dekodierung fehlgeschlagen (%d bytes)", len(audioData))
+		return ""
+	}
+	samples = trimSilence(samples)
+	if len(samples) < 1600 {
+		return ""
+	}
+	wavData := pcm16ToWAV(samples)
+
+	var buf bytes.Buffer
+	boundary := fmt.Sprintf("----TakiBoundary%d", time.Now().UnixNano())
+	w := NewMultipartWriter(&buf, boundary)
+	w.WriteField("model", s.cfg.Whisper.Model)
+	w.WriteField("language", "de")
+	w.WriteFile("file", "audio.wav", bytes.NewReader(wavData))
+	w.Close()
+
+	req, err := http.NewRequest("POST", whisperURL, &buf)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		log.Printf("recording: whisper error: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var wr whisperResponse
+	if err := json.NewDecoder(resp.Body).Decode(&wr); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(wr.Text)
+}
+
+// whisperTranscribeWithWords transkribiert Audio-Bytes MIT Wort-Timestamps (DTW).
+// Langsamer als whisperTranscribeBytes (~10s für 30s Audio auf RTX Blackwell).
+// Für fertige Fragmente — asynchron aufgerufen, nicht im Live-Pfad.
+func (s *Server) whisperTranscribeWithWords(audioData []byte, fragStartSec float64) whisperTranscribeResult {
+	whisperURL := strings.TrimRight(s.cfg.Whisper.APIBase, "/") + "/audio/transcriptions"
+
+	samples := decodeAudioToPCM16(audioData)
+	if samples == nil {
 		return whisperTranscribeResult{}
 	}
-
 	samples = trimSilence(samples)
 	if len(samples) < 1600 {
 		return whisperTranscribeResult{}
 	}
-
 	wavData := pcm16ToWAV(samples)
 
 	var buf bytes.Buffer
@@ -2443,27 +2513,25 @@ func (s *Server) whisperTranscribeVerbose(audioData []byte, fragStartSec float64
 
 	req, err := http.NewRequest("POST", whisperURL, &buf)
 	if err != nil {
-		log.Printf("recording: whisper request error: %v", err)
 		return whisperTranscribeResult{}
 	}
 	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		log.Printf("recording: whisper error: %v", err)
+		log.Printf("recording: whisper-words error: %v", err)
 		return whisperTranscribeResult{}
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
-		log.Printf("recording: whisper read error: %v", err)
 		return whisperTranscribeResult{}
 	}
 
 	var wr whisperResponse
 	if err := json.Unmarshal(body, &wr); err != nil {
-		log.Printf("recording: whisper decode error: %v (body: %s)", err, string(body[:min(200, len(body))]))
+		log.Printf("recording: whisper-words decode error: %v", err)
 		return whisperTranscribeResult{}
 	}
 
@@ -2472,7 +2540,6 @@ func (s *Server) whisperTranscribeVerbose(audioData []byte, fragStartSec float64
 		return whisperTranscribeResult{}
 	}
 
-	// Word-Timestamps auf absolute Session-Zeit umrechnen
 	var words []WordTimestamp
 	if len(wr.Words) > 0 {
 		for _, ww := range wr.Words {
@@ -2482,17 +2549,10 @@ func (s *Server) whisperTranscribeVerbose(audioData []byte, fragStartSec float64
 				End:   round2(fragStartSec + ww.End),
 			})
 		}
-		log.Printf("recording: whisper verbose: %d words with timestamps", len(words))
+		log.Printf("recording: whisper-words: %d words with timestamps", len(words))
 	}
 
 	return whisperTranscribeResult{Text: text, Words: words}
-}
-
-// whisperTranscribeBytes transkribiert Audio-Bytes (einfacher Modus, nur Text).
-// Wird für Partials und Live-Chunks verwendet (keine Timestamps nötig).
-func (s *Server) whisperTranscribeBytes(audioData []byte) string {
-	result := s.whisperTranscribeVerbose(audioData, 0)
-	return result.Text
 }
 
 // trimSilence entfernt Stille (RMS < 0.008) von Anfang und Ende des Audio.
