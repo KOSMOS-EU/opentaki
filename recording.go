@@ -41,7 +41,7 @@ type RecordingConfig struct {
 	DiarizeAPIBase  string  `yaml:"diarize_api_base"`   // e.g. "http://microllm:8012/svc/steno-ml"
 	DiarizeModel    string  `yaml:"diarize_model"`      // e.g. "pyannote/speaker-diarization-3.1"
 	SpeakerStore    string  `yaml:"speaker_store"`      // SQLite-DB Pfad (leer = /data/speakers.db)
-	SpeakerMatch    float64 `yaml:"speaker_match"`      // cosine threshold (default 0.75)
+	SpeakerMatch    float64 `yaml:"speaker_match"`      // cosine threshold (default 0.65)
 	MaxChunkMB      int     `yaml:"max_chunk_mb"`       // max size per chunk (default 50)
 	SilenceThresh   float64 `yaml:"silence_thresh"`     // RMS below this = silence (default 0.01)
 	SilenceTimeout  int     `yaml:"silence_timeout_ms"` // ms of silence → fragment end (default 800)
@@ -555,7 +555,7 @@ func (s *Server) matchSpeaker(embedding []float64) matchSpeakerResult {
 
 	threshold := s.cfg.Recording.SpeakerMatch
 	if threshold <= 0 {
-		threshold = 0.75
+		threshold = 0.65
 	}
 
 	var bestPerson SpeakerPerson
@@ -592,7 +592,7 @@ func (s *Server) matchSpeaker(embedding []float64) matchSpeakerResult {
 func (s *Server) addProfileForSession(personID int, embedding []float64, sourceSessionID string) int {
 	threshold := s.cfg.Recording.SpeakerMatch
 	if threshold <= 0 {
-		threshold = 0.75
+		threshold = 0.65
 	}
 
 	// Bestehendes Profil für diese Person mit ähnlichem Embedding → LastSeen updaten
@@ -1548,10 +1548,10 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 			}
 		}
 	}
-	// 0.80 statt 0.60: verschiedene Sprecher haben typischerweise 0.5-0.7 Cosine.
-	// Nur derselbe Sprecher mit leicht variierendem Embedding (unterschiedliche
-	// Windows) liegt zuverlässig ≥ 0.80.
-	const windowAlignThreshold = 0.80
+	// Cross-Session Cosine derselben Person: 0.65-0.70 (pyannote 256-dim).
+	// Session-intern: verschiedene Sprecher 0.20-0.35, gleicher 0.65-0.80.
+	// 0.72 als Window-Align: konservativ genug um verschiedene Sprecher zu trennen.
+	const windowAlignThreshold = 0.72
 	if bestScore >= windowAlignThreshold && bestRef.PersonName != "" {
 		session.liveSpeakerMap[label] = bestRef
 		session.liveSpeakerEmb[label] = emb
@@ -1567,7 +1567,7 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
 		log.Printf("recording: live-diarize: label %s → %q (match=%.2f)", label, match.Person.Name, match.Score)
-	} else if match.Score >= 0.70 && strings.HasPrefix(match.Person.Name, "SPEAKER_") {
+	} else if match.Score >= 0.55 && strings.HasPrefix(match.Person.Name, "SPEAKER_") {
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
 		log.Printf("recording: live-diarize: label %s → %q (unbekannt-zone=%.2f)", label, match.Person.Name, match.Score)
@@ -1836,12 +1836,12 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 					bestLiveScore = sc
 				}
 			}
-			// 0.75: Envelope-Mean aus 30+ Segmenten vs. Einzel-Window-Embedding
-			// kann abweichen. 0.80 wäre zu streng, 0.60 zu locker.
-			if bestLiveScore >= 0.75 {
+			// 0.65: Envelope-Mean vs. Einzel-Window-Embedding.
+			// Cross-Session derselben Person: 0.65-0.70 (pyannote 256-dim).
+			if bestLiveScore >= 0.65 {
 				// Besten Embedding finden und zugehörigen Ref
 				for l, emb := range session.liveSpeakerEmb {
-					if sc := cosineSimilarity(meanEmb, emb); sc >= 0.75 {
+					if sc := cosineSimilarity(meanEmb, emb); sc >= 0.65 {
 						if ref, ok := session.liveSpeakerMap[l]; ok {
 							liveRef = ref
 							liveMatched = true
@@ -1874,12 +1874,13 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 				label, match.Person.Name, profileID, match.Score)
 		} else {
 			// Unbekannte Stimme.
-			// Falls der Score in der "Unbekannt-Zone" liegt (0.70–0.75) und die
+			// Falls der Score in der "Unbekannt-Zone" liegt (0.55–0.65) und die
 			// beste Person noch ein SPEAKER_XX ist (nicht manuell benannt),
 			// wiederverwenden statt neu anlegen — verhindert dass derselbe
 			// unbekannte Sprecher in zwei Sessions zwei verschiedene SPEAKER_XX
-			// bekommt.
-			const unknownToUnknownThreshold = 0.70
+			// bekommt. 0.55 ist aggressiv, aber Cross-Session-Cosine derselben
+			// Person liegt bei 0.65-0.70 (pyannote 256-dim).
+			const unknownToUnknownThreshold = 0.55
 			if match.Score >= unknownToUnknownThreshold &&
 				strings.HasPrefix(match.Person.Name, "SPEAKER_") {
 				profileID := s.addProfileForSession(match.Person.ID, meanEmb, session.ID)
