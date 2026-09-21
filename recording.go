@@ -97,11 +97,21 @@ type RecordingFrag struct {
 
 // FragSpeakerSeg ist ein Speaker-Segment innerhalb eines Fragments.
 // Wird nach der Session-End-Diarization per Zeit-Overlap berechnet.
+// Ein Fragment kann mehrere Segmente haben (Multi-Speaker).
 type FragSpeakerSeg struct {
 	Speaker string  `json:"speaker"`
-	Start   float64 `json:"start"` // relative Zeit im Fragment (Sekunden)
+	Start   float64 `json:"start"` // absolute Zeit (Session-Sekunden)
 	End     float64 `json:"end"`
 	Text    string  `json:"text"` // Text-Anteil (proportional zur Dauer)
+}
+
+// Utterance ist eine zusammenhängende Rede einer Person, über Fragment-Grenzen hinweg.
+// Aufeinanderfolgende Segmente desselben Speakers werden zusammengefasst.
+type Utterance struct {
+	Speaker string  `json:"speaker"`
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
+	Text    string  `json:"text"`
 }
 
 // SpeakerPerson = die Person (stabil, user-definiert oder SPEAKER_XX).
@@ -757,13 +767,15 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 		s.diarizeSessionEnd(session)
 	}
 
-	// 2. Komplettes Transkript zusammenstellen
+	// 2. Komplettes Transkript zusammenstellen (aus Utterances, nicht Fragments,
+	//    damit zusammenhängende Rede einer Person als eine Zeile erscheint)
+	sessionUtterances := buildUtterances(session.Fragments)
 	var transcriptBuilder strings.Builder
-	for _, frag := range session.Fragments {
-		if frag.Speaker != "" && frag.Speaker != "unknown" {
-			fmt.Fprintf(&transcriptBuilder, "[%s]: ", frag.Speaker)
+	for _, utt := range sessionUtterances {
+		if utt.Speaker != "" && utt.Speaker != "unknown" {
+			fmt.Fprintf(&transcriptBuilder, "[%s]: ", utt.Speaker)
 		}
-		transcriptBuilder.WriteString(frag.Text)
+		transcriptBuilder.WriteString(utt.Text)
 		transcriptBuilder.WriteString("\n")
 	}
 	fullTranscript := transcriptBuilder.String()
@@ -819,7 +831,8 @@ Roh-Transkript:
 		log.Printf("recording: session/end: kein Share, kein WebDAV-Upload")
 	}
 
-	// 5. Response (inkl. Fragmente mit Speaker-Zuweisung nach Session-End-Diarization)
+	// 5. Response (inkl. Fragmente + Utterances)
+	utterances := buildUtterances(session.Fragments)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":     "done",
@@ -827,6 +840,7 @@ Roh-Transkript:
 		"transcript": finishedTranscript,
 		"upload":     uploadPath,
 		"fragments":  session.Fragments,
+		"utterances": utterances,
 	})
 }
 
@@ -1898,209 +1912,264 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		s.speakerMu.Unlock()
 	}
 
-	// 3. Pro Fragment: Speaker-Wechsel-Erkennung + Fragment-Splitting
-	//    Große VAD-Fragmente (164s in Sitzungen) enthalten mehrere Sprecher.
-	//    Nach der Diarization an Speaker-Wechsel-Grenzen aufteilen,
-	//    Text pro Zeitspanne proportional verteilen.
+	// 3. Pro Fragment: Multi-Segment-Zuordnung.
+	//    Fragmente bleiben als Audio-Einheiten erhalten (1 pro VAD-Chunk).
+	//    Jedes Fragment bekommt mehrere Segmente (Speaker-homogene Abschnitte).
+	//    Text wird proportional (i/N) auf Segmente verteilt.
 	session.mu.Lock()
-	newFrags := make([]RecordingFrag, 0, len(session.Fragments))
-	splitCount := 0
 
-	for _, frag := range session.Fragments {
+	for i := range session.Fragments {
+		frag := &session.Fragments[i]
 		if frag.Duration <= 0 || frag.Text == "" {
-			newFrags = append(newFrags, frag)
 			continue
 		}
 
-		// Diarization-Segmente die mit diesem Fragment überlappen, extrahieren.
-		// Segmente < 1s ignorieren (pyannote-Mikro-Artefakte bei Overlap/Noise).
-		var overlapping []diarizeSegment
-		for _, seg := range result.Segments {
-			ovStart := math.Max(frag.Start, seg.Start)
-			ovEnd := math.Min(frag.End, seg.End)
-			if ovEnd-ovStart < 1.0 {
-				continue
-			}
-			if ovEnd > ovStart {
-				overlapping = append(overlapping, diarizeSegment{
-					Speaker: seg.Speaker,
-					Start:   ovStart,
-					End:     ovEnd,
-				})
-			}
-		}
-		if len(overlapping) == 0 {
-			newFrags = append(newFrags, frag)
-			continue
-		}
-
-		// Sortieren nach Start
-		sort.Slice(overlapping, func(i, j int) bool {
-			return overlapping[i].Start < overlapping[j].Start
-		})
-
-		// Überlappende Segmente zu Zeitspannen mit dominanter Stimme zusammenfassen
-		// (pyannote-Overlap: bei 2 Speakern gleichzeitig gewinnt der mit mehr Dauer)
+		// Diarization-Segmente die mit diesem Fragment überlappen sammeln.
+		// Segmente < 0.5s ignorieren (pyannote-Mikro-Artefakte).
 		type span struct {
 			start, end float64
 			speaker    string
 		}
 		var spans []span
-		for _, seg := range overlapping {
-			// Segment auf Fragment-Start clampen (Fragment beginnt erst hier)
-			clampedStart := seg.Start
-			if clampedStart < frag.Start {
-				clampedStart = frag.Start
+		for _, seg := range result.Segments {
+			ovStart := math.Max(frag.Start, seg.Start)
+			ovEnd := math.Min(frag.End, seg.End)
+			if ovEnd-ovStart < 0.5 {
+				continue
 			}
-			if len(spans) > 0 && clampedStart <= spans[len(spans)-1].end {
-				// Overlap: dominante Stimme der Kombination bestimmen
-				last := &spans[len(spans)-1]
-				ovWith := clampedStart
-				if ovWith < last.start {
-					ovWith = last.start
-				}
-				lastDur := last.end - ovWith
-				segDur := seg.End - ovWith
-				if segDur > lastDur {
-					last.speaker = seg.Speaker
-				}
-				if seg.End > last.end {
-					last.end = seg.End
-				}
-			} else {
-				spans = append(spans, span{clampedStart, seg.End, seg.Speaker})
+			if ovEnd > ovStart {
+				spans = append(spans, span{ovStart, ovEnd, seg.Speaker})
 			}
 		}
 
-		// Fallback: nur eine Zeitspanne → dominanter Speaker, kein Split
-		if len(spans) <= 1 {
-			sp := spans[0]
+		if len(spans) == 0 {
+			// Kein pyannote-Segment → Fragment behält Speaker
+			frag.Segments = []FragSpeakerSeg{{
+				Speaker: frag.Speaker,
+				Start:   round2(frag.Start),
+				End:     round2(frag.End),
+				Text:    frag.Text,
+			}}
+			continue
+		}
+
+		// Nach Start sortieren
+		sort.Slice(spans, func(a, b int) bool { return spans[a].start < spans[b].start })
+
+		// Overlaps auflösen: bei gleichzeitiger Rede gewinnt das längere Segment.
+		// Dann zu nicht-überlappenden Zeitspannen mit eindeutigem Speaker zusammenfassen.
+		var resolved []span
+		for _, sp := range spans {
+			if len(resolved) > 0 && sp.start < resolved[len(resolved)-1].end {
+				last := &resolved[len(resolved)-1]
+				if sp.speaker == last.speaker {
+					// Gleicher Speaker → erweitern
+					if sp.end > last.end {
+						last.end = sp.end
+					}
+				} else {
+					// Verschiedene Speaker → Overlap: längeres gewinnt den Overlap-Bereich
+					overlapEnd := math.Min(sp.end, last.end)
+					lastDur := overlapEnd - last.start
+					spDur := sp.end - sp.start
+					if spDur > lastDur {
+						// Neues Segment dominiert → altes kürzen, neues anhängen
+						last.end = sp.start
+						if last.end <= last.start {
+							resolved = resolved[:len(resolved)-1]
+						}
+						resolved = append(resolved, span{sp.start, sp.end, sp.speaker})
+					} else {
+						// Altes Segment dominiert → neues nach dem Overlap anfangen
+						if sp.end > last.end {
+							resolved = append(resolved, span{last.end, sp.end, sp.speaker})
+						}
+					}
+				}
+			} else {
+				resolved = append(resolved, sp)
+			}
+		}
+
+		// Auf Fragment-Zeitbereich clampen
+		for j := range resolved {
+			if resolved[j].start < frag.Start {
+				resolved[j].start = frag.Start
+			}
+			if resolved[j].end > frag.End {
+				resolved[j].end = frag.End
+			}
+		}
+
+		// Aufeinanderfolgende Spans mit gleichem Speaker zusammenfassen
+		var merged []span
+		for _, sp := range resolved {
+			if sp.end <= sp.start {
+				continue
+			}
+			if len(merged) > 0 && sp.speaker == merged[len(merged)-1].speaker {
+				merged[len(merged)-1].end = sp.end
+			} else {
+				merged = append(merged, sp)
+			}
+		}
+
+		if len(merged) == 0 {
+			frag.Segments = []FragSpeakerSeg{{
+				Speaker: frag.Speaker,
+				Start:   round2(frag.Start),
+				End:     round2(frag.End),
+				Text:    frag.Text,
+			}}
+			continue
+		}
+
+		// Text auf Segmente verteilen (proportional i/N)
+		words := strings.Fields(frag.Text)
+		if len(words) == 0 {
 			speakerStr := "unknown"
-			if ref, ok := speakerDisplay[sp.speaker]; ok {
+			if ref, ok := speakerDisplay[merged[0].speaker]; ok {
 				speakerStr = ref.String()
 			}
 			frag.Speaker = speakerStr
-			frag.Segments = []FragSpeakerSeg{{
-				Speaker: speakerStr,
-				Start:   0,
-				End:     round2(frag.Duration),
-				Text:    frag.Text,
-			}}
-			newFrags = append(newFrags, frag)
 			continue
 		}
 
-		// Fragment an Speaker-Wechsel-Grenzen splitten
-		words := strings.Fields(frag.Text)
-		if len(words) == 0 {
-			newFrags = append(newFrags, frag)
-			continue
-		}
-
-		// Pro Wort: Zeitspanne bestimmen → Speaker zuordnen
-		// Wort i liegt bei relativer Zeit i/N * Duration im Fragment
-		wordSpk := make([]string, len(words))
-		for wi, _ := range words {
-			relTime := float64(wi) / float64(len(words)) * frag.Duration
-			absTime := frag.Start + relTime
-			wordSpk[wi] = spans[0].speaker // Fallback: erste Span
-			for _, sp := range spans {
+		// Pro Wort: Speaker aus Zeitspanne bestimmen
+		wordSpeakers := make([]string, len(words))
+		for wi := range words {
+			absTime := frag.Start + float64(wi)/float64(len(words))*frag.Duration
+			wordSpeakers[wi] = merged[0].speaker // Fallback
+			for _, sp := range merged {
 				if absTime >= sp.start && absTime < sp.end {
-					wordSpk[wi] = sp.speaker
+					wordSpeakers[wi] = sp.speaker
 					break
 				}
 			}
 		}
 
-		// Kontiguierte Wortgruppen mit gleichem Speaker zusammenfassen
-		type subFrag struct {
-			speaker  string
-			startIdx int
-			endIdx   int // exklusiv
-		}
-		const minWords = 2 // Sub-Fragmente mit < 2 Wörtern werden zusammengeführt
-		var subs []subFrag
-		for wi := 0; wi < len(words); {
-			spk := wordSpk[wi]
-			end := wi + 1
-			for end < len(words) && wordSpk[end] == spk {
-				end++
+		// Kontiguierte Wortgruppen mit gleichem Speaker → Segmente
+		var segments []FragSpeakerSeg
+		segStart := 0
+		for wi := 1; wi <= len(words); wi++ {
+			if wi < len(words) && wordSpeakers[wi] == wordSpeakers[segStart] {
+				continue
 			}
-			subs = append(subs, subFrag{spk, wi, end})
-			wi = end
-		}
-
-		// Mikro-Fragmente (< minWords) mit Nachbar zusammenführen
-		if len(subs) > 1 {
-			merged := []subFrag{subs[0]}
-			for i := 1; i < len(subs); i++ {
-				cur := subs[i]
-				prev := &merged[len(merged)-1]
-				curWords := cur.endIdx - cur.startIdx
-				if curWords < minWords {
-					// Zu kurz → in vorheriges aufnehmen
-					prev.endIdx = cur.endIdx
-					continue
-				}
-				// Prüfen ob vorheriges jetzt zu kurz ist
-				prevWords := prev.endIdx - prev.startIdx
-				if prevWords < minWords && len(merged) > 1 {
-					pprev := &merged[len(merged)-2]
-					pprev.endIdx = prev.endIdx
-					merged = merged[:len(merged)-1]
-					continue
-				}
-				merged = append(merged, cur)
+			speakerStr := "unknown"
+			if ref, ok := speakerDisplay[wordSpeakers[segStart]]; ok {
+				speakerStr = ref.String()
 			}
-			// Letztes kann auch zu kurz sein
-			if len(merged) > 1 {
-				last := &merged[len(merged)-1]
-				lastWords := last.endIdx - last.startIdx
-				if lastWords < minWords {
-					merged[len(merged)-2].endIdx = last.endIdx
-					merged = merged[:len(merged)-1]
-				}
-			}
-			subs = merged
-		}
-
-		// Sub-Fragmente als neue Fragments schreiben
-		for _, sf := range subs {
-			stableID := "unknown"
-			if ref, ok := speakerDisplay[sf.speaker]; ok {
-				stableID = ref.String()
-			}
-			subText := strings.Join(words[sf.startIdx:sf.endIdx], " ")
-			relStart := float64(sf.startIdx) / float64(len(words)) * frag.Duration
-			relEnd := float64(sf.endIdx) / float64(len(words)) * frag.Duration
-			newFrags = append(newFrags, RecordingFrag{
-				Index:    frag.Index,
-				Text:     subText,
-				Speaker:  stableID,
-				Start:    round2(frag.Start + relStart),
-				End:      round2(frag.Start + relEnd),
-				Duration: round2(relEnd - relStart),
-				Status:   "done",
-				Segments: []FragSpeakerSeg{{
-					Speaker: stableID,
-					Start:   0,
-					End:     round2(relEnd - relStart),
-					Text:    subText,
-				}},
+			segText := strings.Join(words[segStart:wi], " ")
+			absStart := frag.Start + float64(segStart)/float64(len(words))*frag.Duration
+			absEnd := frag.Start + float64(wi)/float64(len(words))*frag.Duration
+			segments = append(segments, FragSpeakerSeg{
+				Speaker: speakerStr,
+				Start:   round2(absStart),
+				End:     round2(absEnd),
+				Text:    segText,
 			})
+			segStart = wi
 		}
-		splitCount++
+
+		// Mikro-Segmente (< 2 Wörter) in Nachbar-Segment zusammenführen
+		if len(segments) > 1 {
+			var cleaned []FragSpeakerSeg
+			for _, seg := range segments {
+				wordCount := len(strings.Fields(seg.Text))
+				if wordCount < 2 && len(cleaned) > 0 {
+					// Zu kurz → in vorheriges aufnehmen
+					cleaned[len(cleaned)-1].End = seg.End
+					cleaned[len(cleaned)-1].Text += " " + seg.Text
+				} else {
+					cleaned = append(cleaned, seg)
+				}
+			}
+			segments = cleaned
+		}
+
+		frag.Segments = segments
+		// Dominanter Speaker = Speaker des längsten Segments
+		maxDur := 0.0
+		for _, seg := range segments {
+			d := seg.End - seg.Start
+			if d > maxDur {
+				maxDur = d
+				frag.Speaker = seg.Speaker
+			}
+		}
 	}
 
-	// Neue Fragment-Liste ersetzen (Index neu vergeben)
-	for i := range newFrags {
-		newFrags[i].Index = i + 1
-	}
-	session.Fragments = newFrags
 	session.mu.Unlock()
 
-	log.Printf("recording: session/end-diarize: fertig in %v (%d Speaker, %d Fragmente, %d gesplittet)",
-		time.Since(start), len(envelopeOrder), len(newFrags), splitCount)
+	log.Printf("recording: session/end-diarize: fertig in %v (%d Speaker, %d Fragmente)",
+		time.Since(start), len(envelopeOrder), len(session.Fragments))
+}
+
+// buildUtterances fasst aufeinanderfolgende Segmente desselben Speakers
+// zu Äußerungen zusammen — auch über Fragment-Grenzen hinweg.
+// Eine Pause > 2s zwischen Segmenten desselben Speakers startet eine neue Äußerung.
+func buildUtterances(fragments []RecordingFrag) []Utterance {
+	// Alle Segmente flach sammeln (zeitlich sortiert)
+	var allSegs []FragSpeakerSeg
+	for _, frag := range fragments {
+		if len(frag.Segments) > 0 {
+			allSegs = append(allSegs, frag.Segments...)
+		} else if frag.Text != "" {
+			// Fragment ohne Segmente → als ganzes Segment
+			allSegs = append(allSegs, FragSpeakerSeg{
+				Speaker: frag.Speaker,
+				Start:   frag.Start,
+				End:     frag.End,
+				Text:    frag.Text,
+			})
+		}
+	}
+	if len(allSegs) == 0 {
+		return nil
+	}
+
+	// Nach Start sortieren
+	sort.Slice(allSegs, func(i, j int) bool { return allSegs[i].Start < allSegs[j].Start })
+
+	// Zusammenfassen: gleicher Speaker + Pause < 2s → eine Äußerung
+	const maxPause = 2.0
+	var utterances []Utterance
+	cur := Utterance{
+		Speaker: allSegs[0].Speaker,
+		Start:   allSegs[0].Start,
+		End:     allSegs[0].End,
+		Text:    allSegs[0].Text,
+	}
+
+	for i := 1; i < len(allSegs); i++ {
+		seg := allSegs[i]
+		gap := seg.Start - cur.End
+		if seg.Speaker == cur.Speaker && gap < maxPause {
+			// Gleicher Speaker, geringe Pause → zusammenfassen
+			cur.End = seg.End
+			cur.Text += " " + seg.Text
+		} else {
+			// Neuer Speaker oder große Pause → neue Äußerung
+			cur.Text = strings.TrimSpace(cur.Text)
+			utterances = append(utterances, cur)
+			cur = Utterance{
+				Speaker: seg.Speaker,
+				Start:   seg.Start,
+				End:     seg.End,
+				Text:    seg.Text,
+			}
+		}
+	}
+	cur.Text = strings.TrimSpace(cur.Text)
+	utterances = append(utterances, cur)
+
+	// Zeiten runden
+	for i := range utterances {
+		utterances[i].Start = round2(utterances[i].Start)
+		utterances[i].End = round2(utterances[i].End)
+	}
+
+	return utterances
 }
 
 // ── WebDAV-Upload ────────────────────────────────────────────
@@ -2129,13 +2198,15 @@ func (s *Server) webdavUploadRecording(session *RecordingSession, transcript str
 		}
 	}
 
-	// Transkript-JSON (inkl. speaker_hints)
+	// Transkript-JSON (inkl. speaker_hints + utterances)
 	speakerHints := buildSpeakerHints(session.Fragments)
+	utterances := buildUtterances(session.Fragments)
 	transcriptJSON, _ := json.MarshalIndent(map[string]any{
 		"session_id":    session.ID,
 		"created":       session.Created,
 		"transcript":    transcript,
 		"fragments":     session.Fragments,
+		"utterances":    utterances,
 		"speaker_hints": speakerHints,
 		"audio_file":    "aufnahme.wav",
 	}, "", "  ")
