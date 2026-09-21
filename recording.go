@@ -87,6 +87,8 @@ type RecordingSession struct {
 	liveSpeakerByFrag   map[int]string      // Fragment-Index → Speaker-Name
 	liveSpeakerMap      map[string]SpeakerRef // pyannote-Label → stabile SpeakerRef (session-lokal)
 	liveSpeakerEmb      map[string][]float64  // pyannote-Label → Embedding (für Alignment)
+	// Rohe pyannote-Segmente aus allen Windows (absolute Session-Zeit, mit stabilen Speaker-Namen)
+	liveSegments        []FragSpeakerSeg
 }
 
 // WordTimestamp ist ein Wort mit absolutem Zeitstempel (Session-Zeit).
@@ -1542,7 +1544,20 @@ func (s *Server) diarizeWindowFinal(session *RecordingSession) {
 			continue
 		}
 	}
-	_ = result // Segments werden unten für Fragment-Zuordnung gebraucht
+	// Rohe Segmente mit stabilen Speaker-Namen speichern
+	for _, seg := range result.Segments {
+		speakerName := "unknown"
+		if ref, ok := session.liveSpeakerMap[seg.Speaker]; ok {
+			speakerName = ref.String()
+		}
+		if speakerName != "unknown" {
+			session.liveSegments = append(session.liveSegments, FragSpeakerSeg{
+				Speaker: speakerName,
+				Start:   round2(seg.Start),
+				End:     round2(seg.End),
+			})
+		}
+	}
 
 	// Fragmente zuordnen per Midpoint
 	for i := range session.Fragments {
@@ -1658,7 +1673,7 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 		}
 	}
 
-	// Segmente auf absolute Session-Zeit umrechnen
+	// Segmente auf absolute Session-Zeit umrechnen + stabile Speaker-Namen
 	winStartSec := float64(winStartSamples) / 16000.0
 	var absSegs []diarizeSegment
 	for _, seg := range result.Segments {
@@ -1669,15 +1684,27 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 		})
 	}
 
-	// Fragmente im Window-Zeitfenster [cursor, winEnd] zuweisen
+	// Rohe Segmente mit stabilen Speaker-Namen in Session speichern
+	// (für Multi-Segment-Zuordnung bei Session-End)
 	cursorSec := float64(session.windowCursorSamples) / 16000.0
-	winEndSec := float64(winEndSamples) / 16000.0
-	log.Printf("recording: live-diarize: zuweise Fragmente [%.0f-%.0f]s, %d absSegs, %d labelRefs, winStartSec=%.1f",
-		cursorSec, winEndSec, len(absSegs), len(labelRefs), winStartSec)
-	if len(absSegs) > 0 {
-		log.Printf("recording: live-diarize: absSegs[0]=[%.1f-%.1f] absSegs[-1]=[%.1f-%.1f]",
-			absSegs[0].Start, absSegs[0].End, absSegs[len(absSegs)-1].Start, absSegs[len(absSegs)-1].End)
+	for _, seg := range absSegs {
+		// Nur Segmente ab Cursor (neue Segmente, nicht Overlap-Bereich)
+		if seg.End <= cursorSec {
+			continue
+		}
+		speakerName := "unknown"
+		if ref, ok := labelRefs[seg.Speaker]; ok {
+			speakerName = ref.String()
+		}
+		session.liveSegments = append(session.liveSegments, FragSpeakerSeg{
+			Speaker: speakerName,
+			Start:   round2(seg.Start),
+			End:     round2(seg.End),
+		})
 	}
+
+	// Fragmente im Window-Zeitfenster [cursor, winEnd] zuweisen
+	winEndSec := float64(winEndSamples) / 16000.0
 	for i := range session.Fragments {
 		frag := &session.Fragments[i]
 		mid := (frag.Start + frag.End) / 2
@@ -2039,42 +2066,26 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			continue
 		}
 
-		// Sammle alle Speaker die in diesem Zeitbereich aktiv sind.
-		// Quelle: liveSpeakerByFrag für dieses Fragment + Nachbar-Fragmente
-		// deren Zeitbereich in dieses Fragment hineinragt.
+		// Rohe pyannote-Segmente die mit diesem Fragment überlappen sammeln.
+		// Quelle: session.liveSegments (aus Live-Window + Final-Window, stabile Speaker-Namen).
 		type span struct {
 			start, end float64
 			speaker    string
 		}
 		var spans []span
-
-		// Eigener Fragment-Speaker als Basis-Span
-		if frag.Speaker != "" && frag.Speaker != "unknown" {
-			spans = append(spans, span{frag.Start, frag.End, frag.Speaker})
-		}
-
-		// Prüfe ob Nachbar-Fragmente andere Speaker haben und zeitlich nah sind.
-		// Bei Sprecherwechsel innerhalb eines Fragments: der nächste Fragment-Speaker
-		// "ragt" in dieses Fragment hinein (Word-Timestamps zeigen wo).
-		if i > 0 {
-			prev := &session.Fragments[i-1]
-			if prev.Speaker != frag.Speaker && prev.Speaker != "" && prev.Speaker != "unknown" {
-				// Vorheriger Speaker könnte am Anfang dieses Fragments noch reden
-				spans = append(spans, span{frag.Start, frag.Start + frag.Duration*0.3, prev.Speaker})
+		for _, seg := range session.liveSegments {
+			ovStart := math.Max(frag.Start, seg.Start)
+			ovEnd := math.Min(frag.End, seg.End)
+			if ovEnd-ovStart < 0.3 {
+				continue
 			}
-		}
-		if i+1 < len(session.Fragments) {
-			next := &session.Fragments[i+1]
-			if next.Speaker != frag.Speaker && next.Speaker != "" && next.Speaker != "unknown" {
-				// Nächster Speaker könnte am Ende dieses Fragments schon anfangen
-				spans = append(spans, span{frag.End - frag.Duration*0.3, frag.End, next.Speaker})
-			}
+			spans = append(spans, span{ovStart, ovEnd, seg.Speaker})
 		}
 
-		if len(spans) <= 1 {
-			// Nur ein Speaker → einfaches Segment
+		// Fallback: kein liveSegment → Fragment-Speaker als einzelnes Segment
+		if len(spans) == 0 {
 			speaker := frag.Speaker
-			if speaker == "" || speaker == "unknown" {
+			if speaker == "" {
 				speaker = "unknown"
 			}
 			frag.Segments = []FragSpeakerSeg{{
@@ -2084,6 +2095,47 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 				Text:    frag.Text,
 			}}
 			continue
+		}
+
+		// Sortieren + Overlaps auflösen (längeres Segment dominiert)
+		sort.Slice(spans, func(a, b int) bool { return spans[a].start < spans[b].start })
+		var resolved []span
+		for _, sp := range spans {
+			if len(resolved) > 0 && sp.start < resolved[len(resolved)-1].end {
+				last := &resolved[len(resolved)-1]
+				if sp.speaker == last.speaker {
+					if sp.end > last.end {
+						last.end = sp.end
+					}
+				} else {
+					if sp.end-sp.start > last.end-last.start {
+						last.end = sp.start
+						if last.end <= last.start {
+							resolved = resolved[:len(resolved)-1]
+						}
+						resolved = append(resolved, sp)
+					} else if sp.end > last.end {
+						resolved = append(resolved, span{last.end, sp.end, sp.speaker})
+					}
+				}
+			} else {
+				resolved = append(resolved, sp)
+			}
+		}
+		// Aufeinanderfolgende gleiche Speaker zusammenfassen
+		var merged []span
+		for _, sp := range resolved {
+			if sp.end <= sp.start {
+				continue
+			}
+			if len(merged) > 0 && sp.speaker == merged[len(merged)-1].speaker {
+				merged[len(merged)-1].end = sp.end
+			} else {
+				merged = append(merged, sp)
+			}
+		}
+		if len(merged) == 0 {
+			merged = []span{{frag.Start, frag.End, frag.Speaker}}
 		}
 
 		// Mehrere Speaker-Spans → Text per Word-Timestamps zuordnen
@@ -2109,19 +2161,15 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			}
 		}
 
-		// Pro Wort: Speaker bestimmen (nächster Span)
+		// Pro Wort: Speaker bestimmen aus merged spans
 		wordSpeakers := make([]string, len(words))
 		for wi := range wordsWT {
 			absTime := wordsWT[wi].absTime
-			wordSpeakers[wi] = frag.Speaker // Fallback: Fragment-Speaker
-			bestDist := math.MaxFloat64
-			for _, sp := range spans {
+			wordSpeakers[wi] = merged[0].speaker // Fallback: erster Span
+			for _, sp := range merged {
 				if absTime >= sp.start && absTime < sp.end {
-					dist := absTime - sp.start
-					if dist < bestDist {
-						bestDist = dist
-						wordSpeakers[wi] = sp.speaker
-					}
+					wordSpeakers[wi] = sp.speaker
+					break
 				}
 			}
 		}
