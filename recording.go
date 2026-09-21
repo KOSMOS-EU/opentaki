@@ -1685,10 +1685,9 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 	}
 
 	// Rohe Segmente mit stabilen Speaker-Namen in Session speichern
-	// (für Multi-Segment-Zuordnung bei Session-End)
 	cursorSec := float64(session.windowCursorSamples) / 16000.0
+	newSegs := 0
 	for _, seg := range absSegs {
-		// Nur Segmente ab Cursor (neue Segmente, nicht Overlap-Bereich)
 		if seg.End <= cursorSec {
 			continue
 		}
@@ -1701,7 +1700,10 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 			Start:   round2(seg.Start),
 			End:     round2(seg.End),
 		})
+		newSegs++
 	}
+	log.Printf("recording: live-diarize: %d Segmente in liveSegments gespeichert (total: %d)",
+		newSegs, len(session.liveSegments))
 
 	// Fragmente im Window-Zeitfenster [cursor, winEnd] zuweisen
 	winEndSec := float64(winEndSamples) / 16000.0
@@ -2067,7 +2069,6 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 		}
 
 		// Rohe pyannote-Segmente die mit diesem Fragment überlappen sammeln.
-		// Quelle: session.liveSegments (aus Live-Window + Final-Window, stabile Speaker-Namen).
 		type span struct {
 			start, end float64
 			speaker    string
@@ -2081,6 +2082,12 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			}
 			spans = append(spans, span{ovStart, ovEnd, seg.Speaker})
 		}
+		uniqueSpk := map[string]bool{}
+		for _, sp := range spans {
+			uniqueSpk[sp.speaker] = true
+		}
+		log.Printf("recording: finalize: frag %d [%.0f-%.0fs] %d spans, %d speaker: %v",
+			frag.Index, frag.Start, frag.End, len(spans), len(uniqueSpk), uniqueSpk)
 
 		// Fallback: kein liveSegment → Fragment-Speaker als einzelnes Segment
 		if len(spans) == 0 {
