@@ -723,6 +723,34 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	log.Printf("recording: session/end: %s space=%s frags=%d audio=%d bytes",
 		body.SessionID, session.SpaceID, len(session.Fragments), len(session.totalAudio))
 
+	// 0. Fragment-Flush: offenes fragAudio transkribieren (kurze Aufnahmen ohne
+	//    Sprechpause erreichen nie silence_timeout/maxFragmentSec → frags=0).
+	s.flushPendingFragment(session)
+
+	// 0b. Fallback: wenn nach Flush immer noch keine Fragments aber Audio da ist,
+	//     das gesamte Session-Audio als ein Fragment durch Whisper schicken.
+	if len(session.Fragments) == 0 && len(session.totalAudio) > 0 && s.cfg.Whisper.APIBase != "" {
+		log.Printf("recording: session/end: fallback — transkribiere gesamtes Audio (%d bytes) als ein Fragment",
+			len(session.totalAudio))
+		text := s.whisperTranscribeBytes(session.totalAudio)
+		if text != "" {
+			session.mu.Lock()
+			totalDuration := float64(session.totalSamples) / 16000.0
+			session.Fragments = append(session.Fragments, RecordingFrag{
+				Index:    1,
+				Text:     text,
+				Speaker:  "unknown",
+				Start:    0,
+				End:      totalDuration,
+				Duration: totalDuration,
+				Status:   "done",
+			})
+			session.mu.Unlock()
+			log.Printf("recording: session/end: fallback Fragment erzeugt (%.1fs, %d chars)",
+				totalDuration, len(text))
+		}
+	}
+
 	// 1. Session-End-Diarization: ein pyannote-Call auf komplettes Session-Audio,
 	//    Segmente zeitbasiert auf Fragmente mappen, Speaker-Profile per Embedding anlegen.
 	if s.cfg.Recording.DiarizeAPIBase != "" && len(session.totalAudio) > 0 && len(session.Fragments) > 0 {
@@ -740,26 +768,17 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	}
 	fullTranscript := transcriptBuilder.String()
 
-	// 3a. WebDAV-Upload (auch bei leerem Transkript — Audio-File hochladen)
-	if session.shareToken != "" && len(session.totalAudio) > 0 {
-		uploadPath := s.webdavUploadRecording(session, fullTranscript)
-		if uploadPath != "" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"status":     "done",
-				"transcript": "",
-				"upload":     uploadPath,
-				"message":    "Kein Transkript, Audio hochgeladen",
-			})
-			return
-		}
-	}
+	// 3a. Leere Session: nur Audio hochladen (kein Transkript möglich)
 	if fullTranscript == "" {
+		if session.shareToken != "" && len(session.totalAudio) > 0 {
+			s.webdavUploadRecording(session, "")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":      "done",
-			"transcript":  "",
-			"message":     "Kein Transkript (leere Session)",
+			"status":     "done",
+			"transcript": "",
+			"fragments":  session.Fragments,
+			"message":    "Kein Transkript (leere Session)",
 		})
 		return
 	}
@@ -1343,6 +1362,41 @@ func (session *RecordingSession) markFragFailed(idx int) {
 	session.silenceSinceSamples = 0
 	session.speechActive = false
 	session.lastPartialSamples = 0
+}
+
+// flushPendingFragment transkribiert noch offenes fragAudio bei Session-Ende.
+// Löst das Problem dass kurze Aufnahmen ohne Sprechpause nie ein Fragment
+// erzeugen (silence_timeout und maxFragmentSec werden nicht erreicht).
+func (s *Server) flushPendingFragment(session *RecordingSession) {
+	fragAudio := session.takeFragAudio()
+	if len(fragAudio) < 2 {
+		return
+	}
+	if s.cfg.Whisper.APIBase == "" {
+		return
+	}
+
+	session.mu.Lock()
+	fragmentIdx := session.fragIndex
+	if fragmentIdx == 0 {
+		fragmentIdx = 1
+	}
+	session.mu.Unlock()
+
+	log.Printf("recording: flush pending fragment %d (%d bytes)", fragmentIdx, len(fragAudio))
+	text := s.whisperTranscribeBytes(fragAudio)
+	if text == "" {
+		log.Printf("recording: flush fragment %d: Whisper lieferte leeren Text", fragmentIdx)
+		return
+	}
+
+	session.addFragment(fragmentIdx, text, "unknown")
+	log.Printf("recording: flush fragment %d ok (%d chars)", fragmentIdx, len(text))
+
+	// Fragment-Audio auch per WebDAV hochladen
+	if session.shareToken != "" {
+		go s.webdavUploadFragment(session, fragmentIdx, fragAudio)
+	}
 }
 
 // ── Session-End-Diarization ──────────────────────────────────
