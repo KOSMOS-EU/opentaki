@@ -781,10 +781,12 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	session.wordWg.Wait()
 	log.Printf("recording: session/end: alle word-timestamps da")
 
-	// 1. Session-End-Diarization: ein pyannote-Call auf komplettes Session-Audio,
-	//    Segmente zeitbasiert auf Fragmente mappen, Speaker-Profile per Embedding anlegen.
-	if s.cfg.Recording.DiarizeAPIBase != "" && len(session.totalAudio) > 0 && len(session.Fragments) > 0 {
-		s.diarizeSessionEnd(session)
+	// 1. Speaker-Finalisierung: Live-Window-Ergebnisse nutzen (kein erneuter pyannote-Call).
+	//    Live-Window hat feinere Segmentierung (60s-Fenster, min_speakers) als ein
+	//    einzelner Call auf dem Gesamtaudio. Session-End speichert nur noch Profile
+	//    und baut Multi-Segments aus den Live-Daten.
+	if len(session.Fragments) > 0 {
+		s.finalizeSessionSpeakers(session)
 	}
 
 	// 2. Komplettes Transkript zusammenstellen (aus Utterances, nicht Fragments,
@@ -1838,182 +1840,130 @@ func (session *RecordingSession) applyLlmSplit(fragIdx int, wordCount int, nextS
 	}
 }
 
-// diarizeSessionEnd führt die Diarization einmal auf dem kompletten
-// Session-Audio aus und mappt die Segmente zeitbasiert auf Fragmente.
-// Pro einzigem Speaker wird ein Envelope-Mean-Embedding berechnet und
-// mit matchSpeaker gegen die Speaker-Profile geprüft.
-func (s *Server) diarizeSessionEnd(session *RecordingSession) {
-	log.Printf("recording: session/end-diarize: start für %s (audio=%d bytes)",
-		session.ID, len(session.totalAudio))
+// finalizeSessionSpeakers nutzt die Live-Window-Diarization-Ergebnisse
+// (statt eines erneuten pyannote-Calls auf dem Gesamtaudio).
+// Live-Window hat feinere Segmentierung (60s-Fenster, min_speakers)
+// als ein einzelner Call auf dem Gesamtaudio.
+//
+// Aufgaben:
+//   - Speaker-Profile in DB speichern (aus liveSpeakerEmb)
+//   - Fragmente die nur "unknown" haben: Speaker aus liveSpeakerByFrag setzen
+//   - Multi-Segment-Zuordnung per Word-Timestamps
+func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 	start := time.Now()
 
-	result := s.diarizeAudioBytes(session.totalAudio)
-	if result == nil || len(result.Segments) == 0 {
-		log.Printf("recording: session/end-diarize: keine Segmente für %s", session.ID)
-		return
-	}
-	log.Printf("recording: session/end-diarize: %d Segmente, %d Speaker, embeddings=%v",
-		len(result.Segments), len(result.Speakers), len(result.SpeakerEmbeddings) > 0)
-
-	// 1. Pro Speaker: Envelope-Mean aus allen Segments
-	type speakerEnvelope struct {
-		label    string
-		start    float64
-		end      float64
-		envelope []float64
-	}
-	envByLabel := map[string]*speakerEnvelope{}
-	var envelopeOrder []string
-	for _, seg := range result.Segments {
-		env, ok := envByLabel[seg.Speaker]
-		if !ok {
-			env = &speakerEnvelope{label: seg.Speaker, start: seg.Start, end: seg.End, envelope: []float64{}}
-			envByLabel[seg.Speaker] = env
-			envelopeOrder = append(envelopeOrder, seg.Speaker)
-		}
-		// Envelope: frühester Start, spätestes Ende
-		if seg.Start < env.start {
-			env.start = seg.Start
-		}
-		if seg.End > env.end {
-			env.end = seg.End
-		}
-		// Embedding-Vector sammeln
-		if emb, ok := result.SpeakerEmbeddings[seg.Speaker]; ok {
-			env.envelope = append(env.envelope, emb...)
-		}
-	}
-
-	// 2. Globale Speaker-IDs + Person-Matching per Embedding
-	//    speakerDisplay: rawLabel → SpeakerRef (Person-Name + ProfileID)
-	speakerDisplay := map[string]SpeakerRef{}
-	for _, label := range envelopeOrder {
-		env := envByLabel[label]
-		if len(env.envelope) == 0 {
-			log.Printf("recording: session/end-diarize: %s kein Embedding", label)
-			continue
-		}
-
-		// Envelope-Mean
-		numSegments := len(env.envelope) / len(result.SpeakerEmbeddings[label])
-		embDim := len(result.SpeakerEmbeddings[label])
-		meanEmb := make([]float64, embDim)
-		for si := 0; si < numSegments; si++ {
-			for d := 0; d < embDim; d++ {
-				meanEmb[d] += env.envelope[si*embDim+d] / float64(numSegments)
-			}
-		}
-
-		// 1a. Session-lokales Live-Match: wenn der Rolling-Window-Pfad
-		//     diesen Sprecher schon zugeordnet hat, wiederverwenden.
-		//     Verhindert dass Session-End eine neue Person anlegt, wenn
-		//     die Envelope-Mean nicht gegen globale Profile matcht.
-		session.mu.Lock()
-		liveRef := SpeakerRef{}
-		liveMatched := false
-		if len(session.liveSpeakerEmb) > 0 {
-			var bestLiveScore float64
-			for _, emb := range session.liveSpeakerEmb {
-				if sc := cosineSimilarity(meanEmb, emb); sc > bestLiveScore {
-					bestLiveScore = sc
-				}
-			}
-			// 0.65: Envelope-Mean vs. Einzel-Window-Embedding.
-			// Cross-Session derselben Person: 0.65-0.70 (pyannote 256-dim).
-			if bestLiveScore >= 0.65 {
-				// Besten Embedding finden und zugehörigen Ref
-				for l, emb := range session.liveSpeakerEmb {
-					if sc := cosineSimilarity(meanEmb, emb); sc >= 0.65 {
-						if ref, ok := session.liveSpeakerMap[l]; ok {
-							liveRef = ref
-							liveMatched = true
-							log.Printf("recording: session/end-diarize: %s → Live-Speaker %q (cosine=%.2f)",
-								label, ref.PersonName, sc)
-							break
-						}
-					}
-				}
-			}
-		}
-		session.mu.Unlock()
-
-		if liveMatched {
-			s.speakerMu.Lock()
-			profileID := s.addProfileForSession(liveRef.PersonID, meanEmb, session.ID)
-			speakerDisplay[label] = SpeakerRef{PersonName: liveRef.PersonName, PersonID: liveRef.PersonID, ProfileID: profileID}
-			s.speakerMu.Unlock()
-			continue
-		}
-
-		// Cosine-Matching gegen ALLE Profile → Person
-		match := s.matchSpeaker(meanEmb)
-		s.speakerMu.Lock()
-		if match.Matched {
-			// Bekannte Person: Profil updaten oder anlegen
-			profileID := s.addProfileForSession(match.Person.ID, meanEmb, session.ID)
-			speakerDisplay[label] = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: profileID}
-			log.Printf("recording: session/end-diarize: %s → Person %q (profile %d, %.2f)",
-				label, match.Person.Name, profileID, match.Score)
-		} else {
-			// Unbekannte Stimme.
-			// Falls der Score in der "Unbekannt-Zone" liegt (0.55–0.65) und die
-			// beste Person noch ein SPEAKER_XX ist (nicht manuell benannt),
-			// wiederverwenden statt neu anlegen — verhindert dass derselbe
-			// unbekannte Sprecher in zwei Sessions zwei verschiedene SPEAKER_XX
-			// bekommt. 0.55 ist aggressiv, aber Cross-Session-Cosine derselben
-			// Person liegt bei 0.65-0.70 (pyannote 256-dim).
-			const unknownToUnknownThreshold = 0.55
-			if match.Score >= unknownToUnknownThreshold &&
-				strings.HasPrefix(match.Person.Name, "SPEAKER_") {
-				profileID := s.addProfileForSession(match.Person.ID, meanEmb, session.ID)
-				speakerDisplay[label] = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: profileID}
-				log.Printf("recording: session/end-diarize: %s → wiederverwende %q (profile %d, score=%.2f, unbekannt-zone)",
-					label, match.Person.Name, profileID, match.Score)
-			} else {
-				person := s.createGlobalSpeaker()
-				profileID := s.addProfileForSession(person.ID, meanEmb, session.ID)
-				speakerDisplay[label] = SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: profileID}
-				log.Printf("recording: session/end-diarize: %s → neue Person %q (profile %d, best=%.2f)",
-					label, person.Name, profileID, match.Score)
-			}
-		}
-		s.speakerMu.Unlock()
-	}
-
-	// 3. Pro Fragment: Multi-Segment-Zuordnung.
-	//    Fragmente bleiben als Audio-Einheiten erhalten (1 pro VAD-Chunk).
-	//    Jedes Fragment bekommt mehrere Segmente (Speaker-homogene Abschnitte).
-	//    Text wird proportional (i/N) auf Segmente verteilt.
 	session.mu.Lock()
+	liveSpeakers := make(map[string]SpeakerRef)
+	for k, v := range session.liveSpeakerMap {
+		liveSpeakers[k] = v
+	}
+	liveByFrag := make(map[int]string)
+	for k, v := range session.liveSpeakerByFrag {
+		liveByFrag[k] = v
+	}
+	liveEmb := make(map[string][]float64)
+	for k, v := range session.liveSpeakerEmb {
+		liveEmb[k] = v
+	}
+	session.mu.Unlock()
 
+	// Eindeutige Speaker-Refs sammeln (dedupliziert nach PersonName)
+	speakerRefs := map[string]SpeakerRef{} // PersonName → SpeakerRef
+	speakerEmbs := map[string][]float64{}  // PersonName → Embedding
+	for label, ref := range liveSpeakers {
+		if _, exists := speakerRefs[ref.PersonName]; !exists {
+			speakerRefs[ref.PersonName] = ref
+			if emb, ok := liveEmb[label]; ok {
+				speakerEmbs[ref.PersonName] = emb
+			}
+		}
+	}
+
+	log.Printf("recording: finalize: %d Live-Speaker, %d Fragmente",
+		len(speakerRefs), len(session.Fragments))
+
+	// 1. Speaker-Profile in DB speichern (aus Live-Embeddings)
+	for personName, emb := range speakerEmbs {
+		ref := speakerRefs[personName]
+		if ref.PersonID > 0 && len(emb) > 0 {
+			s.speakerMu.Lock()
+			s.addProfileForSession(ref.PersonID, emb, session.ID)
+			s.speakerMu.Unlock()
+		}
+	}
+
+	// 2. Fragmente: Speaker aus Live-Window setzen (falls noch "unknown")
+	session.mu.Lock()
+	for i := range session.Fragments {
+		frag := &session.Fragments[i]
+		if (frag.Speaker == "" || frag.Speaker == "unknown") {
+			if name, ok := liveByFrag[frag.Index]; ok {
+				frag.Speaker = name
+			}
+		}
+	}
+
+	// 3. Multi-Segment-Zuordnung per Word-Timestamps.
+	//    Jedes Fragment bekommt Segmente basierend auf den Live-Speaker-Zuweisungen
+	//    benachbarter Fragmente und den Word-Timestamps für präzise Grenzen.
 	for i := range session.Fragments {
 		frag := &session.Fragments[i]
 		if frag.Duration <= 0 || frag.Text == "" {
 			continue
 		}
 
-		// Diarization-Segmente die mit diesem Fragment überlappen sammeln.
-		// Segmente < 0.5s ignorieren (pyannote-Mikro-Artefakte).
+		// Wenn Fragment nur einen Speaker hat und keine Word-Timestamps:
+		// einfaches Single-Segment
+		if frag.Speaker != "" && frag.Speaker != "unknown" && len(frag.Words) == 0 {
+			frag.Segments = []FragSpeakerSeg{{
+				Speaker: frag.Speaker,
+				Start:   round2(frag.Start),
+				End:     round2(frag.End),
+				Text:    frag.Text,
+			}}
+			continue
+		}
+
+		// Sammle alle Speaker die in diesem Zeitbereich aktiv sind.
+		// Quelle: liveSpeakerByFrag für dieses Fragment + Nachbar-Fragmente
+		// deren Zeitbereich in dieses Fragment hineinragt.
 		type span struct {
 			start, end float64
 			speaker    string
 		}
 		var spans []span
-		for _, seg := range result.Segments {
-			ovStart := math.Max(frag.Start, seg.Start)
-			ovEnd := math.Min(frag.End, seg.End)
-			if ovEnd-ovStart < 0.5 {
-				continue
+
+		// Eigener Fragment-Speaker als Basis-Span
+		if frag.Speaker != "" && frag.Speaker != "unknown" {
+			spans = append(spans, span{frag.Start, frag.End, frag.Speaker})
+		}
+
+		// Prüfe ob Nachbar-Fragmente andere Speaker haben und zeitlich nah sind.
+		// Bei Sprecherwechsel innerhalb eines Fragments: der nächste Fragment-Speaker
+		// "ragt" in dieses Fragment hinein (Word-Timestamps zeigen wo).
+		if i > 0 {
+			prev := &session.Fragments[i-1]
+			if prev.Speaker != frag.Speaker && prev.Speaker != "" && prev.Speaker != "unknown" {
+				// Vorheriger Speaker könnte am Anfang dieses Fragments noch reden
+				spans = append(spans, span{frag.Start, frag.Start + frag.Duration*0.3, prev.Speaker})
 			}
-			if ovEnd > ovStart {
-				spans = append(spans, span{ovStart, ovEnd, seg.Speaker})
+		}
+		if i+1 < len(session.Fragments) {
+			next := &session.Fragments[i+1]
+			if next.Speaker != frag.Speaker && next.Speaker != "" && next.Speaker != "unknown" {
+				// Nächster Speaker könnte am Ende dieses Fragments schon anfangen
+				spans = append(spans, span{frag.End - frag.Duration*0.3, frag.End, next.Speaker})
 			}
 		}
 
-		if len(spans) == 0 {
-			// Kein pyannote-Segment → Fragment behält Speaker
+		if len(spans) <= 1 {
+			// Nur ein Speaker → einfaches Segment
+			speaker := frag.Speaker
+			if speaker == "" || speaker == "unknown" {
+				speaker = "unknown"
+			}
 			frag.Segments = []FragSpeakerSeg{{
-				Speaker: frag.Speaker,
+				Speaker: speaker,
 				Start:   round2(frag.Start),
 				End:     round2(frag.End),
 				Text:    frag.Text,
@@ -2021,148 +1971,61 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			continue
 		}
 
-		// Nach Start sortieren
-		sort.Slice(spans, func(a, b int) bool { return spans[a].start < spans[b].start })
-
-		// Overlaps auflösen: bei gleichzeitiger Rede gewinnt das längere Segment.
-		// Dann zu nicht-überlappenden Zeitspannen mit eindeutigem Speaker zusammenfassen.
-		var resolved []span
-		for _, sp := range spans {
-			if len(resolved) > 0 && sp.start < resolved[len(resolved)-1].end {
-				last := &resolved[len(resolved)-1]
-				if sp.speaker == last.speaker {
-					// Gleicher Speaker → erweitern
-					if sp.end > last.end {
-						last.end = sp.end
-					}
-				} else {
-					// Verschiedene Speaker → Overlap: längeres gewinnt den Overlap-Bereich
-					overlapEnd := math.Min(sp.end, last.end)
-					lastDur := overlapEnd - last.start
-					spDur := sp.end - sp.start
-					if spDur > lastDur {
-						// Neues Segment dominiert → altes kürzen, neues anhängen
-						last.end = sp.start
-						if last.end <= last.start {
-							resolved = resolved[:len(resolved)-1]
-						}
-						resolved = append(resolved, span{sp.start, sp.end, sp.speaker})
-					} else {
-						// Altes Segment dominiert → neues nach dem Overlap anfangen
-						if sp.end > last.end {
-							resolved = append(resolved, span{last.end, sp.end, sp.speaker})
-						}
-					}
-				}
-			} else {
-				resolved = append(resolved, sp)
-			}
-		}
-
-		// Auf Fragment-Zeitbereich clampen
-		for j := range resolved {
-			if resolved[j].start < frag.Start {
-				resolved[j].start = frag.Start
-			}
-			if resolved[j].end > frag.End {
-				resolved[j].end = frag.End
-			}
-		}
-
-		// Aufeinanderfolgende Spans mit gleichem Speaker zusammenfassen
-		var merged []span
-		for _, sp := range resolved {
-			if sp.end <= sp.start {
-				continue
-			}
-			if len(merged) > 0 && sp.speaker == merged[len(merged)-1].speaker {
-				merged[len(merged)-1].end = sp.end
-			} else {
-				merged = append(merged, sp)
-			}
-		}
-
-		if len(merged) == 0 {
-			frag.Segments = []FragSpeakerSeg{{
-				Speaker: frag.Speaker,
-				Start:   round2(frag.Start),
-				End:     round2(frag.End),
-				Text:    frag.Text,
-			}}
-			continue
-		}
-
-		// Text auf Segmente verteilen.
-		// Wenn Word-Timestamps vorhanden: echte Zeiten pro Wort.
-		// Sonst Fallback: proportional i/N.
+		// Mehrere Speaker-Spans → Text per Word-Timestamps zuordnen
 		words := strings.Fields(frag.Text)
 		if len(words) == 0 {
-			speakerStr := "unknown"
-			if ref, ok := speakerDisplay[merged[0].speaker]; ok {
-				speakerStr = ref.String()
-			}
-			frag.Speaker = speakerStr
 			continue
 		}
 
-		// Wort-zu-Zeit-Zuordnung: echte Timestamps oder i/N-Schätzung
+		// Wort-zu-Zeit-Zuordnung
 		type wordWithTime struct {
 			word    string
-			absTime float64 // Zeitpunkt des Wort-Starts (absolute Session-Zeit)
+			absTime float64
 		}
-		wordsWithTime := make([]wordWithTime, len(words))
-
+		wordsWT := make([]wordWithTime, len(words))
 		if len(frag.Words) >= len(words) {
-			// Whisper Word-Timestamps vorhanden → echte Zeiten
 			for wi := range words {
-				wordsWithTime[wi] = wordWithTime{
-					word:    words[wi],
-					absTime: frag.Words[wi].Start,
-				}
+				wordsWT[wi] = wordWithTime{words[wi], frag.Words[wi].Start}
 			}
-			log.Printf("recording: diarize: fragment %d using %d word timestamps", frag.Index, len(frag.Words))
+			log.Printf("recording: finalize: fragment %d using %d word timestamps", frag.Index, len(frag.Words))
 		} else {
-			// Fallback: proportional i/N
 			for wi := range words {
-				wordsWithTime[wi] = wordWithTime{
-					word:    words[wi],
-					absTime: frag.Start + float64(wi)/float64(len(words))*frag.Duration,
-				}
+				wordsWT[wi] = wordWithTime{words[wi], frag.Start + float64(wi)/float64(len(words))*frag.Duration}
 			}
 		}
 
-		// Pro Wort: Speaker aus Diarization-Zeitspanne bestimmen
+		// Pro Wort: Speaker bestimmen (nächster Span)
 		wordSpeakers := make([]string, len(words))
-		for wi := range wordsWithTime {
-			absTime := wordsWithTime[wi].absTime
-			wordSpeakers[wi] = merged[0].speaker // Fallback
-			for _, sp := range merged {
+		for wi := range wordsWT {
+			absTime := wordsWT[wi].absTime
+			wordSpeakers[wi] = frag.Speaker // Fallback: Fragment-Speaker
+			bestDist := math.MaxFloat64
+			for _, sp := range spans {
 				if absTime >= sp.start && absTime < sp.end {
-					wordSpeakers[wi] = sp.speaker
-					break
+					dist := absTime - sp.start
+					if dist < bestDist {
+						bestDist = dist
+						wordSpeakers[wi] = sp.speaker
+					}
 				}
 			}
 		}
 
-		// Kontiguierte Wortgruppen mit gleichem Speaker → Segmente
+		// Kontiguierte Wortgruppen → Segmente
 		var segments []FragSpeakerSeg
 		segStart := 0
 		for wi := 1; wi <= len(words); wi++ {
 			if wi < len(words) && wordSpeakers[wi] == wordSpeakers[segStart] {
 				continue
 			}
-			speakerStr := "unknown"
-			if ref, ok := speakerDisplay[wordSpeakers[segStart]]; ok {
-				speakerStr = ref.String()
-			}
 			segText := strings.Join(words[segStart:wi], " ")
-			absStart := wordsWithTime[segStart].absTime
-			absEnd := frag.End // letzte Gruppe geht bis Fragment-Ende
+			absStart := wordsWT[segStart].absTime
+			absEnd := frag.End
 			if wi < len(words) {
-				absEnd = wordsWithTime[wi].absTime
+				absEnd = wordsWT[wi].absTime
 			}
 			segments = append(segments, FragSpeakerSeg{
-				Speaker: speakerStr,
+				Speaker: wordSpeakers[segStart],
 				Start:   round2(absStart),
 				End:     round2(absEnd),
 				Text:    segText,
@@ -2170,13 +2033,12 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			segStart = wi
 		}
 
-		// Mikro-Segmente (< 2 Wörter) in Nachbar-Segment zusammenführen
+		// Mikro-Segmente zusammenführen
 		if len(segments) > 1 {
 			var cleaned []FragSpeakerSeg
 			for _, seg := range segments {
-				wordCount := len(strings.Fields(seg.Text))
-				if wordCount < 2 && len(cleaned) > 0 {
-					// Zu kurz → in vorheriges aufnehmen
+				wc := len(strings.Fields(seg.Text))
+				if wc < 2 && len(cleaned) > 0 {
 					cleaned[len(cleaned)-1].End = seg.End
 					cleaned[len(cleaned)-1].Text += " " + seg.Text
 				} else {
@@ -2187,7 +2049,7 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 		}
 
 		frag.Segments = segments
-		// Dominanter Speaker = Speaker des längsten Segments
+		// Dominanter Speaker = längstes Segment
 		maxDur := 0.0
 		for _, seg := range segments {
 			d := seg.End - seg.Start
@@ -2197,11 +2059,10 @@ func (s *Server) diarizeSessionEnd(session *RecordingSession) {
 			}
 		}
 	}
-
 	session.mu.Unlock()
 
-	log.Printf("recording: session/end-diarize: fertig in %v (%d Speaker, %d Fragmente)",
-		time.Since(start), len(envelopeOrder), len(session.Fragments))
+	log.Printf("recording: finalize: fertig in %v (%d Speaker)",
+		time.Since(start), len(speakerRefs))
 }
 
 // buildUtterances fasst aufeinanderfolgende Segmente desselben Speakers
