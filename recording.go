@@ -2304,16 +2304,18 @@ func correctSegmentBoundaries(words []string, wordSpeakers []string) []string {
 		}
 
 		if bestSplit >= wi {
-			// Prüfe: nach dem Satzende muss noch ein anderer Speaker kommen
-			// (sonst würden wir den gesamten Rest zum vorherigen Speaker schieben)
-			hasOtherAfter := false
-			for j := bestSplit + 1; j < len(words) && j <= bestSplit+3; j++ {
-				if result[j] != prevSpeaker {
-					hasOtherAfter = true
+			// Prüfe: würden wir einen ANDEREN Speaker-Abschnitt überrollen?
+			// Wenn zwischen wi und bestSplit ein Speaker vorkommt der weder
+			// prevSpeaker noch der aktuelle ist → nicht verschieben.
+			currentSpeaker := result[wi]
+			wouldOverwrite := false
+			for k := wi; k <= bestSplit; k++ {
+				if result[k] != currentSpeaker && result[k] != prevSpeaker {
+					wouldOverwrite = true
 					break
 				}
 			}
-			if hasOtherAfter || bestSplit == len(words)-1 {
+			if !wouldOverwrite {
 				shifted := bestSplit - wi + 1
 				for k := wi; k <= bestSplit; k++ {
 					result[k] = prevSpeaker
