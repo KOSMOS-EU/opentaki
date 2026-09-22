@@ -2277,53 +2277,28 @@ func correctSegmentBoundaries(words []string, wordSpeakers []string) []string {
 		// Speaker-Wechsel bei wi. Prüfe ob der Split an einer Satzgrenze liegt.
 		prevWord := words[wi-1]
 		if endsWithSentence(prevWord) {
-			// Split nach Satzende — gut, nichts tun
-			continue
+			continue // Split nach Satzende — passt
 		}
 
-		// Split mitten im Satz. Suche die nächste Satzgrenze in der Nähe.
 		prevSpeaker := result[wi-1]
-		nextSpeaker := result[wi]
 
-		// Vorwärts suchen: nächstes Satzende nach dem Split (max 3 Wörter)
-		// → diese Wörter zum vorherigen Speaker schieben
-		forwardEnd := -1
-		for j := wi; j < len(words) && j < wi+4; j++ {
+		// Nur vorwärts suchen: nächstes Satzende nach dem Split (max 2 Wörter).
+		// Diese Wörter zum vorherigen Speaker schieben (Satz vervollständigen).
+		// NICHT rückwärts suchen — das würde Speaker-Segmente vor dem Split
+		// eliminieren und ist zu aggressiv.
+		for j := wi; j < len(words) && j <= wi+2; j++ {
 			if endsWithSentence(words[j]) {
-				forwardEnd = j
+				// Prüfe: würden wir damit einen anderen Speaker komplett eliminieren?
+				// Nur verschieben wenn der nächste Speaker nach dem Satzende
+				// ein ANDERER ist (also der Satz wirklich zum vorherigen gehört).
+				if j+1 < len(words) && result[j+1] != prevSpeaker {
+					for k := wi; k <= j; k++ {
+						result[k] = prevSpeaker
+					}
+					log.Printf("recording: segment-corrector: shifted %d words (%s..%s) to %s (sentence completion)",
+						j-wi+1, words[wi], words[j], prevSpeaker)
+				}
 				break
-			}
-		}
-
-		// Rückwärts suchen: letztes Satzende vor dem Split (max 3 Wörter)
-		// → Wörter nach dem Satzende zum nächsten Speaker schieben
-		backwardEnd := -1
-		for j := wi - 1; j >= 0 && j > wi-5; j-- {
-			if endsWithSentence(words[j]) {
-				backwardEnd = j
-				break
-			}
-		}
-
-		// Entscheide: kürzere Verschiebung gewinnt
-		forwardDist := len(words) // groß = nicht gefunden
-		backwardDist := len(words)
-		if forwardEnd >= 0 {
-			forwardDist = forwardEnd - wi + 1
-		}
-		if backwardEnd >= 0 {
-			backwardDist = wi - backwardEnd - 1
-		}
-
-		if forwardDist <= backwardDist && forwardDist > 0 && forwardDist <= 3 {
-			// Vorwärts: Wörter wi..forwardEnd zum vorherigen Speaker
-			for j := wi; j <= forwardEnd; j++ {
-				result[j] = prevSpeaker
-			}
-		} else if backwardDist > 0 && backwardDist <= 3 {
-			// Rückwärts: Wörter backwardEnd+1..wi-1 zum nächsten Speaker
-			for j := backwardEnd + 1; j < wi; j++ {
-				result[j] = nextSpeaker
 			}
 		}
 	}
