@@ -2202,20 +2202,9 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			segStart = wi
 		}
 
-		// Mikro-Segmente zusammenführen
-		if len(segments) > 1 {
-			var cleaned []FragSpeakerSeg
-			for _, seg := range segments {
-				wc := len(strings.Fields(seg.Text))
-				if wc < 2 && len(cleaned) > 0 {
-					cleaned[len(cleaned)-1].End = seg.End
-					cleaned[len(cleaned)-1].Text += " " + seg.Text
-				} else {
-					cleaned = append(cleaned, seg)
-				}
-			}
-			segments = cleaned
-		}
+		// Mikro-Segmente: NICHT zusammenführen. Lieber ein kurzes Segment
+		// mit eigenem Speaker als einen Sprecher verlieren. Die Segment-Grenzen
+		// kommen von pyannote und sind authorativ.
 
 		frag.Segments = segments
 		// Dominanter Speaker = längstes Segment
