@@ -1737,7 +1737,9 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 }
 
 // alignWindowLabel aligniert ein pyannote-Window-Label auf eine stabile SpeakerRef.
-// Drei Stufen: Identity, Cosine-Alignment, Global Profile Match.
+// Zwei Stufen: Identity (gleiches Label im selben Window), Global Profile Match.
+// KEINE session-interne Cosine-Fusion: wenn pyannote zwei Labels trennt,
+// bleiben sie getrennt. Lieber mehr Profile als unerkannte verschiedene Personen.
 // Precondition: session.mu wird vom Caller gehalten (KEIN Lock hier).
 func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb []float64) (SpeakerRef, bool) {
 	// 1. Identity: Label existiert schon in der Session
@@ -1745,29 +1747,7 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 		return ref, true
 	}
 
-	// 2. Cosine-Alignment gegen bekannte stable Refs (nur bei ≥2 Labels)
-	bestRef := SpeakerRef{}
-	bestScore := 0.0
-	for l, r := range session.liveSpeakerMap {
-		if e, ok := session.liveSpeakerEmb[l]; ok && len(e) > 0 {
-			if sc := cosineSimilarity(emb, e); sc > bestScore {
-				bestScore = sc
-				bestRef = r
-			}
-		}
-	}
-	// Cross-Session Cosine derselben Person: 0.65-0.70 (pyannote 256-dim).
-	// Session-intern: verschiedene Sprecher 0.20-0.35, gleicher 0.65-0.80.
-	// 0.72 als Window-Align: konservativ genug um verschiedene Sprecher zu trennen.
-	const windowAlignThreshold = 0.72
-	if bestScore >= windowAlignThreshold && bestRef.PersonName != "" {
-		session.liveSpeakerMap[label] = bestRef
-		session.liveSpeakerEmb[label] = emb
-		log.Printf("recording: live-diarize: label %s → %q (cosine=%.2f)", label, bestRef.PersonName, bestScore)
-		return bestRef, true
-	}
-
-	// 3. Global Profile Match (REUSE matchSpeaker + create/addProfile Logik)
+	// 2. Global Profile Match (cross-session, NICHT session-intern)
 	match := s.matchSpeaker(emb)
 	s.speakerMu.Lock()
 	var ref SpeakerRef
