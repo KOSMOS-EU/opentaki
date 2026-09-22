@@ -2211,6 +2211,11 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			}
 		}
 
+		// Intelligent Segment Corrector: Speaker-Grenzen an Satzgrenzen verschieben.
+		// Timecodes haben ±200ms Unschärfe (Whisper DTW + pyannote). Wenn der
+		// Split mitten im Satz liegt, nach der nächsten Interpunktion suchen.
+		wordSpeakers = correctSegmentBoundaries(words, wordSpeakers)
+
 		// Kontiguierte Wortgruppen → Segmente
 		var segments []FragSpeakerSeg
 		segStart := 0
@@ -2233,10 +2238,6 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			segStart = wi
 		}
 
-		// Mikro-Segmente: NICHT zusammenführen. Lieber ein kurzes Segment
-		// mit eigenem Speaker als einen Sprecher verlieren. Die Segment-Grenzen
-		// kommen von pyannote und sind authorativ.
-
 		frag.Segments = segments
 		// Dominanter Speaker = längstes Segment
 		maxDur := 0.0
@@ -2252,6 +2253,91 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 
 	log.Printf("recording: finalize: fertig in %v (%d Speaker)",
 		time.Since(start), len(speakerRefs))
+}
+
+// correctSegmentBoundaries verschiebt Speaker-Grenzen an natürliche Satzgrenzen.
+// Wenn ein Sprecherwechsel mitten im Satz liegt (±200ms Timecode-Unschärfe),
+// wird der Split zur nächsten Interpunktion (. ? ! ;) verschoben.
+//
+// Beispiel: wordSpeakers = [A A A A B B B]  words = ["Kommt" "das" "Test" "schon" "an?" "Diese" "KI"]
+// Split nach "schon" ist falsch (Satz "Kommt das Test schon an?" ist unvollständig).
+// Korrektur: "an?" zu A schieben → [A A A A A B B]
+func correctSegmentBoundaries(words []string, wordSpeakers []string) []string {
+	if len(words) < 3 {
+		return wordSpeakers
+	}
+	result := make([]string, len(wordSpeakers))
+	copy(result, wordSpeakers)
+
+	// Finde alle Speaker-Wechsel-Punkte
+	for wi := 1; wi < len(words); wi++ {
+		if result[wi] == result[wi-1] {
+			continue
+		}
+		// Speaker-Wechsel bei wi. Prüfe ob der Split an einer Satzgrenze liegt.
+		prevWord := words[wi-1]
+		if endsWithSentence(prevWord) {
+			// Split nach Satzende — gut, nichts tun
+			continue
+		}
+
+		// Split mitten im Satz. Suche die nächste Satzgrenze in der Nähe.
+		prevSpeaker := result[wi-1]
+		nextSpeaker := result[wi]
+
+		// Vorwärts suchen: nächstes Satzende nach dem Split (max 3 Wörter)
+		// → diese Wörter zum vorherigen Speaker schieben
+		forwardEnd := -1
+		for j := wi; j < len(words) && j < wi+4; j++ {
+			if endsWithSentence(words[j]) {
+				forwardEnd = j
+				break
+			}
+		}
+
+		// Rückwärts suchen: letztes Satzende vor dem Split (max 3 Wörter)
+		// → Wörter nach dem Satzende zum nächsten Speaker schieben
+		backwardEnd := -1
+		for j := wi - 1; j >= 0 && j > wi-5; j-- {
+			if endsWithSentence(words[j]) {
+				backwardEnd = j
+				break
+			}
+		}
+
+		// Entscheide: kürzere Verschiebung gewinnt
+		forwardDist := len(words) // groß = nicht gefunden
+		backwardDist := len(words)
+		if forwardEnd >= 0 {
+			forwardDist = forwardEnd - wi + 1
+		}
+		if backwardEnd >= 0 {
+			backwardDist = wi - backwardEnd - 1
+		}
+
+		if forwardDist <= backwardDist && forwardDist > 0 && forwardDist <= 3 {
+			// Vorwärts: Wörter wi..forwardEnd zum vorherigen Speaker
+			for j := wi; j <= forwardEnd; j++ {
+				result[j] = prevSpeaker
+			}
+		} else if backwardDist > 0 && backwardDist <= 3 {
+			// Rückwärts: Wörter backwardEnd+1..wi-1 zum nächsten Speaker
+			for j := backwardEnd + 1; j < wi; j++ {
+				result[j] = nextSpeaker
+			}
+		}
+	}
+
+	return result
+}
+
+// endsWithSentence prüft ob ein Wort mit Satzzeichen endet.
+func endsWithSentence(word string) bool {
+	if len(word) == 0 {
+		return false
+	}
+	last := word[len(word)-1]
+	return last == '.' || last == '?' || last == '!' || last == ';'
 }
 
 // buildUtterances fasst aufeinanderfolgende Segmente desselben Speakers
