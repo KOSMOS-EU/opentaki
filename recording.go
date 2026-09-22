@@ -2150,30 +2150,9 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			merged = []span{{frag.Start, frag.End, frag.Speaker}}
 		}
 
-		// Kurze Spans (< 1.5s) glätten: in den längeren Nachbar-Span aufnehmen.
-		// pyannote erzeugt bei Sprecherwechseln Mikro-Segmente (0.2-0.5s) die
-		// nach der Midpoint-Overlap-Auflösung als separate Spans übrigbleiben.
-		if len(merged) > 2 {
-			var smoothed []span
-			for _, sp := range merged {
-				dur := sp.end - sp.start
-				if dur < 1.5 && len(smoothed) > 0 {
-					// Zu kurz → in vorherigen aufnehmen
-					smoothed[len(smoothed)-1].end = sp.end
-				} else {
-					smoothed = append(smoothed, sp)
-				}
-			}
-			// Letzten auch prüfen
-			if len(smoothed) > 1 {
-				last := smoothed[len(smoothed)-1]
-				if last.end-last.start < 1.5 {
-					smoothed[len(smoothed)-2].end = last.end
-					smoothed = smoothed[:len(smoothed)-1]
-				}
-			}
-			merged = smoothed
-		}
+		// KEIN Smoothing. Span-Grenzen kommen von pyannote (authorativ).
+		// Der intelligent_segment_corrector verschiebt Grenzen an Satzgrenzen —
+		// das ist besser als zeitbasiertes Smoothing das Speaker eliminiert.
 
 		// Mehrere Speaker-Spans → Text per Word-Timestamps zuordnen
 		words := strings.Fields(frag.Text)
