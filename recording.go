@@ -776,12 +776,18 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	// 0c. Auf laufende async Word-Timestamp-Fetches warten.
-	//     Ohne diesen Wait fehlen Word-Timestamps für Fragmente deren DTW-Goroutine
-	//     noch nicht fertig ist (z.B. Fragment 2 bei 4 Fragmenten).
-	log.Printf("recording: session/end: warte auf async word-timestamps...")
-	session.wordWg.Wait()
-	log.Printf("recording: session/end: alle word-timestamps da")
+	// 0c. Auf laufende async Word-Timestamp-Fetches warten (max 30s).
+	//     Ohne Wait fehlen Word-Timestamps, aber besser Ergebnis ohne Words
+	//     als endlos blockieren (DTW auf GB10 kann 277s/Fragment dauern).
+	log.Printf("recording: session/end: warte auf async word-timestamps (max 30s)...")
+	wordsDone := make(chan struct{})
+	go func() { session.wordWg.Wait(); close(wordsDone) }()
+	select {
+	case <-wordsDone:
+		log.Printf("recording: session/end: alle word-timestamps da")
+	case <-time.After(30 * time.Second):
+		log.Printf("recording: session/end: word-timestamp timeout (30s), weiter ohne fehlende Words")
+	}
 
 	// 1. Finales Diarize-Window: Falls das Rolling-Window nie gefeuert hat
 	//    (Aufnahme kürzer als live_window_sec), einmalig auf dem gesamten Audio laufen.
@@ -2142,6 +2148,31 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 		}
 		if len(merged) == 0 {
 			merged = []span{{frag.Start, frag.End, frag.Speaker}}
+		}
+
+		// Kurze Spans (< 1.5s) glätten: in den längeren Nachbar-Span aufnehmen.
+		// pyannote erzeugt bei Sprecherwechseln Mikro-Segmente (0.2-0.5s) die
+		// nach der Midpoint-Overlap-Auflösung als separate Spans übrigbleiben.
+		if len(merged) > 2 {
+			var smoothed []span
+			for _, sp := range merged {
+				dur := sp.end - sp.start
+				if dur < 1.5 && len(smoothed) > 0 {
+					// Zu kurz → in vorherigen aufnehmen
+					smoothed[len(smoothed)-1].end = sp.end
+				} else {
+					smoothed = append(smoothed, sp)
+				}
+			}
+			// Letzten auch prüfen
+			if len(smoothed) > 1 {
+				last := smoothed[len(smoothed)-1]
+				if last.end-last.start < 1.5 {
+					smoothed[len(smoothed)-2].end = last.end
+					smoothed = smoothed[:len(smoothed)-1]
+				}
+			}
+			merged = smoothed
 		}
 
 		// Mehrere Speaker-Spans → Text per Word-Timestamps zuordnen
