@@ -2275,30 +2275,51 @@ func correctSegmentBoundaries(words []string, wordSpeakers []string) []string {
 			continue
 		}
 		// Speaker-Wechsel bei wi. Prüfe ob der Split an einer Satzgrenze liegt.
-		prevWord := words[wi-1]
-		if endsWithSentence(prevWord) {
+		if endsWithSentence(words[wi-1]) {
 			continue // Split nach Satzende — passt
 		}
 
 		prevSpeaker := result[wi-1]
 
-		// Nur vorwärts suchen: nächstes Satzende nach dem Split (max 2 Wörter).
-		// Diese Wörter zum vorherigen Speaker schieben (Satz vervollständigen).
-		// NICHT rückwärts suchen — das würde Speaker-Segmente vor dem Split
-		// eliminieren und ist zu aggressiv.
-		for j := wi; j < len(words) && j <= wi+2; j++ {
+		// Vorwärts suchen: Satzende oder Satzanfang finden (max 12 Wörter).
+		// Strategie: den Satz des vorherigen Speakers vervollständigen.
+		//
+		// Zwei Signale:
+		// 1. Satzende-Interpunktion (. ? ! ;) → alles bis dahin zum vorherigen Speaker
+		// 2. Satzanfang (Großbuchstabe nach Satzende) → Split hierhin verschieben
+		bestSplit := -1
+		for j := wi; j < len(words) && j < wi+12; j++ {
 			if endsWithSentence(words[j]) {
-				// Prüfe: würden wir damit einen anderen Speaker komplett eliminieren?
-				// Nur verschieben wenn der nächste Speaker nach dem Satzende
-				// ein ANDERER ist (also der Satz wirklich zum vorherigen gehört).
-				if j+1 < len(words) && result[j+1] != prevSpeaker {
-					for k := wi; k <= j; k++ {
-						result[k] = prevSpeaker
-					}
-					log.Printf("recording: segment-corrector: shifted %d words (%s..%s) to %s (sentence completion)",
-						j-wi+1, words[wi], words[j], prevSpeaker)
-				}
+				// Satzende gefunden → alles bis hier zum vorherigen Speaker
+				bestSplit = j
 				break
+			}
+			// Prüfe ob dieses Wort ein Satzanfang ist (Großbuchstabe)
+			// und das vorherige Wort ein Satzende hat
+			if j > wi && endsWithSentence(words[j-1]) {
+				// Split VOR diesem Wort (das vorherige hat Satzende)
+				bestSplit = j - 1
+				break
+			}
+		}
+
+		if bestSplit >= wi {
+			// Prüfe: nach dem Satzende muss noch ein anderer Speaker kommen
+			// (sonst würden wir den gesamten Rest zum vorherigen Speaker schieben)
+			hasOtherAfter := false
+			for j := bestSplit + 1; j < len(words) && j <= bestSplit+3; j++ {
+				if result[j] != prevSpeaker {
+					hasOtherAfter = true
+					break
+				}
+			}
+			if hasOtherAfter || bestSplit == len(words)-1 {
+				shifted := bestSplit - wi + 1
+				for k := wi; k <= bestSplit; k++ {
+					result[k] = prevSpeaker
+				}
+				log.Printf("recording: segment-corrector: shifted %d words (%s..%s) to %s (sentence completion)",
+					shifted, words[wi], words[bestSplit], prevSpeaker)
 			}
 		}
 	}
