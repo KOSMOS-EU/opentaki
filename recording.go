@@ -1747,23 +1747,40 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 		return ref, true
 	}
 
-	// 2. Global Profile Match (cross-session, NICHT session-intern)
+	// 2. Global Profile Match — aber NUR gegen Profile die VOR dieser Session
+	//    existierten. Profile die im selben Window/Session angelegt wurden,
+	//    dürfen nicht matchen (pyannote hat sie bewusst getrennt).
+	//    → Prüfe ob die gematchte Person schon in liveSpeakerMap ist (= diese Session).
 	match := s.matchSpeaker(emb)
 	s.speakerMu.Lock()
 	var ref SpeakerRef
-	if match.Matched {
+
+	// Ist die gematchte Person bereits in dieser Session als anderes Label vergeben?
+	matchedIsSessionLocal := false
+	if match.Matched || match.Score >= 0.55 {
+		for _, existingRef := range session.liveSpeakerMap {
+			if existingRef.PersonID == match.Person.ID {
+				matchedIsSessionLocal = true
+				break
+			}
+		}
+	}
+
+	if match.Matched && !matchedIsSessionLocal {
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
 		log.Printf("recording: live-diarize: label %s → %q (match=%.2f)", label, match.Person.Name, match.Score)
-	} else if match.Score >= 0.55 && strings.HasPrefix(match.Person.Name, "SPEAKER_") {
-		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
-		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
-		log.Printf("recording: live-diarize: label %s → %q (unbekannt-zone=%.2f)", label, match.Person.Name, match.Score)
 	} else {
+		// Neue Person — entweder kein Match oder Match ist session-lokal
 		person := s.createGlobalSpeaker()
 		pid := s.addProfileForSession(person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
-		log.Printf("recording: live-diarize: label %s → neue Person %q (best=%.2f)", label, person.Name, match.Score)
+		if matchedIsSessionLocal {
+			log.Printf("recording: live-diarize: label %s → neue Person %q (match %.2f war session-lokal %q, getrennt gehalten)",
+				label, person.Name, match.Score, match.Person.Name)
+		} else {
+			log.Printf("recording: live-diarize: label %s → neue Person %q (best=%.2f)", label, person.Name, match.Score)
+		}
 	}
 	s.speakerMu.Unlock()
 
