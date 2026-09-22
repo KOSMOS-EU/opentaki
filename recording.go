@@ -850,6 +850,7 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 - Fehlende Satzzeichen (Punkte, Kommas, Frage-/Ausrufezeichen)
 - Grammatik und Rechtschreibung
 - Füllwörter (äh, ähm, also also)
+- Whisper-Halluzinationen: "Vielen Dank", "Thank you", "Untertitel von", "Danke fürs Zuschauen" — diese Floskeln am Ende von Abschnitten entfernen (Whisper erfindet sie bei Stille)
 
 WICHTIG:
 - Füge KEINE neuen Wörter, Sätze, Floskeln oder Formulierungen hinzu.
@@ -2694,7 +2695,7 @@ func (s *Server) whisperTranscribeWithWords(audioData []byte, fragStartSec float
 // trimSilence entfernt Stille (RMS < 0.008) von Anfang und Ende des Audio.
 // Whisper erfindet bei Stille/Rauschen Floskeln ("Vielen Dank", "Thank you").
 func trimSilence(samples []int16) []int16 {
-	const threshold = 0.008 // etwas unter der VAD-Schwelle (0.01)
+	const threshold = 0.012 // leicht über der alten Schwelle (0.008 war zu niedrig)
 	const frameSize = 320   // 20ms bei 16kHz
 
 	if len(samples) < frameSize*2 {
