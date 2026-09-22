@@ -2104,26 +2104,28 @@ func (s *Server) finalizeSessionSpeakers(session *RecordingSession) {
 			continue
 		}
 
-		// Sortieren + Overlaps auflösen (längeres Segment dominiert)
+		// Sortieren + Overlaps auflösen: bei verschiedenen Speakern wird am
+		// Midpoint des Overlaps geschnitten (beide Segmente behalten).
 		sort.Slice(spans, func(a, b int) bool { return spans[a].start < spans[b].start })
 		var resolved []span
 		for _, sp := range spans {
 			if len(resolved) > 0 && sp.start < resolved[len(resolved)-1].end {
 				last := &resolved[len(resolved)-1]
 				if sp.speaker == last.speaker {
+					// Gleicher Speaker → erweitern
 					if sp.end > last.end {
 						last.end = sp.end
 					}
 				} else {
-					if sp.end-sp.start > last.end-last.start {
-						last.end = sp.start
-						if last.end <= last.start {
-							resolved = resolved[:len(resolved)-1]
-						}
-						resolved = append(resolved, sp)
-					} else if sp.end > last.end {
-						resolved = append(resolved, span{last.end, sp.end, sp.speaker})
+					// Verschiedene Speaker → am Midpoint des Overlaps schneiden
+					overlapStart := sp.start
+					overlapEnd := math.Min(sp.end, last.end)
+					mid := (overlapStart + overlapEnd) / 2
+					last.end = mid
+					if last.end <= last.start {
+						resolved = resolved[:len(resolved)-1]
 					}
+					resolved = append(resolved, span{mid, sp.end, sp.speaker})
 				}
 			} else {
 				resolved = append(resolved, sp)
