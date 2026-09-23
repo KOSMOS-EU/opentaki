@@ -1579,22 +1579,33 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 		}
 	}
 
-	// Pro Label: Embedding → DB-Match oder neue Person.
-	// WICHTIG: pyannote-Labels (SPEAKER_00 etc.) sind nur innerhalb eines Calls gültig.
-	// Bei Fragment-Level-Diarization sind Labels über Fragmente NICHT stabil.
-	// Deshalb: Label mit Fragment-Index prefixen für session.liveSpeakerMap.
+	// Pro Label: IMMER neue Person + neues Profil anlegen.
+	// pyannote hat die Labels bewusst getrennt — wir respektieren das.
+	// Wiedererkennung passiert beim NÄCHSTEN Fragment/Session über die DB.
+	// Innerhalb eines pyannote-Calls: jedes Label = eigene Person.
 	labelRefs := make(map[string]SpeakerRef)
 	for _, label := range result.Speakers {
 		emb := result.SpeakerEmbeddings[label]
 		if len(emb) == 0 {
 			continue
 		}
-		// Scoped Label: "f1_SPEAKER_03" statt nur "SPEAKER_03"
 		scopedLabel := fmt.Sprintf("f%d_%s", fragmentIdx, label)
-		ref, ok := s.assignSpeakerProfile(session, scopedLabel, emb)
-		if ok {
+		// Identity-Check: dieses Label schon in der Session?
+		if ref, ok := session.liveSpeakerMap[scopedLabel]; ok {
 			labelRefs[label] = ref
+			continue
 		}
+		// Neue Person + neues Profil
+		s.speakerMu.Lock()
+		person := s.createSprecher()
+		pid := s.addProfileForSession(person.ID, emb, session.ID)
+		ref := SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
+		s.speakerMu.Unlock()
+		session.liveSpeakerMap[scopedLabel] = ref
+		session.liveSpeakerEmb[scopedLabel] = emb
+		labelRefs[label] = ref
+		log.Printf("recording: diarize-fragment %d: %s → %s (Profil %d)",
+			fragmentIdx, label, person.Name, pid)
 	}
 	log.Printf("recording: diarize-fragment %d: labelRefs=%v", fragmentIdx, labelRefs)
 
