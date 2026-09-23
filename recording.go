@@ -73,6 +73,7 @@ type RecordingSession struct {
 	lastSilence     int       // totalSamples bei letzter Stille (Audio-Zeit)
 	speechActive    bool      // aktuell in Sprechphase
 	silenceSinceSamples int   // totalSamples seit Stille beginnt (Audio-Zeit)
+	maxSilenceSamples  int   // längste Stille im aktuellen Fragment (Samples)
 	lastPartialSamples int    // totalSamples beim letzten Partial-Transcribe (Audio-Zeit)
 	fragIndex       int       // laufende Fragment-Nummer
 	prevTranscript  string    // Transkript bis letzte Sprechpause (Kontext)
@@ -1372,7 +1373,12 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		}
 		session.speechActive = false
 	} else {
+		// Sprache nach Stille → längste Stille im Fragment tracken
 		if session.silenceSinceSamples > 0 {
+			silDur := session.totalSamples - session.silenceSinceSamples
+			if silDur > session.maxSilenceSamples {
+				session.maxSilenceSamples = silDur
+			}
 			session.silenceSinceSamples = 0
 		}
 		session.speechActive = true
@@ -1381,6 +1387,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 			session.fragStartSamples = session.totalSamples
 			session.fragIndex++
 			session.lastPartialSamples = 0
+			session.maxSilenceSamples = 0
 		}
 		session.fragAudio = append(session.fragAudio, audioData...)
 	}
@@ -1395,7 +1402,9 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	fragCompleteByDuration := false
 	if session.fragAudio != nil && fragEndSamples-session.fragStartSamples >= maxFragmentSamples {
 		fragCompleteByDuration = true
-		log.Printf("recording: HARD-CUT bei %ds (keine Stille gefunden)", maxFragmentSec)
+		maxSilMs := session.maxSilenceSamples * 1000 / 16000
+		log.Printf("recording: HARD-CUT bei %ds (längste Stille im Fragment: %dms, soft_silence: %dms)",
+			maxFragmentSec, maxSilMs, softSilenceMs)
 	}
 
 	var partialText string
