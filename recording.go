@@ -828,10 +828,10 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 		session.mu.Unlock()
 	}
 
-	// 2. Speaker-Finalisierung: Fragment-Segmente nutzen.
-	if len(session.Fragments) > 0 {
-		s.finalizeSessionSpeakers(session)
-	}
+	// 2. Speaker-Profile in DB speichern (aus diarizeFragment).
+	//    Segmente sind schon direkt in den Fragmenten (von diarizeFragment).
+	//    Kein finalizeSessionSpeakers mehr — das hat Segmente/Speaker eliminiert.
+	s.saveSessionProfiles(session)
 
 	// 2. Komplettes Transkript zusammenstellen (aus Utterances, nicht Fragments,
 	//    damit zusammenhängende Rede einer Person als eine Zeile erscheint)
@@ -1550,61 +1550,109 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 	}
 	log.Printf("recording: diarize-fragment %d: labelRefs=%v", fragmentIdx, labelRefs)
 
-	// Rohe Segmente mit stabilen Speaker-Namen speichern (absolute Session-Zeit)
+	// Segmente direkt ins Fragment schreiben — KEIN Umweg über liveSegments/finalizeSessionSpeakers.
+	// pyannote's Segmente sind authorativ. Kein Post-Processing das Speaker eliminiert.
+	var frag *RecordingFrag
+	for i := range session.Fragments {
+		if session.Fragments[i].Index == fragmentIdx {
+			frag = &session.Fragments[i]
+			break
+		}
+	}
+	if frag == nil {
+		session.mu.Unlock()
+		return
+	}
+
+	// pyannote-Segmente auf absolute Session-Zeit umrechnen + Speaker-Namen zuordnen
+	var segments []FragSpeakerSeg
 	for _, seg := range result.Segments {
 		speakerName := "unknown"
 		if ref, ok := labelRefs[seg.Speaker]; ok {
 			speakerName = ref.String()
 		}
-		session.liveSegments = append(session.liveSegments, FragSpeakerSeg{
+		segments = append(segments, FragSpeakerSeg{
 			Speaker: speakerName,
 			Start:   round2(fragStart + seg.Start),
 			End:     round2(fragStart + seg.End),
 		})
 	}
 
-	// Dominanter Speaker für das Fragment (Midpoint)
-	mid := fragStart + 15 // Mitte eines ~30s Fragments
-	for _, frag := range session.Fragments {
-		if frag.Index == fragmentIdx {
-			mid = (frag.Start + frag.End) / 2
-			break
+	// Text auf Segmente verteilen per Word-Timestamps (wenn vorhanden)
+	words := strings.Fields(frag.Text)
+	if len(words) > 0 && len(segments) > 0 {
+		// Wort-zu-Zeit-Zuordnung
+		type wordWithTime struct {
+			word    string
+			absTime float64
 		}
-	}
-	bestDur := 0.0
-	bestSpeaker := ""
-	for _, seg := range result.Segments {
-		absMid := mid - fragStart // relativ zum Fragment
-		if absMid >= seg.Start && absMid < seg.End {
-			dur := seg.End - seg.Start
-			if dur > bestDur {
-				bestDur = dur
-				if ref, ok := labelRefs[seg.Speaker]; ok {
-					bestSpeaker = ref.String()
+		wordsWT := make([]wordWithTime, len(words))
+		if len(frag.Words) >= len(words) {
+			for wi := range words {
+				wordsWT[wi] = wordWithTime{words[wi], frag.Words[wi].Start}
+			}
+		} else {
+			for wi := range words {
+				wordsWT[wi] = wordWithTime{words[wi], frag.Start + float64(wi)/float64(len(words))*frag.Duration}
+			}
+		}
+
+		// Pro Wort: Speaker aus dem nächsten pyannote-Segment bestimmen
+		wordSpeakers := make([]string, len(words))
+		for wi := range wordsWT {
+			absTime := wordsWT[wi].absTime
+			wordSpeakers[wi] = segments[0].Speaker // Fallback
+			for _, seg := range segments {
+				if absTime >= seg.Start && absTime < seg.End {
+					wordSpeakers[wi] = seg.Speaker
+					break
 				}
 			}
 		}
-	}
-	if bestSpeaker == "" && len(labelRefs) > 0 {
-		// Fallback: erster Speaker
-		for _, ref := range labelRefs {
-			bestSpeaker = ref.String()
-			break
-		}
-	}
-	if bestSpeaker != "" {
-		session.liveSpeakerByFrag[fragmentIdx] = bestSpeaker
-		for i := range session.Fragments {
-			if session.Fragments[i].Index == fragmentIdx {
-				session.Fragments[i].Speaker = bestSpeaker
-				break
+
+		// Intelligent Segment Corrector: Satzgrenzen
+		wordSpeakers = correctSegmentBoundaries(words, wordSpeakers)
+
+		// Kontiguierte Wortgruppen → finale Segmente mit Text
+		var finalSegs []FragSpeakerSeg
+		segStart := 0
+		for wi := 1; wi <= len(words); wi++ {
+			if wi < len(words) && wordSpeakers[wi] == wordSpeakers[segStart] {
+				continue
 			}
+			segText := strings.Join(words[segStart:wi], " ")
+			absStart := wordsWT[segStart].absTime
+			absEnd := frag.End
+			if wi < len(words) {
+				absEnd = wordsWT[wi].absTime
+			}
+			finalSegs = append(finalSegs, FragSpeakerSeg{
+				Speaker: wordSpeakers[segStart],
+				Start:   round2(absStart),
+				End:     round2(absEnd),
+				Text:    segText,
+			})
+			segStart = wi
+		}
+		frag.Segments = finalSegs
+	} else {
+		frag.Segments = segments
+	}
+
+	// Dominanter Speaker = längstes Segment
+	maxDur := 0.0
+	for _, seg := range frag.Segments {
+		d := seg.End - seg.Start
+		if d > maxDur {
+			maxDur = d
+			frag.Speaker = seg.Speaker
 		}
 	}
+
 	session.mu.Unlock()
 
-	log.Printf("recording: diarize-fragment %d: %d Speaker, dominant=%s",
-		fragmentIdx, len(labelRefs), bestSpeaker)
+	log.Printf("recording: diarize-fragment %d: %d Segmente, %d Speaker, dominant=%s",
+		fragmentIdx, len(frag.Segments), len(labelRefs), frag.Speaker)
 }
 
 // diarizeWindowFinal führt ein einmaliges Diarize-Window auf dem gesamten Audio durch.
@@ -2085,7 +2133,38 @@ func (session *RecordingSession) applyLlmSplit(fragIdx int, wordCount int, nextS
 	}
 }
 
-// finalizeSessionSpeakers nutzt die Live-Window-Diarization-Ergebnisse
+// saveSessionProfiles speichert die Speaker-Embeddings aus der Session in die DB.
+// Segmente sind schon direkt in den Fragmenten (von diarizeFragment).
+func (s *Server) saveSessionProfiles(session *RecordingSession) {
+	session.mu.Lock()
+	liveEmb := make(map[string][]float64)
+	liveSpeakers := make(map[string]SpeakerRef)
+	for k, v := range session.liveSpeakerEmb {
+		liveEmb[k] = v
+	}
+	for k, v := range session.liveSpeakerMap {
+		liveSpeakers[k] = v
+	}
+	session.mu.Unlock()
+
+	saved := 0
+	for label, emb := range liveEmb {
+		ref, ok := liveSpeakers[label]
+		if !ok || ref.PersonID <= 0 || len(emb) == 0 {
+			continue
+		}
+		s.speakerMu.Lock()
+		s.addProfileForSession(ref.PersonID, emb, session.ID)
+		s.speakerMu.Unlock()
+		saved++
+	}
+	log.Printf("recording: saveSessionProfiles: %d Profile gespeichert", saved)
+}
+
+// finalizeSessionSpeakers — VERALTET, nicht mehr aufrufen.
+// War die Ursache für Speaker-Eliminierung durch Overlap-Auflösung/Merge.
+// Segmente werden jetzt direkt in diarizeFragment geschrieben.
+// Bleibt als toter Code bis bestätigt ist dass alles funktioniert.
 // (statt eines erneuten pyannote-Calls auf dem Gesamtaudio).
 // Live-Window hat feinere Segmentierung (60s-Fenster, min_speakers)
 // als ein einzelner Call auf dem Gesamtaudio.
