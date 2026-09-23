@@ -1531,22 +1531,24 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 		}
 	}
 
-	// Pro Label: alignWindowLabel (Embedding → DB-Match oder neue Person)
+	// Pro Label: Embedding → DB-Match oder neue Person.
+	// WICHTIG: pyannote-Labels (SPEAKER_00 etc.) sind nur innerhalb eines Calls gültig.
+	// Bei Fragment-Level-Diarization sind Labels über Fragmente NICHT stabil.
+	// Deshalb: Label mit Fragment-Index prefixen für session.liveSpeakerMap.
 	labelRefs := make(map[string]SpeakerRef)
 	for _, label := range result.Speakers {
 		emb := result.SpeakerEmbeddings[label]
 		if len(emb) == 0 {
 			continue
 		}
-		if _, ok := session.liveSpeakerMap[label]; ok {
-			labelRefs[label] = session.liveSpeakerMap[label]
-			continue
-		}
-		ref, ok := s.alignWindowLabel(session, label, emb)
+		// Scoped Label: "f1_SPEAKER_03" statt nur "SPEAKER_03"
+		scopedLabel := fmt.Sprintf("f%d_%s", fragmentIdx, label)
+		ref, ok := s.alignWindowLabel(session, scopedLabel, emb)
 		if ok {
 			labelRefs[label] = ref
 		}
 	}
+	log.Printf("recording: diarize-fragment %d: labelRefs=%v", fragmentIdx, labelRefs)
 
 	// Rohe Segmente mit stabilen Speaker-Namen speichern (absolute Session-Zeit)
 	for _, seg := range result.Segments {
