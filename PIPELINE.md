@@ -1,139 +1,128 @@
-# Recording Pipeline — Begriffe, Funktionen, Befunde
-
-Stand: 2026-09-23
+# Recording Pipeline
 
 ## Begriffe
 
-| Begriff | Definition | Code |
-|---------|-----------|------|
-| **Chunk** | 2s Audio-Paket vom Browser | `handleRecordingChunk` |
-| **Fragment** | VAD-Einheit: Audio gesammelt bis **Sprechpause** (≥800ms Stille) oder Max-Dauer (30s Fallback). Typisch 5-30s, je nach Sprechverhalten. Ein Whisper-Call pro Fragment. | `session.fragAudio`, `addFragment` |
-| **Fragment-Final** | Fragment fertig transkribiert + Word-Timestamps vorhanden. Bereit für Diarization. | nach `whisperTranscribeBytes` + `whisperTranscribeWithWords` |
-| **Segment** | Speaker-homogener Abschnitt innerhalb eines Fragments. Bestimmt durch pyannote + Word-Timestamps. | `FragSpeakerSeg` |
-| **Utterance** | Zusammenhängende Rede einer Person über Fragment-Grenzen. Lesesicht für UI. | `Utterance`, `buildUtterances` |
-| **Speaker-Profil** | Ein Embedding (256-dim) in der DB, gehört zu einer Person. Mehrere Profile pro Person möglich. | `profiles` Tabelle |
-| **Person** | Benannter oder automatischer Sprecher (SPEAKER_XX). Hat 1..N Profile. | `persons` Tabelle |
-| **Session** | Eine Aufnahme-Sitzung. Start bis Stop. | `RecordingSession` |
+| Begriff | Definition |
+|---------|-----------|
+| **Chunk** | 2s Audio-Paket vom Browser |
+| **Fragment** | Audio bis Sprechpause (≥800ms) oder Soft-/Hard-Limit. Ein Whisper-Call. |
+| **Segment** | Speaker-homogener Abschnitt innerhalb eines Fragments. Von pyannote. |
+| **Utterance** | Zusammenhängende Rede einer Person über Fragment-Grenzen. Lesesicht. |
+| **Profil** | Ein Embedding (256-dim) in der DB. Eine Beobachtung einer Stimme. |
+| **Person** | Gruppierung von Profilen. Auto-Name "Sprecher_N", manuell änderbar. |
 
-## Funktionen (was sie tun, nicht was sie heißen sollten)
-
-### Im Code
-
-| Funktion | Was sie tut | Wann | Status |
-|----------|------------|------|--------|
-| `processAudioChunk` | VAD: sammelt Audio, erkennt Stille/Max-Dauer, entscheidet Fragment-Ende | Pro 2s-Chunk | AKTIV |
-| `whisperTranscribeBytes` | Schnelle Transkription: Audio → Text (kein DTW) | Fragment-Final | AKTIV |
-| `whisperTranscribeWithWords` | Langsame Transkription: Audio → Text + Word-Timestamps (DTW) | Fragment-Final, async | AKTIV |
-| `diarizeWindowLive` | Rolling-Window-Diarization: pyannote auf 60s-Fenster von totalAudio | Nach Fragment-Final wenn >=60s seit letztem Window | **DEAKTIVIEREN** |
-| `diarizeWindowFinal` | ~~pyannote auf Gesamtaudio~~ | | **DEAKTIVIERT** — schlechtere Ergebnisse als Fragment-Level |
-| `diarizeFragment` | pyannote pro fertigem Fragment (5-45s Audio) | Nach Fragment-Final | AKTIV — Kern der Diarization |
-| `diarizeAudioBytes` | Low-Level: sendet Audio an openannote, gibt Segmente+Embeddings zurück | Von diarizeWindowLive/Final aufgerufen | AKTIV |
-| `alignWindowLabel` | Mappt pyannote-Label auf stabile Person (DB-Match oder neu anlegen) | Pro Label in jedem diarize-Call | AKTIV |
-| `finalizeSessionSpeakers` | ~~Baute Multi-Segmente aus liveSegments~~ | Session-End | **ENTFERNT** — hat Speaker eliminiert. Segmente werden jetzt direkt in `diarizeFragment` geschrieben. |
-| `saveSessionProfiles` | Speichert Speaker-Embeddings in DB | Session-End | AKTIV (ersetzt finalizeSessionSpeakers) |
-| `correctSegmentBoundaries` | Verschiebt Speaker-Grenzen an Satzgrenzen (Interpunktion) | In diarizeFragment | AKTIV |
-| `assignSpeakerProfile` | ~~Embedding → DB-Match oder neue Person~~ | | **ENTFERNT** — innerhalb eines pyannote-Calls darf nicht gegen DB gematcht werden. Jedes Embedding = neue Person. |
-| `buildUtterances` | Gruppiert aufeinanderfolgende Segmente desselben Speakers | Session-End | AKTIV |
-| `flushPendingFragment` | Transkribiert offenes fragAudio bei Session-End | Session-End | AKTIV |
-
-### Namens-Probleme
-
-| Aktueller Name | Problem | Besserer Name |
-|---------------|---------|---------------|
-| `diarizeWindowLive` | Ist kein "Live" — feuert erst nach 60s, Labels instabil über Windows | `diarizeRollingWindow` (und deaktivieren) |
-| `diarizeWindowFinal` | Heißt "Final" aber ist eigentlich "auf Gesamtaudio". Nicht besser als Rolling-Window, nur einmalig. | `diarizeFullAudio` |
-| `finalizeSessionSpeakers` | Macht viel mehr als "finalize": Multi-Segment-Zuordnung, Word-TS-Matching, Corrector | `buildFragmentSegments` |
-| `alignWindowLabel` | Ist nicht Window-spezifisch, allgemeines Label-zu-Person-Mapping | `mapLabelToPerson` |
-| `liveSegments` | Nicht "live" — werden bei Session-End aus diarizeWindowFinal gefüllt | `diarizeSegments` |
-| `liveSpeakerByFrag` | Nicht "live" — Midpoint-Zuordnung, oft falsch | ggf. entfernen |
-| `liveSpeakerMap` | Nicht "live" — Label→Person Mapping | `labelToPersonMap` |
-
-## Befunde aus Tests (21.-22.09.)
-
-### Was funktioniert
-
-1. **pyannote auf einzelnem Audio-Stück** erkennt Speaker korrekt
-   - Direkter Test: 60s Audio, min_speakers=5 → 4 Speaker, korrekte Segmente
-   - Die Segment-Grenzen sind brauchbar (±200ms)
-
-2. **Word-Timestamps (DTW)** verbessern Speaker-Grenzen massiv
-   - 10.6s präziser als i/N-Schätzung
-   - RTX Blackwell: ~10-15s pro Fragment (akzeptabel)
-
-3. **correctSegmentBoundaries** korrigiert Satzgrenzen
-   - "Kommt das Test schon an?" wird korrekt dem richtigen Speaker zugeordnet
-   - Vorwärts-Suche bis 12 Wörter für Satzende
-
-4. **Fragment-Flush** löst das frags=0-Problem bei kurzen Aufnahmen
-
-5. **Utterances** gruppieren korrekt über Fragment-Grenzen
-
-### Was NICHT funktioniert
-
-1. **Rolling-Window (diarizeWindowLive)**
-   - pyannote clustert in jedem Window neu → Labels instabil
-   - SPEAKER_01 in Window 1 ≠ SPEAKER_01 in Window 2
-   - alignWindowLabel-Alignment über Windows ist fragil
-   - **Ursache der Inkonsistenz**: 65s-Test → 3 Speaker, 256s-Test → 4+ Speaker im selben Bereich
-
-2. **diarizeWindowFinal auf Gesamtaudio**
-   - Erkennt WENIGER Speaker als pyannote auf Einzel-Fragmenten
-   - 60s Audio: 4 Speaker. 256s Audio: 3 Speaker (pyannote konsolidiert)
-   - Überschreibt die besseren Einzel-Ergebnisse
-
-3. **Session-End überschreibt Fragment-Ergebnisse**
-   - Fragmente die einzeln korrekt diarisiert waren, werden bei Session-End
-     durch schlechtere Gesamtaudio-Ergebnisse ersetzt
-
-### Schlussfolgerung
-
-**Fragment-Level-Diarization** ist der richtige Ansatz:
-- pyannote pro **fertigem Fragment** (30s Audio) aufrufen
-- Word-Timestamps für präzise Grenzen innerhalb des Fragments
-- Corrector für Satzgrenzen
-- Speaker-Profile per Embedding in DB → Cross-Fragment-Zuordnung
-- Kein Rolling-Window, kein Gesamtaudio-Call
-
-Das entspricht dem Prinzip: **jedes Fragment ist eine eigenständige Einheit**.
-Speaker-Zuordnung über Fragmente hinweg passiert über die Profile-DB,
-nicht über einen zweiten pyannote-Call.
-
-## Empfohlene Pipeline (Soll)
+## Fragmentierung (VAD)
 
 ```
-1. Chunk empfangen → VAD → Fragment-Buffer
-2. Fragment-Final:
-   a) whisperTranscribeBytes → Text (schnell, SSE)
-   b) async whisperTranscribeWithWords → Word-Timestamps (DTW)
-   c) diarizeFragment: pyannote auf DIESEM Fragment (30s)
-      → Segmente + Embeddings
-      → mapLabelToPerson: Embedding gegen DB matchen
-      → Word-Timestamps für Wort-zu-Speaker-Zuordnung
-      → correctSegmentBoundaries
-      → Segmente + Speaker sofort verfügbar
-      → SSE-Events für UI-Update
-3. Session-End:
-   a) flushPendingFragment
-   b) wordWg.Wait (max 30s)
-   c) buildUtterances (aus Fragment-Segmenten)
-   d) LLM-Finalpass
-   e) WebDAV-Upload
+0 - soft_limit (15s):  normale Stille-Erkennung (800ms, RMS < silence_thresh)
+soft_limit - hard_limit:  kürzere Pausen reichen (soft_silence_ms, RMS < silence_thresh)
+hard_limit (60s):  harter Schnitt (Log: längste Stille + min RMS im Fragment)
 ```
 
-Kein Rolling-Window. Kein Gesamtaudio-Diarize.
-Jedes Fragment wird einzeln diarisiert. Speaker-Konsistenz über die DB.
+Alle Werte per Config einstellbar.
 
-## Profil-Zuordnung (Kernregel)
+## Pipeline pro Fragment
 
-**Innerhalb eines pyannote-Calls**: Jedes Embedding = neue Person + neues Profil.
-pyannote hat die Labels bewusst getrennt. Kein Matching gegen DB, kein Merging.
-pyannote-Labels (SPEAKER_XX) werden verworfen — nur Embeddings zählen.
+```
+1. CHUNK-EMPFANG
+   Browser sendet 2s-Chunks
+   → PCM-Decode → RMS → VAD → Fragment-Buffer
+   → wenn Fragment fertig: weiter zu 2
 
-**Über Fragmente/Sessions hinweg**: Matching gegen bestehende Profile (Cosine > speaker_match).
-Wenn ein Profil aus Fragment 2 ähnlich genug zu einem Profil aus Fragment 1 ist,
-wird dieselbe Person wiederverwendet. Schwelle: `speaker_match` (Config, Default 0.65).
+2. TRANSKRIPTION
+   a) whisperFast(fragAudio) → Text
+      Schnell, nur Text, für sofortige SSE-Antwort an Browser
+   b) SSE: partial/final/done Events an Browser
 
-**Manuell**: Personen können in der UI zusammengeführt oder umbenannt werden.
+3. WORD-TIMESTAMPS (async)
+   whisperDTW(fragAudio) → Word-Timestamps
+   Langsam (~10s auf RTX), läuft parallel im Hintergrund
+   Ergebnis: [{word, start, end}, ...] pro Fragment
 
-Format: `Sprecher_<PersonID>/<ProfilID>` — z.B. `Sprecher_0/1`.
-Wenn `SPEAKER_` in der Ausgabe auftaucht → Bug (pyannote-Label durchgeleckt).
+4. DIARIZATION
+   pyannote(fragAudio, min_speakers) → Segmente + Embeddings
+   Pro Embedding:
+     → neues Profil anlegen (immer)
+     → neue Person anlegen (immer, innerhalb eines pyannote-Calls)
+   pyannote-Labels (SPEAKER_XX) werden verworfen. Nur Embeddings zählen.
+
+5. SEGMENTIERUNG
+   Wenn Word-Timestamps vorhanden (3 fertig):
+     → Wort-zu-Speaker-Zuordnung per echte Zeitstempel
+   Sonst:
+     → Fallback: proportional i/N
+   → correctSegmentBoundaries (Satzgrenzen-Korrektur)
+   → Segmente ins Fragment schreiben
+   → SSE: speaker Event an Browser
+```
+
+Schritte 2-5 passieren pro fertigem Fragment. Der Browser bekommt sofort
+nach Schritt 2 den Text, nach Schritt 5 die Speaker-Zuordnung.
+
+## Pipeline Session-End
+
+```
+6. FLUSH
+   Offenes fragAudio transkribieren (für Aufnahmen ohne finale Sprechpause)
+   → gleiche Schritte 2-5 wie oben
+
+7. UNZUGEORDNETE FRAGMENTE
+   Fragmente ohne Speaker (z.B. Flush-Fragment):
+   → Schritte 4-5 nachholen
+
+8. UTTERANCES
+   Alle Segmente aller Fragmente flach sammeln
+   → aufeinanderfolgende gleichen Speakers gruppieren (Pause > 2s = neue Utterance)
+
+9. TRANSKRIPT
+   Text aus Utterances bauen (Speaker-zusammenhängend)
+
+10. LLM-FINALPASS (optional, per Config)
+    Textpolitur: Tippfehler, Satzzeichen, Füllwörter, Whisper-Halluzinationen
+
+11. UPLOAD
+    .trs JSON (fragments + utterances + transcript) + aufnahme.wav per WebDAV
+```
+
+## Profil-Zuordnung
+
+**Innerhalb eines pyannote-Calls**:
+- Jedes Embedding = neue Person + neues Profil
+- Kein DB-Matching
+- pyannote hat getrennt → bleibt getrennt
+
+**Über Fragmente/Sessions hinweg** (TODO):
+- Matching gegen bestehende Profile (Cosine > speaker_match)
+- Passiert NICHT innerhalb desselben pyannote-Calls
+- Passiert beim nächsten Fragment oder bei einer späteren Session
+
+**Manuell**:
+- Personen umbenennen ("Sprecher_0" → "Klaus Witt")
+- Personen zusammenführen (zwei Profile → eine Person)
+
+**Format**: `Sprecher_<PersonID>/<ProfilID>`
+Wenn `SPEAKER_` in der Ausgabe → Bug.
+
+## Config
+
+```yaml
+recording:
+  # Fragmentierung
+  silence_thresh: 0.03        # RMS-Schwelle für Stille
+  silence_timeout_ms: 800     # Stille-Dauer für Fragment-Ende
+  soft_limit_sec: 15          # Ab hier kürzere Pausen akzeptieren
+  soft_silence_ms: 200        # Pausen-Threshold ab Soft-Limit
+  max_fragment_sec: 60        # Hard-Cut (Notfall)
+
+  # Diarization
+  diarize_api_base: "..."     # openannote URL (via microllm)
+  diarize_model: "pyannote/speaker-diarization-3.1"
+  min_speakers: 5             # Hint an pyannote
+
+  # Speaker-DB
+  speaker_store: "/data/..."  # SQLite-Pfad
+  speaker_match: 0.65         # Cosine-Threshold für Wiedererkennung
+
+  # Optional
+  llm_finalpass: true         # LLM-Textpolitur ein/aus
+```
