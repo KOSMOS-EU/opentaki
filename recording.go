@@ -1856,28 +1856,34 @@ func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb [
 	s.speakerMu.Lock()
 	var ref SpeakerRef
 
-	// Ist die gematchte Person bereits in dieser Session als anderes Label vergeben?
-	matchedIsSessionLocal := false
-	if match.Matched || match.Score >= 0.55 {
-		for _, existingRef := range session.liveSpeakerMap {
-			if existingRef.PersonID == match.Person.ID {
-				matchedIsSessionLocal = true
+	// Ist die gematchte Person bereits im SELBEN FRAGMENT als anderes Label vergeben?
+	// (Nicht session-weit: Cross-Fragment-Matching ist gewünscht!)
+	// Fragment-Scope wird im Label-Prefix codiert: "f1_SPEAKER_03"
+	matchedIsFragmentLocal := false
+	labelPrefix := ""
+	if idx := strings.Index(label, "_SPEAKER_"); idx > 0 {
+		labelPrefix = label[:idx+1] // "f1_"
+	}
+	if labelPrefix != "" && (match.Matched || match.Score >= 0.55) {
+		for existingLabel, existingRef := range session.liveSpeakerMap {
+			if strings.HasPrefix(existingLabel, labelPrefix) && existingRef.PersonID == match.Person.ID {
+				matchedIsFragmentLocal = true
 				break
 			}
 		}
 	}
 
-	if match.Matched && !matchedIsSessionLocal {
+	if match.Matched && !matchedIsFragmentLocal {
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
 		log.Printf("recording: live-diarize: label %s → %q (match=%.2f)", label, match.Person.Name, match.Score)
 	} else {
-		// Neue Person — entweder kein Match oder Match ist session-lokal
+		// Neue Person — entweder kein Match oder Match ist fragment-lokal
 		person := s.createGlobalSpeaker()
 		pid := s.addProfileForSession(person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
-		if matchedIsSessionLocal {
-			log.Printf("recording: live-diarize: label %s → neue Person %q (match %.2f war session-lokal %q, getrennt gehalten)",
+		if matchedIsFragmentLocal {
+			log.Printf("recording: live-diarize: label %s → neue Person %q (match %.2f war fragment-lokal %q, getrennt gehalten)",
 				label, person.Name, match.Score, match.Person.Name)
 		} else {
 			log.Printf("recording: live-diarize: label %s → neue Person %q (best=%.2f)", label, person.Name, match.Score)
