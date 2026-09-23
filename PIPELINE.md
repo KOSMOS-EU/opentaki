@@ -31,7 +31,8 @@ Stand: 2026-09-23
 | `alignWindowLabel` | Mappt pyannote-Label auf stabile Person (DB-Match oder neu anlegen) | Pro Label in jedem diarize-Call | AKTIV |
 | `finalizeSessionSpeakers` | ~~Baute Multi-Segmente aus liveSegments~~ | Session-End | **ENTFERNT** — hat Speaker eliminiert. Segmente werden jetzt direkt in `diarizeFragment` geschrieben. |
 | `saveSessionProfiles` | Speichert Speaker-Embeddings in DB | Session-End | AKTIV (ersetzt finalizeSessionSpeakers) |
-| `correctSegmentBoundaries` | Verschiebt Speaker-Grenzen an Satzgrenzen (Interpunktion) | In finalizeSessionSpeakers | AKTIV |
+| `correctSegmentBoundaries` | Verschiebt Speaker-Grenzen an Satzgrenzen (Interpunktion) | In diarizeFragment | AKTIV |
+| `assignSpeakerProfile` | ~~Embedding → DB-Match oder neue Person~~ | | **ENTFERNT** — innerhalb eines pyannote-Calls darf nicht gegen DB gematcht werden. Jedes Embedding = neue Person. |
 | `buildUtterances` | Gruppiert aufeinanderfolgende Segmente desselben Speakers | Session-End | AKTIV |
 | `flushPendingFragment` | Transkribiert offenes fragAudio bei Session-End | Session-End | AKTIV |
 
@@ -121,3 +122,18 @@ nicht über einen zweiten pyannote-Call.
 
 Kein Rolling-Window. Kein Gesamtaudio-Diarize.
 Jedes Fragment wird einzeln diarisiert. Speaker-Konsistenz über die DB.
+
+## Profil-Zuordnung (Kernregel)
+
+**Innerhalb eines pyannote-Calls**: Jedes Embedding = neue Person + neues Profil.
+pyannote hat die Labels bewusst getrennt. Kein Matching gegen DB, kein Merging.
+pyannote-Labels (SPEAKER_XX) werden verworfen — nur Embeddings zählen.
+
+**Über Fragmente/Sessions hinweg**: Matching gegen bestehende Profile (Cosine > speaker_match).
+Wenn ein Profil aus Fragment 2 ähnlich genug zu einem Profil aus Fragment 1 ist,
+wird dieselbe Person wiederverwendet. Schwelle: `speaker_match` (Config, Default 0.65).
+
+**Manuell**: Personen können in der UI zusammengeführt oder umbenannt werden.
+
+Format: `Sprecher_<PersonID>/<ProfilID>` — z.B. `Sprecher_0/1`.
+Wenn `SPEAKER_` in der Ausgabe auftaucht → Bug (pyannote-Label durchgeleckt).
