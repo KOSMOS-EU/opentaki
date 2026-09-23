@@ -156,9 +156,10 @@ type SpeakerRef struct {
 	ProfileID  int // 0 = nicht gesetzt (erstes Profil)
 }
 
-// String liefert das .trs-Format: "Klaus", "Klaus/2", "SPEAKER_00".
+// String liefert das .trs-Format: "Sprecher_0/1", "Klaus/3".
+// Immer Person/ProfilID — damit man sieht welches Profil gematcht hat.
 func (r SpeakerRef) String() string {
-	if r.ProfileID <= 1 {
+	if r.ProfileID <= 0 {
 		return r.PersonName
 	}
 	return fmt.Sprintf("%s/%d", r.PersonName, r.ProfileID)
