@@ -25,7 +25,8 @@ Stand: 2026-09-23
 | `whisperTranscribeBytes` | Schnelle Transkription: Audio → Text (kein DTW) | Fragment-Final | AKTIV |
 | `whisperTranscribeWithWords` | Langsame Transkription: Audio → Text + Word-Timestamps (DTW) | Fragment-Final, async | AKTIV |
 | `diarizeWindowLive` | Rolling-Window-Diarization: pyannote auf 60s-Fenster von totalAudio | Nach Fragment-Final wenn >=60s seit letztem Window | **DEAKTIVIEREN** |
-| `diarizeWindowFinal` | pyannote auf GESAMTEM totalAudio bei Session-End | Session-End, wenn unzugeordnete Fragmente | AKTIV, aber **problematisch** |
+| `diarizeWindowFinal` | ~~pyannote auf Gesamtaudio~~ | | **DEAKTIVIERT** — schlechtere Ergebnisse als Fragment-Level |
+| `diarizeFragment` | pyannote pro fertigem Fragment (5-45s Audio) | Nach Fragment-Final | AKTIV — Kern der Diarization |
 | `diarizeAudioBytes` | Low-Level: sendet Audio an openannote, gibt Segmente+Embeddings zurück | Von diarizeWindowLive/Final aufgerufen | AKTIV |
 | `alignWindowLabel` | Mappt pyannote-Label auf stabile Person (DB-Match oder neu anlegen) | Pro Label in jedem diarize-Call | AKTIV |
 | `finalizeSessionSpeakers` | ~~Baute Multi-Segmente aus liveSegments~~ | Session-End | **ENTFERNT** — hat Speaker eliminiert. Segmente werden jetzt direkt in `diarizeFragment` geschrieben. |
