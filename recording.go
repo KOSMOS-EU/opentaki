@@ -47,8 +47,10 @@ type RecordingConfig struct {
 	MaxChunkMB      int     `yaml:"max_chunk_mb"`       // max size per chunk (default 50)
 	SilenceThresh   float64 `yaml:"silence_thresh"`     // RMS below this = silence (default 0.01)
 	SilenceTimeout  int     `yaml:"silence_timeout_ms"` // ms of silence → fragment end (default 800)
+	SoftLimitSec    int     `yaml:"soft_limit_sec"`     // ab hier kürzere Pausen akzeptieren (default 15)
+	SoftSilenceMs   int     `yaml:"soft_silence_ms"`    // Pausen-Threshold ab Soft-Limit (default 200)
 	PartialInterval int     `yaml:"partial_interval_s"` // seconds between partial transcriptions (default 3)
-	MaxFragmentSec  int     `yaml:"max_fragment_sec"`   // max fragment duration (default 30)
+	MaxFragmentSec  int     `yaml:"max_fragment_sec"`   // Hard-Limit: max fragment duration (default 45)
 	LiveDiarize     bool    `yaml:"live_diarize"`       // Rolling-Window-Diarization (default false)
 	LiveWindowSec   int     `yaml:"live_window_sec"`    // Rolling-Window-Länge in Sekunden (default 60)
 	LiveOverlapSec  int     `yaml:"live_overlap_sec"`   // Overlap für Label-Alignment (default 10)
@@ -1309,7 +1311,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	}
 	maxFragmentSec := s.cfg.Recording.MaxFragmentSec
 	if maxFragmentSec <= 0 {
-		maxFragmentSec = 45
+		maxFragmentSec = 60
 	}
 
 	// Audio dekodieren + RMS
@@ -1328,12 +1330,21 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		session.totalSamples += len(samples)
 	}
 
+	softLimitSec := s.cfg.Recording.SoftLimitSec
+	if softLimitSec <= 0 {
+		softLimitSec = 15
+	}
+	softSilenceMs := s.cfg.Recording.SoftSilenceMs
+	if softSilenceMs <= 0 {
+		softSilenceMs = 200
+	}
+
 	// VAD-State-Machine (Audio-Zeit basierend auf totalSamples, nicht Wall-Clock)
 	fragmentComplete := false
 	silenceTimeoutSamples := silenceTimeoutMs * 16 // ms → samples (16kHz: 16 samples/ms)
 	maxFragmentSamples := maxFragmentSec * 16000   // sec → samples
-	softLimitSamples := 15 * 16000                 // 15s Soft-Limit
-	softSilenceTimeoutSamples := 300 * 16          // 300ms — kürzere Pause reicht ab Soft-Limit
+	softLimitSamples := softLimitSec * 16000
+	softSilenceTimeoutSamples := softSilenceMs * 16
 	partialIntervalSamples := partialIntervalSec * 16000
 
 	// Fragment-Dauer bisher
