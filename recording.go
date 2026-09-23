@@ -73,8 +73,9 @@ type RecordingSession struct {
 	lastSilence     int       // totalSamples bei letzter Stille (Audio-Zeit)
 	speechActive    bool      // aktuell in Sprechphase
 	silenceSinceSamples int   // totalSamples seit Stille beginnt (Audio-Zeit)
-	maxSilenceSamples  int   // längste Stille im aktuellen Fragment (Samples)
-	lastPartialSamples int    // totalSamples beim letzten Partial-Transcribe (Audio-Zeit)
+	maxSilenceSamples  int     // längste Stille im aktuellen Fragment (Samples)
+	minRMS             float64 // niedrigster RMS im aktuellen Fragment
+	lastPartialSamples int     // totalSamples beim letzten Partial-Transcribe (Audio-Zeit)
 	fragIndex       int       // laufende Fragment-Nummer
 	prevTranscript  string    // Transkript bis letzte Sprechpause (Kontext)
 	totalAudio      []byte    // komplettes Audio der Session (PCM16)
@@ -1362,6 +1363,11 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		effectiveSilenceTimeout = softSilenceTimeoutSamples
 	}
 
+	// minRMS für alle Chunks tracken (auch stille)
+	if session.fragAudio != nil && rms > 0 && rms < session.minRMS {
+		session.minRMS = rms
+	}
+
 	if isSilent {
 		if session.silenceSinceSamples > 0 {
 			silenceDurSamples := session.totalSamples - session.silenceSinceSamples
@@ -1388,6 +1394,10 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 			session.fragIndex++
 			session.lastPartialSamples = 0
 			session.maxSilenceSamples = 0
+			session.minRMS = 1.0
+		}
+		if rms < session.minRMS {
+			session.minRMS = rms
 		}
 		session.fragAudio = append(session.fragAudio, audioData...)
 	}
@@ -1403,8 +1413,8 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	if session.fragAudio != nil && fragEndSamples-session.fragStartSamples >= maxFragmentSamples {
 		fragCompleteByDuration = true
 		maxSilMs := session.maxSilenceSamples * 1000 / 16000
-		log.Printf("recording: HARD-CUT bei %ds (längste Stille im Fragment: %dms, soft_silence: %dms)",
-			maxFragmentSec, maxSilMs, softSilenceMs)
+		log.Printf("recording: HARD-CUT bei %ds (längste Stille: %dms, min RMS: %.4f, silence_thresh: %.4f, soft_silence: %dms)",
+			maxFragmentSec, maxSilMs, session.minRMS, s.cfg.Recording.SilenceThresh, softSilenceMs)
 	}
 
 	var partialText string
