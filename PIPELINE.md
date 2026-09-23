@@ -1,5 +1,40 @@
 # Recording Pipeline (Ist-Zustand 2026-09-23)
 
+## Modul-Übersicht
+
+| Modul | Zweck | Status | Begründung |
+|-------|-------|--------|------------|
+| **VAD** | Fragment-Grenzen erkennen (Stille/Max-Dauer) | AKTIV | Grundlage: wann wird Whisper aufgerufen |
+| **Whisper (schnell)** | Text pro Fragment (Live-SSE) | AKTIV | Kern: Transkription |
+| **Whisper (DTW)** | Word-Timestamps pro Fragment | AKTIV | Präzise Speaker-Grenzen (10.6s besser als i/N) |
+| **Rolling-Window-Diarize** | Live-Speaker während Aufnahme | **DEAKTIVIEREN** | Label-Instabilität über Windows: pyannote clustert in jedem Window neu, Labels sind nicht stabil. `diarizeWindowFinal` auf Gesamtaudio ist zuverlässiger. Sliding Window war gedacht um früher Speaker zu erkennen, aber die Inkonsistenz über Windows macht es unbrauchbar. |
+| **diarizeWindowFinal** | Ein pyannote-Call auf Gesamtaudio bei Session-End | AKTIV | Stabil: ein Call, ein Clustering, konsistente Labels. Ersetzt Rolling-Window. |
+| **alignWindowLabel** | pyannote-Labels auf stabile Speaker-Profile mappen | AKTIV | Braucht Überarbeitung: session-lokaler Check funktioniert, aber Cross-Window-Alignment ist fragil |
+| **Word-Timestamp-Zuordnung** | Wörter per echten Timestamps Speakern zuordnen | AKTIV | Funktioniert gut: 10.6s präziser als i/N-Schätzung |
+| **correctSegmentBoundaries** | Speaker-Grenzen an Satzgrenzen verschieben | AKTIV | Funktioniert: "an?" wird zum richtigen Speaker geschoben, Satzstruktur erkannt |
+| **Utterances** | Aufeinanderfolgende Segmente desselben Speakers gruppieren | AKTIV | Lesesicht für UI/Transkript |
+| **LLM-Finalpass** | Tippfehler, Halluzinationen, Satzzeichen | AKTIV | "Vielen Dank"-Filter funktioniert |
+| **Fragment-Flush** | Offenes Audio bei Session-End transkribieren | AKTIV | Löst das frags=0-Problem bei kurzen Aufnahmen |
+| **Mikro-Segment-Smoothing** | Kurze Spans zusammenfassen | ENTFERNT | Eliminierte Speaker-Segmente bevor der Corrector laufen konnte |
+| **Session-End-Diarize** | Zweiter pyannote-Call auf Gesamtaudio | ENTFERNT | War redundant zu Rolling-Window + schlechter (weniger Speaker, überschrieb bessere Live-Ergebnisse) |
+| **Session-interne Cosine-Fusion** | Labels innerhalb Session per Embedding mergen | ENTFERNT | Bug: fusionierte verschiedene Sprecher die pyannote korrekt getrennt hatte |
+
+### Empfehlung: Rolling-Window deaktivieren
+
+Das Rolling-Window (Phase 3) war gedacht um **live** Speaker zu erkennen.
+Aber es verursacht das Inkonsistenz-Problem:
+- pyannote clustert in jedem 60s-Window **neu**
+- SPEAKER_01 in Window 1 ≠ SPEAKER_01 in Window 2
+- `alignWindowLabel` versucht Alignment, aber Embeddings variieren
+- Ergebnis: unterschiedliche Speaker-Anzahl je nach Testlänge
+
+Stattdessen: **`diarizeWindowFinal` auf Gesamtaudio** (ein Call, stabil).
+Word-Timestamps + Corrector liefern die präzisen Grenzen.
+
+Live-Speaker-Events (SSE `type:"speaker"`) gehen damit verloren — die
+kamen erst nach 60s ohnehin. Akzeptabler Trade-off: Speaker werden bei
+Session-End zugewiesen statt live, dafür konsistent.
+
 ## Überblick
 
 ```
