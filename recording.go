@@ -790,9 +790,9 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 1. Finales Diarize-Window: Falls das Rolling-Window nie gefeuert hat
-	//    (Aufnahme kürzer als live_window_sec), einmalig auf dem gesamten Audio laufen.
-	// Finales Diarize-Window: wenn es unzugeordnete Fragmente gibt
-	// (kein Live-Window gelaufen, oder Fragmente jenseits des letzten Windows)
+	// 1. Fragment-Level-Diarization ist schon pro Fragment gelaufen (in handleRecordingChunk).
+	//    Kein Rolling-Window, kein Gesamtaudio-Diarize.
+	//    Nur noch für den Flush-Fragment nachholen:
 	session.mu.Lock()
 	hasUnassigned := false
 	for _, frag := range session.Fragments {
@@ -801,14 +801,34 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 			break
 		}
 	}
-	needsFinalWindow := hasUnassigned && len(session.totalAudio) > 0
 	session.mu.Unlock()
-	if needsFinalWindow && s.cfg.Recording.DiarizeAPIBase != "" {
-		log.Printf("recording: session/end: finales Diarize-Window (unzugeordnete Fragmente)")
-		s.diarizeWindowFinal(session)
+	if hasUnassigned && s.cfg.Recording.DiarizeAPIBase != "" {
+		// Flush-Fragment oder Fallback-Fragment hat noch keinen Speaker.
+		// Diarisiere nur die unzugeordneten Fragmente einzeln.
+		session.mu.Lock()
+		for i := range session.Fragments {
+			frag := &session.Fragments[i]
+			if frag.Speaker != "" && frag.Speaker != "unknown" {
+				continue
+			}
+			// Fragment-Audio aus totalAudio extrahieren
+			startSample := int(frag.Start * 16000)
+			endSample := int(frag.End * 16000)
+			if endSample*2 > len(session.totalAudio) {
+				endSample = len(session.totalAudio) / 2
+			}
+			if startSample*2 >= len(session.totalAudio) || startSample >= endSample {
+				continue
+			}
+			fragAudio := session.totalAudio[startSample*2 : endSample*2]
+			session.mu.Unlock()
+			s.diarizeFragment(session, frag.Index, fragAudio)
+			session.mu.Lock()
+		}
+		session.mu.Unlock()
 	}
 
-	// 2. Speaker-Finalisierung: Live-Window-Ergebnisse nutzen.
+	// 2. Speaker-Finalisierung: Fragment-Segmente nutzen.
 	if len(session.Fragments) > 0 {
 		s.finalizeSessionSpeakers(session)
 	}
@@ -1106,36 +1126,11 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			}
 		}(fragmentIdx, fragAudio, fragStartSec)
 
-		// Rolling-Window-Diarization: Live-Speaker für das fertige Fragment
-		if s.cfg.Recording.LiveDiarize && s.cfg.Recording.DiarizeAPIBase != "" {
-			liveSpeaker := s.diarizeWindowLive(session, fragmentIdx)
-			if liveSpeaker != "" {
-				session.addFragmentSpeaker(fragmentIdx, liveSpeaker)
-				sseWrite(w, flusher, map[string]any{
-					"type":     "speaker",
-					"fragment": fragmentIdx,
-					"speaker":  liveSpeaker,
-				})
-
-				// LLM Word-Boundary-Correction: prüfen ob die letzten Wörter
-				// des VORHERIGEN Fragments zum aktuellen Speaker gehören.
-				wordCount := s.llmSplitCheck(session, fragmentIdx)
-				if wordCount > 0 {
-					session.mu.Lock()
-					prevIdx := 0
-					if len(session.Fragments) >= 2 {
-						prevIdx = session.Fragments[len(session.Fragments)-2].Index
-					}
-					session.mu.Unlock()
-					session.applyLlmSplit(prevIdx, wordCount, liveSpeaker)
-					sseWrite(w, flusher, map[string]any{
-						"type":     "split",
-						"fragment": prevIdx,
-						"words":    wordCount,
-						"speaker":  liveSpeaker,
-					})
-				}
-			}
+		// Fragment-Level-Diarization: pyannote auf DIESEM Fragment.
+		// Jedes Fragment wird einzeln diarisiert — kein Rolling-Window,
+		// kein Gesamtaudio. Speaker-Konsistenz über die Profile-DB.
+		if s.cfg.Recording.DiarizeAPIBase != "" {
+			s.diarizeFragment(session, fragmentIdx, fragAudio)
 		}
 
 		sseWrite(w, flusher, map[string]any{
@@ -1513,8 +1508,105 @@ func (s *Server) flushPendingFragment(session *RecordingSession) {
 // ── Rolling-Window-Diarization (Live-Speaker) ────────────────────
 
 // diarizeWindowFinal führt ein einmaliges Diarize-Window auf dem gesamten Audio durch.
-// Wird bei Session-End aufgerufen wenn das Rolling-Window nie gefeuert hat
-// (Aufnahme kürzer als live_window_sec).
+// diarizeFragment führt pyannote auf einem einzelnen Fragment-Audio durch.
+// Jedes Fragment wird eigenständig diarisiert — stabile Ergebnisse,
+// keine Label-Instabilität über Windows.
+// Speaker-Zuordnung über Fragmente hinweg passiert über die Profile-DB.
+func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fragAudio []byte) {
+	result := s.diarizeAudioBytes(fragAudio)
+	if result == nil || len(result.Segments) == 0 {
+		return
+	}
+
+	log.Printf("recording: diarize-fragment %d: %d Segmente, %d Speaker",
+		fragmentIdx, len(result.Segments), len(result.Speakers))
+
+	session.mu.Lock()
+	// Fragment-Startzeit für absolute Zeitumrechnung
+	var fragStart float64
+	for _, frag := range session.Fragments {
+		if frag.Index == fragmentIdx {
+			fragStart = frag.Start
+			break
+		}
+	}
+
+	// Pro Label: alignWindowLabel (Embedding → DB-Match oder neue Person)
+	labelRefs := make(map[string]SpeakerRef)
+	for _, label := range result.Speakers {
+		emb := result.SpeakerEmbeddings[label]
+		if len(emb) == 0 {
+			continue
+		}
+		if _, ok := session.liveSpeakerMap[label]; ok {
+			labelRefs[label] = session.liveSpeakerMap[label]
+			continue
+		}
+		ref, ok := s.alignWindowLabel(session, label, emb)
+		if ok {
+			labelRefs[label] = ref
+		}
+	}
+
+	// Rohe Segmente mit stabilen Speaker-Namen speichern (absolute Session-Zeit)
+	for _, seg := range result.Segments {
+		speakerName := "unknown"
+		if ref, ok := labelRefs[seg.Speaker]; ok {
+			speakerName = ref.String()
+		}
+		session.liveSegments = append(session.liveSegments, FragSpeakerSeg{
+			Speaker: speakerName,
+			Start:   round2(fragStart + seg.Start),
+			End:     round2(fragStart + seg.End),
+		})
+	}
+
+	// Dominanter Speaker für das Fragment (Midpoint)
+	mid := fragStart + 15 // Mitte eines ~30s Fragments
+	for _, frag := range session.Fragments {
+		if frag.Index == fragmentIdx {
+			mid = (frag.Start + frag.End) / 2
+			break
+		}
+	}
+	bestDur := 0.0
+	bestSpeaker := ""
+	for _, seg := range result.Segments {
+		absMid := mid - fragStart // relativ zum Fragment
+		if absMid >= seg.Start && absMid < seg.End {
+			dur := seg.End - seg.Start
+			if dur > bestDur {
+				bestDur = dur
+				if ref, ok := labelRefs[seg.Speaker]; ok {
+					bestSpeaker = ref.String()
+				}
+			}
+		}
+	}
+	if bestSpeaker == "" && len(labelRefs) > 0 {
+		// Fallback: erster Speaker
+		for _, ref := range labelRefs {
+			bestSpeaker = ref.String()
+			break
+		}
+	}
+	if bestSpeaker != "" {
+		session.liveSpeakerByFrag[fragmentIdx] = bestSpeaker
+		for i := range session.Fragments {
+			if session.Fragments[i].Index == fragmentIdx {
+				session.Fragments[i].Speaker = bestSpeaker
+				break
+			}
+		}
+	}
+	session.mu.Unlock()
+
+	log.Printf("recording: diarize-fragment %d: %d Speaker, dominant=%s",
+		fragmentIdx, len(labelRefs), bestSpeaker)
+}
+
+// diarizeWindowFinal führt ein einmaliges Diarize-Window auf dem gesamten Audio durch.
+// Wird bei Session-End aufgerufen wenn es unzugeordnete Fragmente gibt.
 func (s *Server) diarizeWindowFinal(session *RecordingSession) {
 	session.mu.Lock()
 	if len(session.totalAudio) < 3*16000*2 { // < 3s
