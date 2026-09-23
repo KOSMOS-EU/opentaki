@@ -1934,14 +1934,13 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 }
 
 // assignSpeakerProfile ordnet einem pyannote-Embedding ein Sprecher-Profil zu.
-// Einfache Logik:
-//   1. Immer neues Profil anlegen (jedes Embedding ist eine Beobachtung)
-//   2. Gegen bestehende Profile matchen (Cosine > threshold)
-//   3. Wenn Match: bestehende Person wiederverwenden
-//   4. Wenn kein Match: neue Person ("Sprecher_<ProfilID>")
-//   5. Innerhalb desselben Fragments: NICHT gegen eigene Labels matchen
+//   1. Gegen ALLE bestehenden Profile matchen (Cosine > threshold)
+//   2. Wenn Match: bestehende Person wiederverwenden + neues Profil anlegen
+//   3. Wenn kein Match: neue Person ("Sprecher_N") + neues Profil
 //
-// pyannote-Labels (SPEAKER_XX) werden verworfen. Nur Embeddings zählen.
+// Kein fragment-lokaler Check, kein session-lokaler Check.
+// Die DB ist global. Ein Match ist ein Match.
+// pyannote-Labels werden verworfen. Nur Embeddings zählen.
 // Precondition: session.mu wird vom Caller gehalten.
 func (s *Server) assignSpeakerProfile(session *RecordingSession, scopedLabel string, emb []float64) (SpeakerRef, bool) {
 	// Identity: dieses scoped Label schon bekannt?
@@ -1949,44 +1948,22 @@ func (s *Server) assignSpeakerProfile(session *RecordingSession, scopedLabel str
 		return ref, true
 	}
 
-	// Gegen bestehende Profile matchen
+	// Gegen alle bestehenden Profile matchen
 	match := s.matchSpeaker(emb)
 	s.speakerMu.Lock()
 	var ref SpeakerRef
 
-	// Fragment-lokaler Check: nicht gegen Labels aus demselben Fragment matchen
-	fragmentLocal := false
-	labelPrefix := ""
-	if idx := strings.Index(scopedLabel, "_SPEAKER_"); idx > 0 {
-		labelPrefix = scopedLabel[:idx+1]
-	}
-	if labelPrefix != "" && match.Matched {
-		for existingLabel, existingRef := range session.liveSpeakerMap {
-			if strings.HasPrefix(existingLabel, labelPrefix) && existingRef.PersonID == match.Person.ID {
-				fragmentLocal = true
-				break
-			}
-		}
-	}
-
-	if match.Matched && !fragmentLocal {
-		// Bestehende Person wiederverwenden
+	if match.Matched {
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
 		log.Printf("recording: assign-profile: %s → %s (match=%.2f, profil=%d)",
 			scopedLabel, match.Person.Name, match.Score, pid)
 	} else {
-		// Neue Person + neues Profil
 		person := s.createSprecher()
 		pid := s.addProfileForSession(person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
-		if fragmentLocal {
-			log.Printf("recording: assign-profile: %s → %s (fragment-lokal, neues Profil %d)",
-				scopedLabel, person.Name, pid)
-		} else {
-			log.Printf("recording: assign-profile: %s → %s (kein Match, best=%.2f, Profil %d)",
-				scopedLabel, person.Name, match.Score, pid)
-		}
+		log.Printf("recording: assign-profile: %s → %s (kein Match, best=%.2f, Profil %d)",
+			scopedLabel, person.Name, match.Score, pid)
 	}
 	s.speakerMu.Unlock()
 
