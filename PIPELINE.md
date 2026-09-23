@@ -7,7 +7,7 @@ Stand: 2026-09-23
 | Begriff | Definition | Code |
 |---------|-----------|------|
 | **Chunk** | 2s Audio-Paket vom Browser | `handleRecordingChunk` |
-| **Fragment** | VAD-Einheit: Audio gesammelt bis Stille (800ms) oder Max-Dauer (30s). Ein Whisper-Call pro Fragment. | `session.fragAudio`, `addFragment` |
+| **Fragment** | VAD-Einheit: Audio gesammelt bis **Sprechpause** (≥800ms Stille) oder Max-Dauer (30s Fallback). Typisch 5-30s, je nach Sprechverhalten. Ein Whisper-Call pro Fragment. | `session.fragAudio`, `addFragment` |
 | **Fragment-Final** | Fragment fertig transkribiert + Word-Timestamps vorhanden. Bereit für Diarization. | nach `whisperTranscribeBytes` + `whisperTranscribeWithWords` |
 | **Segment** | Speaker-homogener Abschnitt innerhalb eines Fragments. Bestimmt durch pyannote + Word-Timestamps. | `FragSpeakerSeg` |
 | **Utterance** | Zusammenhängende Rede einer Person über Fragment-Grenzen. Lesesicht für UI. | `Utterance`, `buildUtterances` |
