@@ -517,7 +517,6 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	silenceTimeoutSamples := cfg.silenceTimeoutMs() * 16
 	maxFragmentSamples := cfg.maxFragmentSec() * 16000
 	softLimitSamples := cfg.softLimitSec() * 16000
-	softSilenceTimeoutSamples := cfg.softSilenceMs() * 16
 	partialIntervalSec := cfg.PartialInterval
 	if partialIntervalSec <= 0 { partialIntervalSec = 3 }
 	partialIntervalSamples := partialIntervalSec * 16000
@@ -545,18 +544,13 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		fragDurSamples = session.totalSamples - session.fragStartSamples
 	}
 
-	// Ab Soft-Limit: kürzere Stille reicht
-	effectiveSilenceTimeout := silenceTimeoutSamples
-	if fragDurSamples >= softLimitSamples {
-		effectiveSilenceTimeout = softSilenceTimeoutSamples
-	}
-
 	fragmentComplete := false
 
 	if isSilent {
 		if session.silenceSinceSamples > 0 {
 			silDur := session.totalSamples - session.silenceSinceSamples
-			if silDur >= effectiveSilenceTimeout {
+			// Fragment-Ende nur wenn: Stille >= 800ms UND Fragment >= soft_limit
+			if silDur >= silenceTimeoutSamples && fragDurSamples >= softLimitSamples {
 				fragmentComplete = true
 			}
 		} else {
