@@ -28,7 +28,8 @@ Stand: 2026-09-23
 | `diarizeWindowFinal` | pyannote auf GESAMTEM totalAudio bei Session-End | Session-End, wenn unzugeordnete Fragmente | AKTIV, aber **problematisch** |
 | `diarizeAudioBytes` | Low-Level: sendet Audio an openannote, gibt Segmente+Embeddings zurück | Von diarizeWindowLive/Final aufgerufen | AKTIV |
 | `alignWindowLabel` | Mappt pyannote-Label auf stabile Person (DB-Match oder neu anlegen) | Pro Label in jedem diarize-Call | AKTIV |
-| `finalizeSessionSpeakers` | Baut Multi-Segmente pro Fragment aus liveSegments + Word-Timestamps | Session-End | AKTIV |
+| `finalizeSessionSpeakers` | ~~Baute Multi-Segmente aus liveSegments~~ | Session-End | **ENTFERNT** — hat Speaker eliminiert. Segmente werden jetzt direkt in `diarizeFragment` geschrieben. |
+| `saveSessionProfiles` | Speichert Speaker-Embeddings in DB | Session-End | AKTIV (ersetzt finalizeSessionSpeakers) |
 | `correctSegmentBoundaries` | Verschiebt Speaker-Grenzen an Satzgrenzen (Interpunktion) | In finalizeSessionSpeakers | AKTIV |
 | `buildUtterances` | Gruppiert aufeinanderfolgende Segmente desselben Speakers | Session-End | AKTIV |
 | `flushPendingFragment` | Transkribiert offenes fragAudio bei Session-End | Session-End | AKTIV |
