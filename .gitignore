@@ -2,3 +2,6 @@ open_taki
 open_taki_linux
 *.exe
 DIST
+config.local.yaml
+open_taki_local
+speakers-local.db
