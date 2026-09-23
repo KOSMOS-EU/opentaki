@@ -1332,12 +1332,26 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	fragmentComplete := false
 	silenceTimeoutSamples := silenceTimeoutMs * 16 // ms → samples (16kHz: 16 samples/ms)
 	maxFragmentSamples := maxFragmentSec * 16000   // sec → samples
+	softLimitSamples := 15 * 16000                 // 15s Soft-Limit
+	softSilenceTimeoutSamples := 300 * 16          // 300ms — kürzere Pause reicht ab Soft-Limit
 	partialIntervalSamples := partialIntervalSec * 16000
+
+	// Fragment-Dauer bisher
+	fragDurSamples := 0
+	if session.fragAudio != nil {
+		fragDurSamples = session.totalSamples - session.fragStartSamples
+	}
+
+	// Ab Soft-Limit (15s): kürzere Stille (300ms) reicht als Fragment-Ende
+	effectiveSilenceTimeout := silenceTimeoutSamples
+	if fragDurSamples >= softLimitSamples {
+		effectiveSilenceTimeout = softSilenceTimeoutSamples
+	}
 
 	if isSilent {
 		if session.silenceSinceSamples > 0 {
 			silenceDurSamples := session.totalSamples - session.silenceSinceSamples
-			if silenceDurSamples >= silenceTimeoutSamples {
+			if silenceDurSamples >= effectiveSilenceTimeout {
 				fragmentComplete = true
 			}
 		} else {
@@ -1368,6 +1382,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 	fragCompleteByDuration := false
 	if session.fragAudio != nil && fragEndSamples-session.fragStartSamples >= maxFragmentSamples {
 		fragCompleteByDuration = true
+		log.Printf("recording: HARD-CUT bei %ds (keine Stille gefunden)", maxFragmentSec)
 	}
 
 	var partialText string
