@@ -1613,6 +1613,34 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 		// Intelligent Segment Corrector: Satzgrenzen
 		wordSpeakers = correctSegmentBoundaries(words, wordSpeakers)
 
+		// Intra-Speaker-Split: wenn innerhalb eines Speaker-Segments ein Satzende
+		// vorkommt UND die Word-Timestamps eine Sprechpause > 0.3s zeigen →
+		// neuen Speaker-Tag vergeben (SPLIT_xx). Das deckt Fälle ab wo pyannote
+		// zwei verschiedene Sprecher als einen clustert.
+		if len(frag.Words) >= len(words) {
+			splitIdx := 0
+			for wi := 0; wi < len(words)-1; wi++ {
+				if !endsWithSentence(words[wi]) {
+					continue
+				}
+				gap := wordsWT[wi+1].absTime - (wordsWT[wi].absTime + 0.5) // geschätzte Wort-Dauer 0.5s
+				if len(frag.Words) > wi {
+					gap = frag.Words[wi+1].Start - frag.Words[wi].End
+				}
+				if gap >= 0.3 {
+					// Sprechpause nach Satzende → alle Wörter danach bekommen neuen Tag
+					newTag := fmt.Sprintf("%s_SPLIT_%d", wordSpeakers[wi], splitIdx)
+					splitIdx++
+					oldTag := wordSpeakers[wi+1]
+					for j := wi + 1; j < len(words) && wordSpeakers[j] == oldTag; j++ {
+						wordSpeakers[j] = newTag
+					}
+					log.Printf("recording: intra-split: fragment %d, gap=%.3fs after %q → split at word %d",
+						fragmentIdx, gap, words[wi], wi+1)
+				}
+			}
+		}
+
 		// Kontiguierte Wortgruppen → finale Segmente mit Text
 		var finalSegs []FragSpeakerSeg
 		segStart := 0
