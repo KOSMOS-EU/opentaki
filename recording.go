@@ -499,15 +499,17 @@ func (s *Server) findOrCreatePerson(name string) SpeakerPerson {
 	return SpeakerPerson{ID: int(id), Name: name}
 }
 
-// createGlobalSpeaker legt eine neue globale SPEAKER_XX Person an.
+// createSprecher legt eine neue Person mit auto-generiertem Namen an.
+// Name: "Sprecher_<ID>" — "Sprecher" statt "SPEAKER" um von pyannote-Wegwerf-Labels
+// zu unterscheiden. Kann manuell zu einem echten Namen geändert werden.
 // Rufer muss speakerMu halten.
-func (s *Server) createGlobalSpeaker() SpeakerPerson {
+func (s *Server) createSprecher() SpeakerPerson {
 	val := s.getMeta("next_speaker_idx")
 	idx := 0
 	if val != "" {
 		fmt.Sscanf(val, "%d", &idx)
 	}
-	name := fmt.Sprintf("SPEAKER_%02d", idx)
+	name := fmt.Sprintf("Sprecher_%d", idx)
 	s.setMeta("next_speaker_idx", fmt.Sprintf("%d", idx+1))
 
 	res, err := s.speakerDB.Exec(`INSERT INTO persons (name) VALUES (?)`, name)
@@ -1569,7 +1571,7 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 		}
 		// Scoped Label: "f1_SPEAKER_03" statt nur "SPEAKER_03"
 		scopedLabel := fmt.Sprintf("f%d_%s", fragmentIdx, label)
-		ref, ok := s.alignWindowLabel(session, scopedLabel, emb)
+		ref, ok := s.assignSpeakerProfile(session, scopedLabel, emb)
 		if ok {
 			labelRefs[label] = ref
 		}
@@ -1715,7 +1717,7 @@ func (s *Server) diarizeWindowFinal(session *RecordingSession) {
 		if _, ok := session.liveSpeakerMap[seg.Speaker]; ok {
 			continue
 		}
-		_, ok := s.alignWindowLabel(session, seg.Speaker, emb)
+		_, ok := s.assignSpeakerProfile(session, seg.Speaker, emb)
 		if !ok {
 			continue
 		}
@@ -1843,7 +1845,7 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 		if len(emb) == 0 {
 			continue
 		}
-		ref, ok := s.alignWindowLabel(session, label, emb)
+		ref, ok := s.assignSpeakerProfile(session, label, emb)
 		if ok {
 			labelRefs[label] = ref
 		}
@@ -1912,62 +1914,65 @@ func (s *Server) diarizeWindowLive(session *RecordingSession, completedFragIdx i
 	return session.liveSpeakerByFrag[completedFragIdx]
 }
 
-// alignWindowLabel aligniert ein pyannote-Window-Label auf eine stabile SpeakerRef.
-// Zwei Stufen: Identity (gleiches Label im selben Window), Global Profile Match.
-// KEINE session-interne Cosine-Fusion: wenn pyannote zwei Labels trennt,
-// bleiben sie getrennt. Lieber mehr Profile als unerkannte verschiedene Personen.
-// Precondition: session.mu wird vom Caller gehalten (KEIN Lock hier).
-func (s *Server) alignWindowLabel(session *RecordingSession, label string, emb []float64) (SpeakerRef, bool) {
-	// 1. Identity: Label existiert schon in der Session
-	if ref, ok := session.liveSpeakerMap[label]; ok {
+// assignSpeakerProfile ordnet einem pyannote-Embedding ein Sprecher-Profil zu.
+// Einfache Logik:
+//   1. Immer neues Profil anlegen (jedes Embedding ist eine Beobachtung)
+//   2. Gegen bestehende Profile matchen (Cosine > threshold)
+//   3. Wenn Match: bestehende Person wiederverwenden
+//   4. Wenn kein Match: neue Person ("Sprecher_<ProfilID>")
+//   5. Innerhalb desselben Fragments: NICHT gegen eigene Labels matchen
+//
+// pyannote-Labels (SPEAKER_XX) werden verworfen. Nur Embeddings zählen.
+// Precondition: session.mu wird vom Caller gehalten.
+func (s *Server) assignSpeakerProfile(session *RecordingSession, scopedLabel string, emb []float64) (SpeakerRef, bool) {
+	// Identity: dieses scoped Label schon bekannt?
+	if ref, ok := session.liveSpeakerMap[scopedLabel]; ok {
 		return ref, true
 	}
 
-	// 2. Global Profile Match — aber NUR gegen Profile die VOR dieser Session
-	//    existierten. Profile die im selben Window/Session angelegt wurden,
-	//    dürfen nicht matchen (pyannote hat sie bewusst getrennt).
-	//    → Prüfe ob die gematchte Person schon in liveSpeakerMap ist (= diese Session).
+	// Gegen bestehende Profile matchen
 	match := s.matchSpeaker(emb)
 	s.speakerMu.Lock()
 	var ref SpeakerRef
 
-	// Ist die gematchte Person bereits im SELBEN FRAGMENT als anderes Label vergeben?
-	// (Nicht session-weit: Cross-Fragment-Matching ist gewünscht!)
-	// Fragment-Scope wird im Label-Prefix codiert: "f1_SPEAKER_03"
-	matchedIsFragmentLocal := false
+	// Fragment-lokaler Check: nicht gegen Labels aus demselben Fragment matchen
+	fragmentLocal := false
 	labelPrefix := ""
-	if idx := strings.Index(label, "_SPEAKER_"); idx > 0 {
-		labelPrefix = label[:idx+1] // "f1_"
+	if idx := strings.Index(scopedLabel, "_SPEAKER_"); idx > 0 {
+		labelPrefix = scopedLabel[:idx+1]
 	}
-	if labelPrefix != "" && (match.Matched || match.Score >= 0.55) {
+	if labelPrefix != "" && match.Matched {
 		for existingLabel, existingRef := range session.liveSpeakerMap {
 			if strings.HasPrefix(existingLabel, labelPrefix) && existingRef.PersonID == match.Person.ID {
-				matchedIsFragmentLocal = true
+				fragmentLocal = true
 				break
 			}
 		}
 	}
 
-	if match.Matched && !matchedIsFragmentLocal {
+	if match.Matched && !fragmentLocal {
+		// Bestehende Person wiederverwenden
 		pid := s.addProfileForSession(match.Person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: match.Person.Name, PersonID: match.Person.ID, ProfileID: pid}
-		log.Printf("recording: live-diarize: label %s → %q (match=%.2f)", label, match.Person.Name, match.Score)
+		log.Printf("recording: assign-profile: %s → %s (match=%.2f, profil=%d)",
+			scopedLabel, match.Person.Name, match.Score, pid)
 	} else {
-		// Neue Person — entweder kein Match oder Match ist fragment-lokal
-		person := s.createGlobalSpeaker()
+		// Neue Person + neues Profil
+		person := s.createSprecher()
 		pid := s.addProfileForSession(person.ID, emb, session.ID)
 		ref = SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
-		if matchedIsFragmentLocal {
-			log.Printf("recording: live-diarize: label %s → neue Person %q (match %.2f war fragment-lokal %q, getrennt gehalten)",
-				label, person.Name, match.Score, match.Person.Name)
+		if fragmentLocal {
+			log.Printf("recording: assign-profile: %s → %s (fragment-lokal, neues Profil %d)",
+				scopedLabel, person.Name, pid)
 		} else {
-			log.Printf("recording: live-diarize: label %s → neue Person %q (best=%.2f)", label, person.Name, match.Score)
+			log.Printf("recording: assign-profile: %s → %s (kein Match, best=%.2f, Profil %d)",
+				scopedLabel, person.Name, match.Score, pid)
 		}
 	}
 	s.speakerMu.Unlock()
 
-	session.liveSpeakerMap[label] = ref
-	session.liveSpeakerEmb[label] = emb
+	session.liveSpeakerMap[scopedLabel] = ref
+	session.liveSpeakerEmb[scopedLabel] = emb
 	return ref, true
 }
 
