@@ -46,7 +46,7 @@ type RecordingConfig struct {
 	MinSpeakers     int     `yaml:"min_speakers"`
 	MaxSpeakers     int     `yaml:"max_speakers"`
 	SpeakerStore    string  `yaml:"speaker_store"`
-	SpeakerMatch    float64 `yaml:"speaker_match"`
+	ProfileMatch    float64 `yaml:"profile_match"`
 	MaxChunkMB      int     `yaml:"max_chunk_mb"`
 	SilenceThresh   float64 `yaml:"silence_thresh"`
 	SilenceTimeout  int     `yaml:"silence_timeout_ms"`
@@ -81,8 +81,8 @@ func (c *RecordingConfig) minSpeakers() int {
 	if c.MinSpeakers > 0 { return c.MinSpeakers }
 	return 2
 }
-func (c *RecordingConfig) speakerMatchThreshold() float64 {
-	if c.SpeakerMatch > 0 { return c.SpeakerMatch }
+func (c *RecordingConfig) profileMatchThreshold() float64 {
+	if c.ProfileMatch > 0 { return c.ProfileMatch }
 	return 0.65
 }
 func (c *RecordingConfig) doLLMFinalpass() bool {
@@ -480,7 +480,7 @@ type matchSpeakerResult struct {
 }
 
 func (s *Server) matchSpeaker(embedding []float64) matchSpeakerResult {
-	threshold := s.cfg.Recording.speakerMatchThreshold()
+	threshold := s.cfg.Recording.profileMatchThreshold()
 	var bestPerson SpeakerPerson
 	var bestProfileID int
 	bestScore := 0.0
