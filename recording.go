@@ -533,6 +533,8 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		session.totalSamples += len(samples)
 	}
 
+	log.Printf("recording: chunk rms=%.4f silent=%v audio=%d bytes", rms, isSilent, len(audioData))
+
 	// Min RMS tracken
 	if session.fragAudio != nil && rms > 0 && rms < session.minRMS {
 		session.minRMS = rms
