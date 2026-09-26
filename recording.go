@@ -559,6 +559,10 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 			session.silenceSinceSamples = session.totalSamples
 		}
 		session.speechActive = false
+		// Stille-Chunks auch ins Fragment speichern (damit Zeiten stimmen)
+		if session.fragAudio != nil {
+			session.fragAudio = append(session.fragAudio, audioData...)
+		}
 	} else {
 		if session.silenceSinceSamples > 0 {
 			silDur := session.totalSamples - session.silenceSinceSamples
