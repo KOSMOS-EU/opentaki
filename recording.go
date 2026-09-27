@@ -926,27 +926,44 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 	}
 
 	// Backend liefert eigene Timestamps+Text (z.B. VibeVoice)?
-	// → Segmente direkt übernehmen mit Backend-Timestamps.
-	//   Der Text kommt vom Backend (mäßig für Deutsch), wird aber im
-	//   LLM-Finalpass mit Whisper-Text korrigiert.
+	// → VibeVoice-Segmente als Zeitgerüst (Speaker + Start/End),
+	//   Whisper-Text als Textquelle. LLM mappt beides zusammen pro Fragment.
 	backendProvidesText := s.diarDefaults != nil && s.diarDefaults.ProvidesText
 	hasSegmentText := len(result.Segments) > 0 && result.Segments[0].Text != ""
 
 	if backendProvidesText && hasSegmentText {
-		var finalSegs []FragSpeakerSeg
+		// VibeVoice-Segmente als Gerüst
+		var vvSegs []FragSpeakerSeg
 		for _, rs := range result.Segments {
+			// Halluzinations-Filter: >50% Wort-Wiederholung → verwerfen
+			if isHallucination(rs.Text) {
+				log.Printf("recording: diarize-fragment %d: hallucination filtered: %.30s...", fragmentIdx, rs.Text)
+				continue
+			}
 			speakerName := "unknown"
 			if ref, ok := labelRefs[rs.Speaker]; ok {
 				speakerName = ref.String()
 			}
-			finalSegs = append(finalSegs, FragSpeakerSeg{
+			vvSegs = append(vvSegs, FragSpeakerSeg{
 				Speaker: speakerName,
 				Start:   round2(fragStart + rs.Start),
 				End:     round2(fragStart + rs.End),
 				Text:    rs.Text,
 			})
 		}
-		frag.Segments = finalSegs
+
+		// LLM-Merge pro Fragment: Whisper-Text + VibeVoice-Gerüst
+		whisperText := frag.Text
+		if whisperText != "" && len(vvSegs) > 0 && s.cfg.LLM.APIBase != "" {
+			merged := s.llmMergeFragmentSpeakers(vvSegs, whisperText)
+			if merged != nil {
+				frag.Segments = merged
+			} else {
+				frag.Segments = vvSegs
+			}
+		} else {
+			frag.Segments = vvSegs
+		}
 	} else {
 		// Whisper-Word-Timestamps auf Diarizer-Segmente mappen (pyannote/NeMo)
 		words := strings.Fields(frag.Text)
@@ -1017,6 +1034,96 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 	session.mu.Unlock()
 	log.Printf("recording: diarize-fragment %d: %d Segmente, dominant=%s",
 		fragmentIdx, len(frag.Segments), frag.Speaker)
+}
+
+// ── Halluzinations-Filter ────────────────────────────────────
+
+func isHallucination(text string) bool {
+	words := strings.Fields(text)
+	if len(words) < 5 {
+		return false
+	}
+	counts := make(map[string]int)
+	for _, w := range words {
+		counts[strings.ToLower(w)]++
+	}
+	for _, count := range counts {
+		if float64(count)/float64(len(words)) > 0.5 {
+			return true
+		}
+	}
+	return false
+}
+
+// ── LLM Fragment-Merge (VibeVoice-Gerüst + Whisper-Text) ────
+
+func (s *Server) llmMergeFragmentSpeakers(vvSegs []FragSpeakerSeg, whisperText string) []FragSpeakerSeg {
+	// VibeVoice-Gerüst als Referenz formatieren
+	var geruestBuilder strings.Builder
+	for _, seg := range vvSegs {
+		fmt.Fprintf(&geruestBuilder, "[%s]: %s\n", seg.Speaker, seg.Text)
+	}
+
+	prompt := fmt.Sprintf(
+		`Du erhältst ein Diarizer-Transkript (mit Sprechern, aber schlechter Textqualität) und ein Whisper-Transkript (guter Text, ohne Sprecher).
+
+DIARIZER (Sprecher-Zuordnung, Text nur als Hint):
+%s
+WHISPER (korrekter Text):
+%s
+Aufgabe: Ersetze den Text jedes Diarizer-Segments durch den passenden Whisper-Text.
+- Behalte die Sprecher-Zuordnungen und die Anzahl der Segmente EXAKT bei.
+- Behalte die Reihenfolge der Segmente bei.
+- Verschiebe KEINE Sprecher-Grenzen. Ordne den Whisper-Text sequentiell den bestehenden Segmenten zu.
+- Wenn der Whisper-Text nicht exakt auf die Segmente passt, teile ihn sinnvoll an Satzgrenzen.
+- Entferne Halluzinationen und Füllwörter.
+
+Gib NUR die korrigierten Segmente zurück, Format: [Sprecher_XX]: Text
+Keine Erklärungen.`, geruestBuilder.String(), whisperText)
+
+	result := s.llmChat(prompt)
+	if result == "" {
+		return nil
+	}
+
+	// Parse LLM-Ergebnis zurück in Segmente
+	var merged []FragSpeakerSeg
+	vvIdx := 0
+	for _, line := range strings.Split(result, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: [Sprecher_XX]: Text
+		if !strings.HasPrefix(line, "[") {
+			continue
+		}
+		closeBracket := strings.Index(line, "]:")
+		if closeBracket < 0 {
+			continue
+		}
+		speaker := line[1:closeBracket]
+		text := strings.TrimSpace(line[closeBracket+2:])
+
+		// Timestamps aus VibeVoice-Gerüst übernehmen (sequentiell)
+		start, end := 0.0, 0.0
+		if vvIdx < len(vvSegs) {
+			start = vvSegs[vvIdx].Start
+			end = vvSegs[vvIdx].End
+			vvIdx++
+		}
+		merged = append(merged, FragSpeakerSeg{
+			Speaker: speaker,
+			Start:   start,
+			End:     end,
+			Text:    text,
+		})
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	log.Printf("recording: llm-merge: %d VV segments → %d merged segments", len(vvSegs), len(merged))
+	return merged
 }
 
 // ── Utterances ───────────────────────────────────────────────
