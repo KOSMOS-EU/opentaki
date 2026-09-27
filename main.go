@@ -223,8 +223,9 @@ type Server struct {
 	// Recording (near-live Transkription)
 	recMu     sync.Mutex
 	sessions  map[string]*RecordingSession
-	speakerMu sync.RWMutex
-	speakerDB *sql.DB
+	speakerMu      sync.RWMutex
+	speakerDB      *sql.DB
+	diarDefaults   *diarizeDefaults
 }
 
 // traceCtx carries per-request debug context through the pipeline.
@@ -652,6 +653,9 @@ func NewServer(cfg Config) *Server {
 	if err := srv.initSpeakerStore(); err != nil {
 		log.Printf("recording: speaker store init: %v", err)
 	}
+
+	// Diarizer-Defaults abfragen (Backend meldet max_audio_sec, embedding_type etc.)
+	srv.fetchDiarizeDefaults()
 
 	return srv
 }

@@ -51,7 +51,6 @@ Alle Werte per Config einstellbar.
      → Wort-zu-Speaker-Zuordnung per echte Zeitstempel
    Sonst:
      → Fallback: proportional i/N
-   → correctSegmentBoundaries (Satzgrenzen-Korrektur)
    → Segmente ins Fragment schreiben
    → SSE: speaker Event an Browser
 ```

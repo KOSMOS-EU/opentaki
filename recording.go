@@ -45,6 +45,7 @@ type RecordingConfig struct {
 	DiarizeModel    string  `yaml:"diarize_model"`
 	MinSpeakers     int     `yaml:"min_speakers"`
 	MaxSpeakers     int     `yaml:"max_speakers"`
+	MinDurationOff  float64 `yaml:"min_duration_off"`
 	SpeakerStore    string  `yaml:"speaker_store"`
 	ProfileMatch    float64 `yaml:"profile_match"`
 	MaxChunkMB      int     `yaml:"max_chunk_mb"`
@@ -76,6 +77,13 @@ func (c *RecordingConfig) softSilenceMs() int {
 func (c *RecordingConfig) maxFragmentSec() int {
 	if c.MaxFragmentSec > 0 { return c.MaxFragmentSec }
 	return 60
+}
+func (c *RecordingConfig) maxFragmentSecEffective(diarDefaults *diarizeDefaults) int {
+	configMax := c.maxFragmentSec()
+	if diarDefaults != nil && diarDefaults.MaxAudioSec > 0 && diarDefaults.MaxAudioSec < configMax {
+		return diarDefaults.MaxAudioSec
+	}
+	return configMax
 }
 func (c *RecordingConfig) minSpeakers() int {
 	if c.MinSpeakers > 0 { return c.MinSpeakers }
@@ -176,6 +184,39 @@ func (r SpeakerRef) String() string {
 	return fmt.Sprintf("%s/%d", r.PersonName, r.ProfileID)
 }
 
+type diarizeDefaults struct {
+	MaxAudioSec   int    `json:"max_audio_sec"`
+	EmbeddingDim  int    `json:"embedding_dim"`
+	EmbeddingType string `json:"embedding_type"`
+	ProvidesText  bool   `json:"provides_text"`
+}
+
+// fetchDiarizeDefaults queries the diarizer's /health endpoint for backend defaults.
+func (s *Server) fetchDiarizeDefaults() {
+	if s.cfg.Recording.DiarizeAPIBase == "" {
+		return
+	}
+	url := strings.TrimRight(s.cfg.Recording.DiarizeAPIBase, "/") + "/health"
+	resp, err := s.client.Get(url)
+	if err != nil {
+		log.Printf("recording: diarize defaults: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var health struct {
+		Backend  string           `json:"backend"`
+		Defaults diarizeDefaults  `json:"defaults"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		log.Printf("recording: diarize defaults parse: %v", err)
+		return
+	}
+	s.diarDefaults = &health.Defaults
+	log.Printf("recording: diarize backend=%s max_audio=%ds embed=%s(%d) provides_text=%v",
+		health.Backend, health.Defaults.MaxAudioSec, health.Defaults.EmbeddingType,
+		health.Defaults.EmbeddingDim, health.Defaults.ProvidesText)
+}
+
 type diarizeResponse struct {
 	Segments          []diarizeSegment           `json:"segments"`
 	Speakers          []string                   `json:"speakers"`
@@ -205,14 +246,6 @@ func sseWrite(w http.ResponseWriter, flusher http.Flusher, event map[string]any)
 
 func round2(v float64) float64 {
 	return math.Round(v*100) / 100
-}
-
-func endsWithSentence(word string) bool {
-	if len(word) == 0 {
-		return false
-	}
-	last := word[len(word)-1]
-	return last == '.' || last == '?' || last == '!' || last == ';'
 }
 
 func randHex(n int) string {
@@ -515,7 +548,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 
 	cfg := &s.cfg.Recording
 	silenceTimeoutSamples := cfg.silenceTimeoutMs() * 16
-	maxFragmentSamples := cfg.maxFragmentSec() * 16000
+	maxFragmentSamples := cfg.maxFragmentSecEffective(s.diarDefaults) * 16000
 	softLimitSamples := cfg.softLimitSec() * 16000
 	partialIntervalSec := cfg.PartialInterval
 	if partialIntervalSec <= 0 { partialIntervalSec = 3 }
@@ -594,7 +627,7 @@ func (s *Server) processAudioChunk(session *RecordingSession, audioData []byte) 
 		fragmentComplete = true
 		maxSilMs := session.maxSilenceSamples * 1000 / 16000
 		log.Printf("recording: HARD-CUT bei %ds (längste Stille: %dms, min RMS: %.4f, silence_thresh: %.4f)",
-			cfg.maxFragmentSec(), maxSilMs, session.minRMS, cfg.silenceThresh())
+			cfg.maxFragmentSecEffective(s.diarDefaults), maxSilMs, session.minRMS, cfg.silenceThresh())
 	}
 
 	// Partial-Transkription
@@ -720,11 +753,76 @@ func (s *Server) whisperDTW(audioData []byte, fragStartSec float64) whisperTrans
 // ── Diarization ──────────────────────────────────────────────
 
 // diarizeAudio sendet Audio an openannote und gibt rohe Segmente + Embeddings zurück.
+// computeVADSegments detects speech segments in PCM16 audio using RMS energy.
+func computeVADSegments(samples []int16, sampleRate int, silenceThresh float64) []struct{ Start, End float64 } {
+	if silenceThresh <= 0 {
+		silenceThresh = 0.03
+	}
+	windowSamples := sampleRate / 4 // 250ms windows
+	var segments []struct{ Start, End float64 }
+	inSpeech := false
+	var segStart float64
+
+	for i := 0; i < len(samples); i += windowSamples {
+		end := i + windowSamples
+		if end > len(samples) {
+			end = len(samples)
+		}
+		var sumSq float64
+		for _, s := range samples[i:end] {
+			v := float64(s) / 32768.0
+			sumSq += v * v
+		}
+		rms := math.Sqrt(sumSq / float64(end-i))
+		t := float64(i) / float64(sampleRate)
+
+		if rms >= silenceThresh {
+			if !inSpeech {
+				segStart = t
+				inSpeech = true
+			}
+		} else {
+			if inSpeech {
+				segEnd := t
+				if segEnd-segStart >= 0.2 { // min 200ms speech
+					segments = append(segments, struct{ Start, End float64 }{segStart, segEnd})
+				}
+				inSpeech = false
+			}
+		}
+	}
+	if inSpeech {
+		segEnd := float64(len(samples)) / float64(sampleRate)
+		if segEnd-segStart >= 0.2 {
+			segments = append(segments, struct{ Start, End float64 }{segStart, segEnd})
+		}
+	}
+	return segments
+}
+
 func (s *Server) diarizeAudio(audioData []byte) *diarizeResponse {
 	url := strings.TrimRight(s.cfg.Recording.DiarizeAPIBase, "/") + "/diarize"
 	samples := decodeAudioToPCM16(audioData)
 	if samples == nil { return nil }
 	wavData := pcm16ToWAV(samples)
+
+	// Compute VAD segments from our own silence detection
+	vadSegs := computeVADSegments(samples, 16000, s.cfg.Recording.silenceThresh())
+	var vadJSON []byte
+	if len(vadSegs) > 0 {
+		type vadSeg struct {
+			Start float64 `json:"start"`
+			End   float64 `json:"end"`
+		}
+		segs := make([]vadSeg, len(vadSegs))
+		for i, vs := range vadSegs {
+			segs[i] = vadSeg{Start: math.Round(vs.Start*100) / 100, End: math.Round(vs.End*100) / 100}
+		}
+		vadJSON, _ = json.Marshal(segs)
+		log.Printf("recording: diarize VAD: %d segments, %.1fs speech in %.1fs audio",
+			len(segs), func() float64 { var t float64; for _, s := range segs { t += s.End - s.Start }; return t }(),
+			float64(len(samples))/16000)
+	}
 
 	var buf bytes.Buffer
 	boundary := fmt.Sprintf("----TakiBoundary%d", time.Now().UnixNano())
@@ -736,6 +834,12 @@ func (s *Server) diarizeAudio(audioData []byte) *diarizeResponse {
 	w.WriteField("min_speakers", fmt.Sprintf("%d", minSp))
 	if s.cfg.Recording.MaxSpeakers > 0 {
 		w.WriteField("max_speakers", fmt.Sprintf("%d", s.cfg.Recording.MaxSpeakers))
+	}
+	if s.cfg.Recording.MinDurationOff > 0 {
+		w.WriteField("min_duration_off", fmt.Sprintf("%.2f", s.cfg.Recording.MinDurationOff))
+	}
+	if len(vadJSON) > 0 {
+		w.WriteField("vad_segments", string(vadJSON))
 	}
 	w.WriteFile("file", "chunk.wav", bytes.NewReader(wavData))
 	w.Close()
@@ -758,6 +862,13 @@ func (s *Server) diarizeAudio(audioData []byte) *diarizeResponse {
 // Word-Timestamps für Wort-zu-Speaker-Zuordnung.
 // correctSegmentBoundaries für Satzgrenzen.
 func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fragAudio []byte) {
+	// Debug: save fragAudio as WAV for inspection
+	debugSamples := decodeAudioToPCM16(fragAudio)
+	if debugSamples != nil {
+		debugPath := fmt.Sprintf("/tmp/debug_frag_%s_%d.wav", session.ID, fragmentIdx)
+		os.WriteFile(debugPath, pcm16ToWAV(debugSamples), 0644)
+		log.Printf("recording: DEBUG saved %s (%d samples, %.1fs)", debugPath, len(debugSamples), float64(len(debugSamples))/16000)
+	}
 	result := s.diarizeAudio(fragAudio)
 	if result == nil || len(result.Segments) == 0 {
 		return
@@ -782,16 +893,17 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 	}
 	fragStart := frag.Start
 
-	// Jedes Embedding = neue Person + neues Profil (innerhalb eines pyannote-Calls)
+	// Jedes Embedding = neue Person + neues Profil (innerhalb eines Diarizer-Calls)
+	// Backends ohne Embeddings (z.B. VibeVoice): Speaker trotzdem als Person anlegen
 	labelRefs := make(map[string]SpeakerRef)
 	s.speakerMu.Lock()
 	for _, label := range result.Speakers {
 		emb := result.SpeakerEmbeddings[label]
-		if len(emb) == 0 {
-			continue
-		}
 		person := s.createSprecher()
-		pid := s.addProfileForPerson(person.ID, emb, session.ID)
+		pid := 0
+		if len(emb) > 0 {
+			pid = s.addProfileForPerson(person.ID, emb, session.ID)
+		}
 		ref := SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
 		labelRefs[label] = ref
 		log.Printf("recording: diarize-fragment %d: %s → %s/%d", fragmentIdx, label, person.Name, pid)
@@ -843,9 +955,6 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 			}
 		}
 
-		// Satzgrenzen-Korrektur
-		wordSpeakers = correctSegmentBoundaries(words, wordSpeakers)
-
 		// Kontiguierte Wortgruppen → finale Segmente mit Text
 		var finalSegs []FragSpeakerSeg
 		segStart := 0
@@ -885,53 +994,6 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 	session.mu.Unlock()
 	log.Printf("recording: diarize-fragment %d: %d Segmente, dominant=%s",
 		fragmentIdx, len(frag.Segments), frag.Speaker)
-}
-
-// ── Segment-Korrektur ────────────────────────────────────────
-
-func correctSegmentBoundaries(words []string, wordSpeakers []string) []string {
-	if len(words) < 3 {
-		return wordSpeakers
-	}
-	result := make([]string, len(wordSpeakers))
-	copy(result, wordSpeakers)
-
-	for wi := 1; wi < len(words); wi++ {
-		if result[wi] == result[wi-1] {
-			continue
-		}
-		if endsWithSentence(words[wi-1]) {
-			continue
-		}
-		prevSpeaker := result[wi-1]
-		currentSpeaker := result[wi]
-
-		// Vorwärts: Satzende suchen (max 12 Wörter)
-		bestSplit := -1
-		for j := wi; j < len(words) && j < wi+12; j++ {
-			if endsWithSentence(words[j]) {
-				bestSplit = j
-				break
-			}
-		}
-
-		if bestSplit >= wi {
-			// Nicht über Dritt-Speaker hinweg verschieben
-			wouldOverwrite := false
-			for k := wi; k <= bestSplit; k++ {
-				if result[k] != currentSpeaker && result[k] != prevSpeaker {
-					wouldOverwrite = true
-					break
-				}
-			}
-			if !wouldOverwrite {
-				for k := wi; k <= bestSplit; k++ {
-					result[k] = prevSpeaker
-				}
-			}
-		}
-	}
-	return result
 }
 
 // ── Utterances ───────────────────────────────────────────────
