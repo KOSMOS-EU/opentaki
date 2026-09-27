@@ -227,6 +227,7 @@ type diarizeSegment struct {
 	Speaker string  `json:"speaker"`
 	Start   float64 `json:"start"`
 	End     float64 `json:"end"`
+	Text    string  `json:"text,omitempty"`
 }
 
 type whisperTranscribeResult struct {
@@ -924,61 +925,83 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 		})
 	}
 
-	// Text auf Segmente verteilen per Word-Timestamps
-	words := strings.Fields(frag.Text)
-	if len(words) > 0 && len(segments) > 0 {
-		type wordWithTime struct {
-			word    string
-			absTime float64
-		}
-		wordsWT := make([]wordWithTime, len(words))
-		if len(frag.Words) >= len(words) {
-			for wi := range words {
-				wordsWT[wi] = wordWithTime{words[wi], frag.Words[wi].Start}
-			}
-		} else {
-			for wi := range words {
-				wordsWT[wi] = wordWithTime{words[wi], frag.Start + float64(wi)/float64(len(words))*frag.Duration}
-			}
-		}
+	// Backend liefert eigene Timestamps+Text (z.B. VibeVoice)?
+	// → Segmente direkt übernehmen mit Backend-Timestamps.
+	//   Der Text kommt vom Backend (mäßig für Deutsch), wird aber im
+	//   LLM-Finalpass mit Whisper-Text korrigiert.
+	backendProvidesText := s.diarDefaults != nil && s.diarDefaults.ProvidesText
+	hasSegmentText := len(result.Segments) > 0 && result.Segments[0].Text != ""
 
-		// Wort-zu-Speaker per pyannote-Segmente
-		wordSpeakers := make([]string, len(words))
-		for wi := range wordsWT {
-			absTime := wordsWT[wi].absTime
-			wordSpeakers[wi] = segments[0].Speaker
-			for _, seg := range segments {
-				if absTime >= seg.Start && absTime < seg.End {
-					wordSpeakers[wi] = seg.Speaker
-					break
-				}
-			}
-		}
-
-		// Kontiguierte Wortgruppen → finale Segmente mit Text
+	if backendProvidesText && hasSegmentText {
 		var finalSegs []FragSpeakerSeg
-		segStart := 0
-		for wi := 1; wi <= len(words); wi++ {
-			if wi < len(words) && wordSpeakers[wi] == wordSpeakers[segStart] {
-				continue
-			}
-			segText := strings.Join(words[segStart:wi], " ")
-			absStart := wordsWT[segStart].absTime
-			absEnd := frag.End
-			if wi < len(words) {
-				absEnd = wordsWT[wi].absTime
+		for _, rs := range result.Segments {
+			speakerName := "unknown"
+			if ref, ok := labelRefs[rs.Speaker]; ok {
+				speakerName = ref.String()
 			}
 			finalSegs = append(finalSegs, FragSpeakerSeg{
-				Speaker: wordSpeakers[segStart],
-				Start:   round2(absStart),
-				End:     round2(absEnd),
-				Text:    segText,
+				Speaker: speakerName,
+				Start:   round2(fragStart + rs.Start),
+				End:     round2(fragStart + rs.End),
+				Text:    rs.Text,
 			})
-			segStart = wi
 		}
 		frag.Segments = finalSegs
 	} else {
-		frag.Segments = segments
+		// Whisper-Word-Timestamps auf Diarizer-Segmente mappen (pyannote/NeMo)
+		words := strings.Fields(frag.Text)
+		if len(words) > 0 && len(segments) > 0 {
+			type wordWithTime struct {
+				word    string
+				absTime float64
+			}
+			wordsWT := make([]wordWithTime, len(words))
+			if len(frag.Words) >= len(words) {
+				for wi := range words {
+					wordsWT[wi] = wordWithTime{words[wi], frag.Words[wi].Start}
+				}
+			} else {
+				for wi := range words {
+					wordsWT[wi] = wordWithTime{words[wi], frag.Start + float64(wi)/float64(len(words))*frag.Duration}
+				}
+			}
+
+			wordSpeakers := make([]string, len(words))
+			for wi := range wordsWT {
+				absTime := wordsWT[wi].absTime
+				wordSpeakers[wi] = segments[0].Speaker
+				for _, seg := range segments {
+					if absTime >= seg.Start && absTime < seg.End {
+						wordSpeakers[wi] = seg.Speaker
+						break
+					}
+				}
+			}
+
+			var finalSegs []FragSpeakerSeg
+			segStart := 0
+			for wi := 1; wi <= len(words); wi++ {
+				if wi < len(words) && wordSpeakers[wi] == wordSpeakers[segStart] {
+					continue
+				}
+				segText := strings.Join(words[segStart:wi], " ")
+				absStart := wordsWT[segStart].absTime
+				absEnd := frag.End
+				if wi < len(words) {
+					absEnd = wordsWT[wi].absTime
+				}
+				finalSegs = append(finalSegs, FragSpeakerSeg{
+					Speaker: wordSpeakers[segStart],
+					Start:   round2(absStart),
+					End:     round2(absEnd),
+					Text:    segText,
+				})
+				segStart = wi
+			}
+			frag.Segments = finalSegs
+		} else {
+			frag.Segments = segments
+		}
 	}
 
 	// Dominanter Speaker = längstes Segment
@@ -1240,10 +1263,45 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 10. LLM-Finalpass (optional)
+	// Bei VibeVoice: LLM bekommt Diarizer-Transkript (Speaker+Timestamps) + Whisper-Text,
+	// korrigiert den Text mit Whisper-Qualität und behält Sprecher-Struktur bei.
 	finishedTranscript := fullTranscript
 	if s.cfg.Recording.doLLMFinalpass() && s.cfg.LLM.APIBase != "" {
-		prompt := fmt.Sprintf(
-			`Du erhältst ein Roh-Transkript einer Audio-Aufnahme. Korrigiere NUR:
+		backendProvidesText := s.diarDefaults != nil && s.diarDefaults.ProvidesText
+
+		var prompt string
+		if backendProvidesText {
+			// Whisper-Rohtext sammeln (ohne Speaker)
+			var whisperText strings.Builder
+			for _, frag := range session.Fragments {
+				if frag.Text != "" {
+					whisperText.WriteString(frag.Text)
+					whisperText.WriteString(" ")
+				}
+			}
+			prompt = fmt.Sprintf(
+				`Du erhältst zwei Versionen eines Transkripts derselben Audio-Aufnahme:
+
+1. DIARIZER-TRANSKRIPT (mit Sprecher-Zuordnungen, aber mäßige Textqualität):
+%s
+
+2. WHISPER-TRANSKRIPT (bessere Textqualität, aber ohne Sprecher):
+%s
+
+Deine Aufgabe:
+- Behalte die Sprecher-Zuordnung ([Sprecher_XX]: Text) aus dem Diarizer-Transkript.
+- Ersetze den Text jedes Segments durch den entsprechenden Text aus dem Whisper-Transkript.
+- Korrigiere Satzgrenzen: wenn ein Satz mitten im Wort getrennt wurde, verschiebe die Grenze ans Satzende.
+- Korrigiere Erkennungsfehler, Satzzeichen, entferne Füllwörter und Whisper-Halluzinationen.
+
+WICHTIG:
+- Füge KEINE neuen Wörter hinzu. Erfinde KEINEN Inhalt.
+- Entferne KEINE inhaltlichen Aussagen.
+- Gib NUR den korrigierten Text zurück, keine Erklärungen.
+- Format: [Sprecher_XX]: Text (eine Zeile pro Segment)`, fullTranscript, whisperText.String())
+		} else {
+			prompt = fmt.Sprintf(
+				`Du erhältst ein Roh-Transkript einer Audio-Aufnahme. Korrigiere NUR:
 - Tippfehler und Erkennungsfehler
 - Fehlende Satzzeichen (Punkte, Kommas, Frage-/Ausrufezeichen)
 - Grammatik und Rechtschreibung
@@ -1260,6 +1318,7 @@ Gib NUR den korrigierten Text zurück, keine Erklärungen.
 
 Roh-Transkript:
 %s`, fullTranscript)
+		}
 		polished := s.llmChat(prompt)
 		if polished != "" {
 			finishedTranscript = polished
