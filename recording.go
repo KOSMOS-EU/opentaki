@@ -1587,9 +1587,28 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			}
 		}(fragmentIdx, fragAudio, fragStartSec)
 
-		// 4-5. Diarization + Segmentierung
+		// 4-5. Diarization + Segmentierung → SSE speaker-Event
 		if s.cfg.Recording.DiarizeAPIBase != "" {
 			s.diarizeFragment(session, fragmentIdx, fragAudio)
+			session.mu.Lock()
+			var fragSegs []map[string]any
+			for i := range session.Fragments {
+				if session.Fragments[i].Index == fragmentIdx && len(session.Fragments[i].Segments) > 0 {
+					for _, seg := range session.Fragments[i].Segments {
+						fragSegs = append(fragSegs, map[string]any{"speaker": seg.Speaker, "text": seg.Text})
+					}
+					break
+				}
+			}
+			session.mu.Unlock()
+			if len(fragSegs) > 0 {
+				sseWrite(w, flusher, map[string]any{
+					"type":     "speaker",
+					"fragment": fragmentIdx,
+					"speaker":  session.Fragments[fragmentIdx-1].Speaker,
+					"segments": fragSegs,
+				})
+			}
 		}
 
 		// Upload Fragment-Audio async
