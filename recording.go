@@ -390,18 +390,23 @@ func (s *Server) initSpeakerStore() error {
 			name TEXT NOT NULL UNIQUE
 		);
 		CREATE TABLE IF NOT EXISTS profiles (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			person_id  INTEGER NOT NULL REFERENCES persons(id),
-			embedding  BLOB NOT NULL,
-			source     TEXT,
-			first_seen TEXT,
-			last_seen  TEXT
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			person_id      INTEGER NOT NULL REFERENCES persons(id),
+			embedding      BLOB NOT NULL,
+			embedding_type TEXT NOT NULL DEFAULT 'wespeaker',
+			embedding_dim  INTEGER NOT NULL DEFAULT 256,
+			source         TEXT,
+			first_seen     TEXT,
+			last_seen      TEXT
 		);
 		CREATE TABLE IF NOT EXISTS meta (
 			key   TEXT PRIMARY KEY,
 			value TEXT
 		);
 	`)
+	// Migration: add embedding_type/dim columns if missing (existing DBs)
+	db.Exec(`ALTER TABLE profiles ADD COLUMN embedding_type TEXT NOT NULL DEFAULT 'wespeaker'`)
+	db.Exec(`ALTER TABLE profiles ADD COLUMN embedding_dim INTEGER NOT NULL DEFAULT 256`)
 	if err != nil {
 		db.Close()
 		return fmt.Errorf("speaker schema: %w", err)
@@ -466,10 +471,14 @@ func (s *Server) renamePerson(personID int, newName string) error {
 
 func (s *Server) addProfileForPerson(personID int, embedding []float64, source string) int {
 	embBytes, _ := json.Marshal(embedding)
+	embType := "wespeaker"
+	if s.diarDefaults != nil && s.diarDefaults.EmbeddingType != "" {
+		embType = s.diarDefaults.EmbeddingType
+	}
 	now := time.Now().Format(time.RFC3339)
 	res, err := s.speakerDB.Exec(
-		`INSERT INTO profiles (person_id, embedding, source, first_seen, last_seen) VALUES (?,?,?,?,?)`,
-		personID, embBytes, source, now, now)
+		`INSERT INTO profiles (person_id, embedding, embedding_type, embedding_dim, source, first_seen, last_seen) VALUES (?,?,?,?,?,?,?)`,
+		personID, embBytes, embType, len(embedding), source, now, now)
 	if err != nil {
 		return 0
 	}
@@ -477,8 +486,10 @@ func (s *Server) addProfileForPerson(personID int, embedding []float64, source s
 	return int(id)
 }
 
-func (s *Server) loadAllProfiles() []SpeakerProfile {
-	rows, err := s.speakerDB.Query(`SELECT id, person_id, embedding, source, first_seen, last_seen FROM profiles`)
+func (s *Server) loadProfilesByType(embType string) []SpeakerProfile {
+	rows, err := s.speakerDB.Query(
+		`SELECT id, person_id, embedding, source, first_seen, last_seen FROM profiles WHERE embedding_type = ?`,
+		embType)
 	if err != nil { return nil }
 	defer rows.Close()
 	var profiles []SpeakerProfile
@@ -515,10 +526,14 @@ type matchSpeakerResult struct {
 
 func (s *Server) matchSpeaker(embedding []float64) matchSpeakerResult {
 	threshold := s.cfg.Recording.profileMatchThreshold()
+	embType := "wespeaker"
+	if s.diarDefaults != nil && s.diarDefaults.EmbeddingType != "" {
+		embType = s.diarDefaults.EmbeddingType
+	}
 	var bestPerson SpeakerPerson
 	var bestProfileID int
 	bestScore := 0.0
-	profiles := s.loadAllProfiles()
+	profiles := s.loadProfilesByType(embType)
 	personCache := map[int]SpeakerPerson{}
 	for _, profile := range profiles {
 		score := cosineSimilarity(embedding, profile.Embedding)
