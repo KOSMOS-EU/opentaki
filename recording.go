@@ -876,15 +876,7 @@ func (s *Server) diarizeAudio(audioData []byte) *diarizeResponse {
 // diarizeFragment — pyannote auf einem Fragment-Audio.
 // Jedes Embedding = neue Person + neues Profil.
 // Word-Timestamps für Wort-zu-Speaker-Zuordnung.
-// correctSegmentBoundaries für Satzgrenzen.
 func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fragAudio []byte) {
-	// Debug: save fragAudio as WAV for inspection
-	debugSamples := decodeAudioToPCM16(fragAudio)
-	if debugSamples != nil {
-		debugPath := fmt.Sprintf("/tmp/debug_frag_%s_%d.wav", session.ID, fragmentIdx)
-		os.WriteFile(debugPath, pcm16ToWAV(debugSamples), 0644)
-		log.Printf("recording: DEBUG saved %s (%d samples, %.1fs)", debugPath, len(debugSamples), float64(len(debugSamples))/16000)
-	}
 	result := s.diarizeAudio(fragAudio)
 	if result == nil || len(result.Segments) == 0 {
 		return
