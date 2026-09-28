@@ -1747,9 +1747,13 @@ func (s *Server) handleRecordingSpeakerMatrix(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	embType := "wespeaker"
-	if s.diarDefaults != nil && s.diarDefaults.EmbeddingType != "" {
+	// ?type=vibevoice oder aus Backend-Defaults oder Fallback "vibevoice"
+	embType := r.URL.Query().Get("type")
+	if embType == "" && s.diarDefaults != nil && s.diarDefaults.EmbeddingType != "" {
 		embType = s.diarDefaults.EmbeddingType
+	}
+	if embType == "" {
+		embType = "vibevoice"
 	}
 
 	// Profile laden
