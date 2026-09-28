@@ -967,12 +967,13 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 			})
 		}
 
-		// LLM-Merge pro Fragment: Whisper-Text + VibeVoice-Gerüst
+		// LLM-Anreicherung: Whisper-Text auf VibeVoice-Segmente anwenden
+		// Struktur (Speaker, Anzahl, Reihenfolge) bleibt unverändert
 		whisperText := frag.Text
 		if whisperText != "" && len(vvSegs) > 0 && s.cfg.LLM.APIBase != "" {
-			merged := s.llmMergeFragmentSpeakers(vvSegs, whisperText)
-			if merged != nil {
-				frag.Segments = merged
+			enriched := s.llmEnrichFragmentText(vvSegs, whisperText)
+			if enriched != nil {
+				frag.Segments = enriched
 			} else {
 				frag.Segments = vvSegs
 			}
@@ -1070,31 +1071,34 @@ func isHallucination(text string) bool {
 	return false
 }
 
-// ── LLM Fragment-Merge (VibeVoice-Gerüst + Whisper-Text) ────
+// ── LLM Fragment-Anreicherung (VibeVoice-Segmente + Whisper-Text) ──
 
-func (s *Server) llmMergeFragmentSpeakers(vvSegs []FragSpeakerSeg, whisperText string) []FragSpeakerSeg {
-	// VibeVoice-Gerüst als Referenz formatieren
+func (s *Server) llmEnrichFragmentText(vvSegs []FragSpeakerSeg, whisperText string) []FragSpeakerSeg {
+	// VibeVoice-Segmentierung als verbindliche Struktur
 	var geruestBuilder strings.Builder
 	for _, seg := range vvSegs {
 		fmt.Fprintf(&geruestBuilder, "[%s]: %s\n", seg.Speaker, seg.Text)
 	}
 
 	prompt := fmt.Sprintf(
-		`Du erhältst ein Diarizer-Transkript (mit Sprechern, aber schlechter Textqualität) und ein Whisper-Transkript (guter Text, ohne Sprecher).
+		`Du erhältst eine Diarizer-Segmentierung und ein Whisper-Transkript desselben Audio-Fragments.
 
-DIARIZER (Sprecher-Zuordnung, Text nur als Hint):
+DIARIZER-SEGMENTIERUNG (Struktur ist verbindlich, darf NICHT verändert werden):
 %s
-WHISPER (korrekter Text):
+WHISPER-TRANSKRIPT (bessere Textqualität, als Referenz):
 %s
-Aufgabe: Ersetze den Text jedes Diarizer-Segments durch den passenden Whisper-Text.
-- Behalte die Sprecher-Zuordnungen und die Anzahl der Segmente EXAKT bei.
-- Behalte die Reihenfolge der Segmente bei.
-- Verschiebe KEINE Sprecher-Grenzen. Ordne den Whisper-Text sequentiell den bestehenden Segmenten zu.
-- Wenn der Whisper-Text nicht exakt auf die Segmente passt, teile ihn sinnvoll an Satzgrenzen.
-- Entferne Halluzinationen und Füllwörter.
+Aufgabe: Reichere jedes Diarizer-Segment mit besserem Text an.
 
-Gib NUR die korrigierten Segmente zurück, Format: [Sprecher_XX]: Text
-Keine Erklärungen.`, geruestBuilder.String(), whisperText)
+REGELN:
+1. Die Segmentierung des Diarizers ist UNVERÄNDERLICH. Anzahl, Reihenfolge und Sprecher-Zuordnung der Segmente bleiben EXAKT wie oben.
+2. Segmente dürfen NICHT zusammengelegt, geteilt, verschoben oder umgeordnet werden.
+3. Für jedes Segment: finde im Whisper-Transkript die passende Textstelle und verwende diese als verbesserten Text.
+4. Wenn der Whisper-Text für ein Segment nicht eindeutig zuordenbar ist, behalte den Diarizer-Text.
+5. Entferne nur offensichtliche Halluzinationen (wiederholte Wörter, "Vielen Dank", "Untertitel von").
+6. Grammatik und Satzgrenzen NICHT korrigieren — auch wenn ein Satz mitten im Wort getrennt scheint.
+
+Ausgabe: Exakt so viele Zeilen wie Diarizer-Segmente, Format: [Sprecher_XX]: Text
+Keine Erklärungen, keine Zusammenfassungen.`, geruestBuilder.String(), whisperText)
 
 	result := s.llmChat(prompt)
 	if result == "" {
@@ -1137,7 +1141,7 @@ Keine Erklärungen.`, geruestBuilder.String(), whisperText)
 	if len(merged) == 0 {
 		return nil
 	}
-	log.Printf("recording: llm-merge: %d VV segments → %d merged segments", len(vvSegs), len(merged))
+	log.Printf("recording: llm-enrich: %d VV segments → %d enriched segments", len(vvSegs), len(merged))
 	return merged
 }
 
