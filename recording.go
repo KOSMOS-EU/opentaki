@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1771,11 +1772,26 @@ func (s *Server) handleRecordingSpeakerMatrix(w http.ResponseWriter, r *http.Req
 	var rows *sql.Rows
 	var err error
 	if profileFilter != "" {
-		// Spezifische Profile
-		rows, err = s.speakerDB.Query(
-			`SELECT pr.id, pr.person_id, p.name, pr.embedding
-			 FROM profiles pr JOIN persons p ON pr.person_id = p.id
-			 WHERE pr.id IN (` + profileFilter + `) ORDER BY pr.id`)
+		// Spezifische Profile — IDs sicher parsen
+		var profileIDs []int
+		for _, s := range strings.Split(profileFilter, ",") {
+			s = strings.TrimSpace(s)
+			if id, parseErr := strconv.Atoi(s); parseErr == nil && id > 0 {
+				profileIDs = append(profileIDs, id)
+			}
+		}
+		if len(profileIDs) > 0 {
+			placeholders := make([]string, len(profileIDs))
+			args := make([]any, len(profileIDs))
+			for i, id := range profileIDs {
+				placeholders[i] = "?"
+				args[i] = id
+			}
+			rows, err = s.speakerDB.Query(
+				`SELECT pr.id, pr.person_id, p.name, pr.embedding
+				 FROM profiles pr JOIN persons p ON pr.person_id = p.id
+				 WHERE pr.id IN (`+strings.Join(placeholders, ",")+`) ORDER BY pr.id`, args...)
+		}
 	} else {
 		// Alle Profile des aktuellen Typs
 		rows, err = s.speakerDB.Query(
