@@ -120,10 +120,11 @@ type RecordingFrag struct {
 }
 
 type FragSpeakerSeg struct {
-	Speaker string  `json:"speaker"`
-	Start   float64 `json:"start"`
-	End     float64 `json:"end"`
-	Text    string  `json:"text"`
+	Speaker   string  `json:"speaker"`
+	ProfileID int     `json:"profile_id,omitempty"`
+	Start     float64 `json:"start"`
+	End       float64 `json:"end"`
+	Text      string  `json:"text"`
 }
 
 type Utterance struct {
@@ -923,13 +924,16 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 	var segments []FragSpeakerSeg
 	for _, seg := range result.Segments {
 		speakerName := "unknown"
+		var profID int
 		if ref, ok := labelRefs[seg.Speaker]; ok {
 			speakerName = ref.String()
+			profID = ref.ProfileID
 		}
 		segments = append(segments, FragSpeakerSeg{
-			Speaker: speakerName,
-			Start:   round2(fragStart + seg.Start),
-			End:     round2(fragStart + seg.End),
+			Speaker:   speakerName,
+			ProfileID: profID,
+			Start:     round2(fragStart + seg.Start),
+			End:       round2(fragStart + seg.End),
 		})
 	}
 
@@ -949,12 +953,15 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 				continue
 			}
 			speakerName := "unknown"
+			var profID int
 			if ref, ok := labelRefs[rs.Speaker]; ok {
 				speakerName = ref.String()
+				profID = ref.ProfileID
 			}
 			vvSegs = append(vvSegs, FragSpeakerSeg{
-				Speaker: speakerName,
-				Start:   round2(fragStart + rs.Start),
+				Speaker:   speakerName,
+				ProfileID: profID,
+				Start:     round2(fragStart + rs.Start),
 				End:     round2(fragStart + rs.End),
 				Text:    rs.Text,
 			})
@@ -1004,6 +1011,12 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 				}
 			}
 
+			// Speaker → ProfileID aus den Diarizer-Segmenten
+			profIDmap := map[string]int{}
+			for _, seg := range segments {
+				profIDmap[seg.Speaker] = seg.ProfileID
+			}
+
 			var finalSegs []FragSpeakerSeg
 			segStart := 0
 			for wi := 1; wi <= len(words); wi++ {
@@ -1017,10 +1030,11 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 					absEnd = wordsWT[wi].absTime
 				}
 				finalSegs = append(finalSegs, FragSpeakerSeg{
-					Speaker: wordSpeakers[segStart],
-					Start:   round2(absStart),
-					End:     round2(absEnd),
-					Text:    segText,
+					Speaker:   wordSpeakers[segStart],
+					ProfileID: profIDmap[wordSpeakers[segStart]],
+					Start:     round2(absStart),
+					End:       round2(absEnd),
+					Text:      segText,
 				})
 				segStart = wi
 			}
@@ -1117,18 +1131,21 @@ Keine Erklärungen, keine Zusammenfassungen.`, geruestBuilder.String(), whisperT
 		speaker := line[1:closeBracket]
 		text := strings.TrimSpace(line[closeBracket+2:])
 
-		// Timestamps aus VibeVoice-Gerüst übernehmen (sequentiell)
+		// Timestamps + ProfileID aus VibeVoice-Gerüst übernehmen (sequentiell)
 		start, end := 0.0, 0.0
+		var profID int
 		if vvIdx < len(vvSegs) {
 			start = vvSegs[vvIdx].Start
 			end = vvSegs[vvIdx].End
+			profID = vvSegs[vvIdx].ProfileID
 			vvIdx++
 		}
 		merged = append(merged, FragSpeakerSeg{
-			Speaker: speaker,
-			Start:   start,
-			End:     end,
-			Text:    text,
+			Speaker:   speaker,
+			ProfileID: profID,
+			Start:     start,
+			End:       end,
+			Text:      text,
 		})
 	}
 	if len(merged) == 0 {
