@@ -1336,7 +1336,7 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 		session.mu.Lock()
 		for i := range session.Fragments {
 			frag := &session.Fragments[i]
-			if frag.Speaker != "" && frag.Speaker != "unknown" {
+			if (frag.Speaker != "" && frag.Speaker != "unknown") || len(frag.Segments) > 0 {
 				continue
 			}
 			startSample := int(frag.Start * 16000)
@@ -1596,7 +1596,7 @@ func (s *Server) handleRecordingChunk(w http.ResponseWriter, r *http.Request) {
 			for i := range session.Fragments {
 				if session.Fragments[i].Index == fragmentIdx && len(session.Fragments[i].Segments) > 0 {
 					for _, seg := range session.Fragments[i].Segments {
-						fragSegs = append(fragSegs, map[string]any{"speaker": seg.Speaker, "text": seg.Text})
+						fragSegs = append(fragSegs, map[string]any{"speaker": seg.Speaker, "text": seg.Text, "start": seg.Start})
 					}
 					break
 				}
