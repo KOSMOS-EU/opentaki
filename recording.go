@@ -1737,6 +1737,103 @@ func (s *Server) handleRecordingSpeakerLink(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(renamed)
 }
 
+// handleRecordingSpeakerMatrix — GET /recording/speakers/matrix?profiles=1,2,3
+// Gibt die Cosine-Similarity-Matrix für die angegebenen Profil-IDs zurück.
+// Ohne ?profiles= werden alle Profile des aktuellen Embedding-Typs verwendet.
+func (s *Server) handleRecordingSpeakerMatrix(w http.ResponseWriter, r *http.Request) {
+	if !s.chatVerifyToken(w, r) { return }
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	embType := "wespeaker"
+	if s.diarDefaults != nil && s.diarDefaults.EmbeddingType != "" {
+		embType = s.diarDefaults.EmbeddingType
+	}
+
+	// Profile laden
+	type profileEntry struct {
+		ID         int
+		PersonID   int
+		PersonName string
+		Embedding  []float64
+	}
+
+	var profiles []profileEntry
+	profileFilter := r.URL.Query().Get("profiles")
+
+	s.speakerMu.RLock()
+	var rows *sql.Rows
+	var err error
+	if profileFilter != "" {
+		// Spezifische Profile
+		rows, err = s.speakerDB.Query(
+			`SELECT pr.id, pr.person_id, p.name, pr.embedding
+			 FROM profiles pr JOIN persons p ON pr.person_id = p.id
+			 WHERE pr.id IN (` + profileFilter + `) ORDER BY pr.id`)
+	} else {
+		// Alle Profile des aktuellen Typs
+		rows, err = s.speakerDB.Query(
+			`SELECT pr.id, pr.person_id, p.name, pr.embedding
+			 FROM profiles pr JOIN persons p ON pr.person_id = p.id
+			 WHERE pr.embedding_type = ? ORDER BY pr.id`, embType)
+	}
+	s.speakerMu.RUnlock()
+
+	if err != nil {
+		writeChatError(w, 500, "db query: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pe profileEntry
+		var embBlob []byte
+		if err := rows.Scan(&pe.ID, &pe.PersonID, &pe.PersonName, &embBlob); err != nil {
+			continue
+		}
+		json.Unmarshal(embBlob, &pe.Embedding)
+		profiles = append(profiles, pe)
+	}
+
+	if len(profiles) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"profiles": []any{}, "matrix": []any{}})
+		return
+	}
+
+	// Matrix berechnen
+	type matrixEntry struct {
+		ProfileA int     `json:"a"`
+		ProfileB int     `json:"b"`
+		Cosine   float64 `json:"cosine"`
+	}
+	var matrix []matrixEntry
+	labels := make([]map[string]any, len(profiles))
+	for i, p := range profiles {
+		labels[i] = map[string]any{
+			"profile_id": p.ID,
+			"person_id":  p.PersonID,
+			"name":       p.PersonName,
+		}
+		for j := i + 1; j < len(profiles); j++ {
+			cos := cosineSimilarity(p.Embedding, profiles[j].Embedding)
+			matrix = append(matrix, matrixEntry{
+				ProfileA: p.ID,
+				ProfileB: profiles[j].ID,
+				Cosine:   math.Round(cos*1000) / 1000,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"embedding_type": embType,
+		"profiles":       labels,
+		"matrix":         matrix,
+	})
+}
+
 // ── WebDAV ───────────────────────────────────────────────────
 
 func webdavSessionDir(session *RecordingSession) string {

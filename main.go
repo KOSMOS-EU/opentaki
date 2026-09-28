@@ -4665,6 +4665,7 @@ func main() {
 	http.HandleFunc("/recording/sessions", srv.handleRecordingSessions)
 	http.HandleFunc("/recording/speakers", srv.handleRecordingSpeakers)
 	http.HandleFunc("/recording/speakers/link", srv.handleRecordingSpeakerLink)
+	http.HandleFunc("/recording/speakers/matrix", srv.handleRecordingSpeakerMatrix)
 	http.HandleFunc("/test", srv.handleTest)
 	http.HandleFunc("/stats", srv.handleStats)
 	http.HandleFunc("/tika", srv.handleHealth)
