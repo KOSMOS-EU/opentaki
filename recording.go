@@ -902,16 +902,28 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 	}
 	fragStart := frag.Start
 
-	// Jedes Embedding = neue Person + neues Profil (innerhalb eines Diarizer-Calls)
-	// Backends ohne Embeddings (z.B. VibeVoice): Speaker trotzdem als Person anlegen
+	// Speaker-Zuordnung: Embedding gegen DB matchen, bei Treffer bestehende Person
+	// verwenden, sonst neue Person + Profil anlegen.
 	labelRefs := make(map[string]SpeakerRef)
 	s.speakerMu.Lock()
 	for _, label := range result.Speakers {
 		emb := result.SpeakerEmbeddings[label]
-		person := s.createSprecher()
-		pid := 0
+		var person SpeakerPerson
+		var pid int
+
 		if len(emb) > 0 {
-			pid = s.addProfileForPerson(person.ID, emb, session.ID)
+			match := s.matchSpeaker(emb)
+			if match.Matched {
+				person = match.Person
+				pid = s.addProfileForPerson(person.ID, emb, session.ID)
+				log.Printf("recording: diarize-fragment %d: %s matched → %s (score=%.3f)",
+					fragmentIdx, label, person.Name, match.Score)
+			} else {
+				person = s.createSprecher()
+				pid = s.addProfileForPerson(person.ID, emb, session.ID)
+			}
+		} else {
+			person = s.createSprecher()
 		}
 		ref := SpeakerRef{PersonName: person.Name, PersonID: person.ID, ProfileID: pid}
 		labelRefs[label] = ref
