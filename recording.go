@@ -1399,43 +1399,13 @@ func (s *Server) handleRecordingSessionEnd(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 10. LLM-Finalpass (optional)
-	// Bei VibeVoice: LLM bekommt Diarizer-Transkript (Speaker+Timestamps) + Whisper-Text,
-	// korrigiert den Text mit Whisper-Qualität und behält Sprecher-Struktur bei.
+	// Bei VibeVoice (provides_text): LLM-Enrichment passiert pro Fragment (Schritt 4-5).
+	// Session-Ende-Finalpass nur für pyannote/NeMo-Backends.
 	finishedTranscript := fullTranscript
-	if s.cfg.Recording.doLLMFinalpass() && s.cfg.LLM.APIBase != "" {
-		backendProvidesText := s.diarDefaults != nil && s.diarDefaults.ProvidesText
-
+	backendProvidesText := s.diarDefaults != nil && s.diarDefaults.ProvidesText
+	if s.cfg.Recording.doLLMFinalpass() && s.cfg.LLM.APIBase != "" && !backendProvidesText {
 		var prompt string
-		if backendProvidesText {
-			// Whisper-Rohtext sammeln (ohne Speaker)
-			var whisperText strings.Builder
-			for _, frag := range session.Fragments {
-				if frag.Text != "" {
-					whisperText.WriteString(frag.Text)
-					whisperText.WriteString(" ")
-				}
-			}
-			prompt = fmt.Sprintf(
-				`Du erhältst zwei Versionen eines Transkripts derselben Audio-Aufnahme:
-
-1. DIARIZER-TRANSKRIPT (mit Sprecher-Zuordnungen, aber mäßige Textqualität):
-%s
-
-2. WHISPER-TRANSKRIPT (bessere Textqualität, aber ohne Sprecher):
-%s
-
-Deine Aufgabe:
-- Behalte die Sprecher-Zuordnung ([Sprecher_XX]: Text) aus dem Diarizer-Transkript.
-- Ersetze den Text jedes Segments durch den entsprechenden Text aus dem Whisper-Transkript.
-- Korrigiere Satzgrenzen: wenn ein Satz mitten im Wort getrennt wurde, verschiebe die Grenze ans Satzende.
-- Korrigiere Erkennungsfehler, Satzzeichen, entferne Füllwörter und Whisper-Halluzinationen.
-
-WICHTIG:
-- Füge KEINE neuen Wörter hinzu. Erfinde KEINEN Inhalt.
-- Entferne KEINE inhaltlichen Aussagen.
-- Gib NUR den korrigierten Text zurück, keine Erklärungen.
-- Format: [Sprecher_XX]: Text (eine Zeile pro Segment)`, fullTranscript, whisperText.String())
-		} else {
+		{
 			prompt = fmt.Sprintf(
 				`Du erhältst ein Roh-Transkript einer Audio-Aufnahme. Korrigiere NUR:
 - Tippfehler und Erkennungsfehler
