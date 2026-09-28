@@ -1698,6 +1698,11 @@ func (s *Server) handleRecordingSpeakers(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// handleRecordingSpeakerLink — PUT /recording/speakers/link
+// Bindet ein Profil an eine andere Person.
+//
+// Body: { "profile_id": 11, "person_id": 5 }
+//   → Profil #11 wird Person #5 zugeordnet.
 func (s *Server) handleRecordingSpeakerLink(w http.ResponseWriter, r *http.Request) {
 	if !s.chatVerifyToken(w, r) { return }
 	if r.Method != http.MethodPut {
@@ -1705,37 +1710,54 @@ func (s *Server) handleRecordingSpeakerLink(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var body struct {
-		SpeakerID  string `json:"speaker_id"`
-		PersonName string `json:"person_name"`
+		ProfileID int `json:"profile_id"`
+		PersonID  int `json:"person_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeChatError(w, http.StatusBadRequest, "ungültiges JSON")
 		return
 	}
-	if body.PersonName == "" {
-		writeChatError(w, http.StatusBadRequest, "person_name fehlt")
+	if body.ProfileID <= 0 || body.PersonID <= 0 {
+		writeChatError(w, http.StatusBadRequest, "profile_id und person_id erforderlich")
 		return
 	}
-	speakerName := body.SpeakerID
-	if idx := strings.Index(speakerName, "/"); idx >= 0 {
-		speakerName = speakerName[:idx]
-	}
+
 	s.speakerMu.Lock()
-	person := s.findPersonByName(speakerName)
-	if person == nil {
-		s.speakerMu.Unlock()
+	defer s.speakerMu.Unlock()
+
+	// Profil existiert?
+	var oldPersonID int
+	err := s.speakerDB.QueryRow(`SELECT person_id FROM profiles WHERE id = ?`, body.ProfileID).Scan(&oldPersonID)
+	if err != nil {
+		writeChatError(w, 404, "Profil nicht gefunden")
+		return
+	}
+
+	// Ziel-Person existiert?
+	var targetName string
+	err = s.speakerDB.QueryRow(`SELECT name FROM persons WHERE id = ?`, body.PersonID).Scan(&targetName)
+	if err != nil {
 		writeChatError(w, 404, "Person nicht gefunden")
 		return
 	}
-	if err := s.renamePerson(person.ID, body.PersonName); err != nil {
-		s.speakerMu.Unlock()
-		writeChatError(w, http.StatusConflict, err.Error())
+
+	// Profil umhängen
+	_, err = s.speakerDB.Exec(`UPDATE profiles SET person_id = ? WHERE id = ?`, body.PersonID, body.ProfileID)
+	if err != nil {
+		writeChatError(w, 500, "Profil umhängen: "+err.Error())
 		return
 	}
-	renamed := SpeakerPerson{ID: person.ID, Name: body.PersonName}
-	s.speakerMu.Unlock()
+
+	log.Printf("recording: link profile #%d → person #%d %q (was #%d)",
+		body.ProfileID, body.PersonID, targetName, oldPersonID)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(renamed)
+	json.NewEncoder(w).Encode(map[string]any{
+		"profile_id":    body.ProfileID,
+		"person_id":     body.PersonID,
+		"person_name":   targetName,
+		"old_person_id": oldPersonID,
+	})
 }
 
 // handleRecordingSpeakerMatrix — GET /recording/speakers/matrix?profiles=1,2,3
