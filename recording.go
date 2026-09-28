@@ -531,30 +531,18 @@ func (s *Server) matchSpeaker(embedding []float64) matchSpeakerResult {
 	if s.diarDefaults != nil && s.diarDefaults.EmbeddingType != "" {
 		embType = s.diarDefaults.EmbeddingType
 	}
-	var bestPerson SpeakerPerson
-	var bestProfileID int
-	bestScore := 0.0
+	// Profile sind nach ID aufsteigend sortiert (älteste zuerst).
+	// Erster Match über Threshold gewinnt — stabile Zuordnung.
 	profiles := s.loadProfilesByType(embType)
-	personCache := map[int]SpeakerPerson{}
 	for _, profile := range profiles {
 		score := cosineSimilarity(embedding, profile.Embedding)
-		if score > bestScore {
-			bestScore = score
-			bestProfileID = profile.ID
-			if p, ok := personCache[profile.PersonID]; ok {
-				bestPerson = p
-			} else {
-				var p SpeakerPerson
-				s.speakerDB.QueryRow(`SELECT id, name FROM persons WHERE id = ?`, profile.PersonID).Scan(&p.ID, &p.Name)
-				bestPerson = p
-				personCache[profile.PersonID] = p
-			}
+		if score >= threshold {
+			var person SpeakerPerson
+			s.speakerDB.QueryRow(`SELECT id, name FROM persons WHERE id = ?`, profile.PersonID).Scan(&person.ID, &person.Name)
+			return matchSpeakerResult{Person: person, ProfileID: profile.ID, Score: score, Matched: true}
 		}
 	}
-	if bestScore >= threshold {
-		return matchSpeakerResult{Person: bestPerson, ProfileID: bestProfileID, Score: bestScore, Matched: true}
-	}
-	return matchSpeakerResult{Score: bestScore, Matched: false}
+	return matchSpeakerResult{Matched: false}
 }
 
 // ── VAD ──────────────────────────────────────────────────────
@@ -915,9 +903,9 @@ func (s *Server) diarizeFragment(session *RecordingSession, fragmentIdx int, fra
 			match := s.matchSpeaker(emb)
 			if match.Matched {
 				person = match.Person
-				pid = s.addProfileForPerson(person.ID, emb, session.ID)
-				log.Printf("recording: diarize-fragment %d: %s matched → %s (score=%.3f)",
-					fragmentIdx, label, person.Name, match.Score)
+				pid = match.ProfileID
+				log.Printf("recording: diarize-fragment %d: %s matched → %s/%d (score=%.3f)",
+					fragmentIdx, label, person.Name, pid, match.Score)
 			} else {
 				person = s.createSprecher()
 				pid = s.addProfileForPerson(person.ID, emb, session.ID)
