@@ -854,12 +854,22 @@ func (s *Server) diarizeAudio(audioData []byte) *diarizeResponse {
 	if err != nil { return nil }
 	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	resp, err := s.client.Do(req)
-	if err != nil { return nil }
+	if err != nil {
+		log.Printf("recording: diarize request failed: %v", err)
+		return nil
+	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK { return nil }
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		log.Printf("recording: diarize returned %d: %s", resp.StatusCode, string(body))
+		return nil
+	}
 
 	var result diarizeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil { return nil }
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("recording: diarize response parse error: %v", err)
+		return nil
+	}
 	return &result
 }
 
