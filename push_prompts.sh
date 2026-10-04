@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/DIST"
 
 TAG="${1:-$(date +%Y%m%d-%H%M)}"
-PACKAGE_NAME="taki-prompts"
+PACKAGE_NAME="taka-prompts"
 REPO="${REPO:-opentaki}"
 OWNER="${PUSH_ORG:-KOSMOS-EU}"
 # Use GitHub token from git remote if PACKAGES_TOKEN not set
