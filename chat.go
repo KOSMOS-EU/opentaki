@@ -727,11 +727,18 @@ func (s *Server) chatTools() []toolDefinition {
 		}},
 	}
 	if s.cfg.Chat.Python.Enabled {
-		tools = append(tools, toolDefinition{Type: "function", Function: toolFunction{
-			Name:        "Python",
-			Description: "Führt ein Python-Skript in einer isolierten Umgebung aus. Erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools. Dateizugriff nur auf die im Arbeitsbereich abgelegten Dateien (relative Pfade). stdout des Skripts wird als Ergebnis geliefert. Ideal zum Rechnen mit Zahlen aus Dokumenten (Summen, Differenzen, Durchschnitte), zum Transformieren von Tabellendaten oder zum Verarbeiten von strukturierten Inhalten. print() für das Ergebnis.",
-			Parameters:  json.RawMessage(`{"type":"object","properties":{"code":{"type":"string","description":"Python-Code. Nutze open('pfad','r',encoding='utf-8') um Dateien im Arbeitsbereich zu lesen. print() für das Ergebnis."}},"required":["code"]}`),
-		}})
+		tools = append(tools,
+			toolDefinition{Type: "function", Function: toolFunction{
+				Name:        "Python",
+				Description: "Führt ein Python-Skript in einer isolierten Umgebung aus. Erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools. Dateizugriff nur auf die im Arbeitsbereich abgelegten Dateien (relative Pfade). stdout des Skripts wird als Ergebnis geliefert. Ideal zum Rechnen mit Zahlen aus Dokumenten (Summen, Differenzen, Durchschnitte), zum Transformieren von Tabellendaten oder zum Verarbeiten von strukturierten Inhalten. print() für das Ergebnis.",
+				Parameters:  json.RawMessage(`{"type":"object","properties":{"code":{"type":"string","description":"Python-Code. Nutze open('pfad','r',encoding='utf-8') um Dateien im Arbeitsbereich zu lesen. print() für das Ergebnis."}},"required":["code"]}`),
+			}},
+			toolDefinition{Type: "function", Function: toolFunction{
+				Name:        "save_tmp",
+				Description: "Speichert eine Datei aus dem geteilten Ordner in den Python-Arbeitsbereich, damit Python sie mit open() lesen kann. Lädt die Datei server-seitig (ohne Kontext-Fenster-Belegung). Nutze bei großen Dateien VOR dem Python-Call, statt den Inhalt in den Python-Code einzubetten. Der Dateiinhalt wird als Text (UTF-8) gespeichert — binäre Dateien werden übersprungen.",
+				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner (wie bei Read)"}},"required":["path"]}`),
+			}},
+		)
 	}
 	return tools
 }
@@ -1810,7 +1817,7 @@ type toolTrace struct {
 // runChatTool führt einen Tool-Call aus und liefert (tool-Result, Trace).
 // u (userWebDav) darf fehlen, wenn der Request kein User-JWT mitschickt —
 // die Such-Tools melden dann "Suche nicht verfügbar".
-func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON string) (string, toolTrace) {
+func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pythonWorkDir string) (string, toolTrace) {
 	start := time.Now()
 	trace := toolTrace{Tool: name}
 
@@ -2255,8 +2262,43 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			return "Verzeichnis erfolgreich entfernt: " + fullPath, trace
 		}
 		fallthrough
+	case "save_tmp":
+		if pythonWorkDir == "" {
+			trace.Error = "Sandbox nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Python-Arbeitsbereich ist nicht verfügbar.", trace
+		}
+		data, _, err := d.getfile(relPath)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Datei nicht lesbar: " + err.Error(), trace
+		}
+		// binäre Dateien überspringen (null byte check)
+		for i, b := range data {
+			if b == 0 {
+				if i > 8192 {
+					break
+				}
+				trace.Error = "binäre Datei"
+				trace.MS = time.Since(start).Milliseconds()
+				return "Fehler: binäre Datei — wird nicht in den Arbeitsbereich kopiert. Lade den extrahierten Text mit Read und verarbeite ihn direkt in Python.", trace
+			}
+		}
+		fileName := filepath.Base(relPath)
+		dstPath := filepath.Join(pythonWorkDir, fileName)
+		if err := os.WriteFile(dstPath, data, 0600); err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: konnte Datei im Arbeitsbereich speichern: " + err.Error(), trace
+		}
+		trace.Method = "save_tmp"
+		trace.FileSize = int64(len(data))
+		trace.MS = time.Since(start).Milliseconds()
+		return fmt.Sprintf("Datei %s (%d Bytes) in den Python-Arbeitsbereich gespeichert. Im Python-Code mit open('%s','r',encoding='utf-8') lesbar.", fileName, len(data), fileName), trace
+
 	case "Python":
-		return s.runPythonTool(args.Code, trace, start)
+		return s.runPythonTool(args.Code, pythonWorkDir, trace, start)
 	default:
 		trace.Error = "unbekanntes Tool"
 		trace.MS = time.Since(start).Milliseconds()
@@ -2286,7 +2328,7 @@ def _safe_open(path, *a, **kw):
 builtins.open = _safe_open
 `
 
-func (s *Server) runPythonTool(code string, trace toolTrace, start time.Time) (string, toolTrace) {
+func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time.Time) (string, toolTrace) {
 	cfg := s.cfg.Chat.Python
 	if !cfg.Enabled {
 		trace.Error = "nicht aktiviert"
@@ -2298,20 +2340,11 @@ func (s *Server) runPythonTool(code string, trace toolTrace, start time.Time) (s
 		trace.MS = time.Since(start).Milliseconds()
 		return "Fehler: der Python-Code darf nicht leer sein.", trace
 	}
-
-	// Temporäres Arbeitsverzeichnis
-	if err := os.MkdirAll("/tmp/taki-python", 0700); err != nil {
-		trace.Error = err.Error()
+	if workDir == "" {
+		trace.Error = "keine Sandbox"
 		trace.MS = time.Since(start).Milliseconds()
-		return "Fehler: konnte Basisverzeichnis anlegen: " + err.Error(), trace
+		return "Fehler: Python-Sandbox nicht verfügbar.", trace
 	}
-	workDir, err := os.MkdirTemp("/tmp/taki-python", "chat-")
-	if err != nil {
-		trace.Error = err.Error()
-		trace.MS = time.Since(start).Milliseconds()
-		return "Fehler: konnte Arbeitsverzeichnis anlegen: " + err.Error(), trace
-	}
-	defer os.RemoveAll(workDir)
 
 	// Sandbox-Header mit erlaubten Modulen + Workdir
 	moduleList := "'" + strings.Join(cfg.AllowedModules, "', '") + "'"
@@ -2955,6 +2988,22 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	lastRealTool := ""
 	lastRealResult := ""
 	var totalUsage *chatTokenUsage
+	// Session-weite Python-Sandbox: überlebt zwischen Tool-Calls,
+	// damit das Modell temporäre Dateien erzeugen und in späteren
+	// Calls wiederverwenden kann. Wird am Ende der Antwort gelöscht.
+	var pythonWorkDir string
+	if s.cfg.Chat.Python.Enabled {
+		if err := os.MkdirAll("/tmp/taki-python", 0700); err == nil {
+			if wd, err := os.MkdirTemp("/tmp/taki-python", "chat-"); err == nil {
+				pythonWorkDir = wd
+			}
+		}
+	}
+	defer func() {
+		if pythonWorkDir != "" {
+			os.RemoveAll(pythonWorkDir)
+		}
+	}()
 	// present_options beendet den Turn: das Modell reicht dem User
 	// konkrete, anklickbare Optionen (SSE-Event "options" + JSON-Feld
 	// "options"). Beim serverseitigen Loop-Abbruch liefert der Server
@@ -3103,7 +3152,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			}
 			var result string
 			var trace toolTrace
-			result, trace = s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments)
+			result, trace = s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments, pythonWorkDir)
 			// Duplikat-Hash über ALLE relevanten Daten: Tool-Name,
 			// normalisierte Parameter und das Ergebnis-Content. SHA-256.
 			// Gleicher Hash wie zuvor = exakt derselbe Call mit exakt dem
