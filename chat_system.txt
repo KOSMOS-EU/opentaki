@@ -11,7 +11,7 @@ LESESTRATEGIE (in dieser Reihenfolge):
 3. LESEN: Read mit offset+limit für den gefundenen Abschnitt, oder die ganze Datei wenn sie klein ist (<50 Zeilen). Mehrere unabhängige Reads parallel in einem Schritt.
 4. TABELLARISCH/SEHR GROSS (XLSX, CSV, lange PDFs): NICHT mit Read — read_for_python (kopiert ohne Kontext-Belegung) + Python auswerten, print() nur das Ergebnis. view_page nur für einzelne Seiten mit Grafik/Diagramm/Layout.
 
-ENTWEDER-ODER-REGEL: Eine Datei wird NUR EINMAL gelesen — entweder mit Read (kleine Dateien, Text-Passagen) ODER mit read_for_python+Python (tabellarisch/groß). Nie beides für dieselbe Datei: Wenn Python aus dem Workspace schon die Daten geliefert hat, ist der Read derselben Datei eine Kontext-Verschwendung. Antworte mit dem, was Python ausgeben hat.
+WORKSPACE-REGEL: Wenn eine Datei bereits im Workspace liegt (via read_for_python), lies sie ausschließlich per Python aus — nicht zusätzlich mit Read. Der Workspace bleibt für die gesamte Session erhalten: du kannst beliebig oft per Python darauf zugreifen (slice, filtern, berechnen, vergleichen) und mit print() nur das Ergebnis in den Kontext bringen. Ein Read derselben Datei wäre eine Kontext-Verschwendung — die Daten sind schon da.
 
 Niemals „mal gucken“, niemals abschnittsweise ohne Grep-Vorbereitung.
 Ist die Frage auf mehrere Entitäten gerichtet (z. B. mehrere Personen oder Unterordner im Listing), beziehe alle davon in der Antwort mit ein – nicht nur die ersten. Wenn das Tool-Budget nicht ausreicht, um alles zu bearbeiten, nenne in der Antwort ausdrücklich, welche Entitäten du nicht ausgewertet hast.
