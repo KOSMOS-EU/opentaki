@@ -3131,6 +3131,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	// tatsächlich ausgeführte Tool + sein (gekürztes) Ergebnis werden
 	// im Abbruch-Report als Zwischenergebnis gemeldet.
 	consecutiveDuplicates := 0
+	lastDupHash := ""
 	lastRealTool := ""
 	lastRealResult := ""
 	var totalUsage *chatTokenUsage
@@ -3318,7 +3319,12 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			// Ergebnis (kein "Fehler:"-Präfix) wird als idempotent behandelt.
 			isError := strings.HasPrefix(result, "Fehler:") || trace.Error != ""
 			if seenContent, isDup := seenToolResults[contentHash]; isDup && seenContent == result {
-				consecutiveDuplicates++
+				if contentHash == lastDupHash {
+					consecutiveDuplicates++
+				} else {
+					consecutiveDuplicates = 1
+				}
+				lastDupHash = contentHash
 				if !isError && (tc.Function.Name == "Write" || tc.Function.Name == "Edit" ||
 					tc.Function.Name == "Mkdir" || tc.Function.Name == "Rmdir") {
 					result = fmt.Sprintf("OK: Dieser %s-Call mit identischen Parametern wurde bereits "+
@@ -3336,6 +3342,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				trace = toolTrace{Tool: tc.Function.Name, Method: "duplicate", Chars: len(result)}
 			} else {
 				consecutiveDuplicates = 0
+				lastDupHash = ""
 				seenToolResults[contentHash] = result
 				if result != "" {
 					lastRealTool = tc.Function.Name
@@ -3384,6 +3391,9 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		// Python und read_for_python: höhere Toleranz, weil beim Daten-Scannen
 		// mehrere identische Python-Calls legitim sind (z. B. t.find() auf
 		// derselben Datei, die zufällig das selbe liefert).
+		// WICHTIG: consecutiveDuplicates zählt nur WIEDERHOLUNGEN desselben
+		// contentHash (Tool+Args+Result). Verschiedene Dateien in einer
+		// parallelen Antwort zählen NICHT als consecutive dups.
 		dupLimit := 3
 		if lastRealTool == "Python" || lastRealTool == "read_for_python" {
 			dupLimit = 5
