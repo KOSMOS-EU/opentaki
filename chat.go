@@ -101,6 +101,7 @@ const chatSystemPromptBuiltin = `Du bist ein Assistent, der mit dem Inhalt des C
 Du kannst dessen Inhalte mit den Tools List (Verzeichnisinhalt), Meta (KI-Metadaten ohne Dateilesen), Read (Dateitext, auch PDF/Office/SVG/Bilder) lesen.
 {{tools}}Pfade sind immer relativ zum Ordner (leerer Pfad = der Ordner selbst).
 Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast.
+{{python}}
 Lies nur Dateien, die für die Frage relevant sind.
 Ist die Frage auf mehrere Entitäten gerichtet (z. B. mehrere Personen oder Unterordner im Listing), beziehe alle davon in der Antwort mit ein – nicht nur die ersten. Wenn das Tool-Budget nicht ausreicht, um alles zu bearbeiten, nenne in der Antwort ausdrücklich, welche Entitäten du nicht ausgewertet hast.
 Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander in separaten Schritten.
@@ -114,15 +115,26 @@ Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.
 Wenn du denselben Tool-Call (Tool + Parameter) erneut aufrufst und ein identisches Ergebnis bekommst: ANTWORTEN mit dem, was du schon hast, oder present_options anbieten. Nicht den Call wiederholen — das führt zu einer Wiederholungsschleife, die der Server abbrechen wird.
 Wenn du in einem Turn mehrere Suchen/Reads machst: plane im Voraus, welche Dateien du brauchst, und rufe sie parallel auf (mehrere tool_calls pro Antwort). Lies nur Dateien, die für die Frage relevant sind — nicht den ganzen Ordner durchlesen.`
 
+// pythonToolPrompt liefert die System-Prompt-Zeile für das Python-Tool,
+// falls aktiviert. Leerer String wenn deaktiviert.
+func (s *Server) pythonToolPrompt() string {
+	if !s.cfg.Chat.Python.Enabled {
+		return ""
+	}
+	return "Jede Summe, Differenz, Quote oder andere Berechnung wird mit dem Python-Tool gerechnet, NIEMALS im Kopf. Das Python-Tool führt ein Skript in einer isolierten Umgebung aus (erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools). Dateizugriff nur auf Dateien im Arbeitsbereich (relative Pfade). Nutze print() für das Ergebnis.\n"
+}
+
 // renderChatSystemPrompt füllt die Platzhalter des System-Prompt-Templates
-// ({{folder}} = Ordnername, {{tools}} = Such-Tool-Beschreibung, leer im File-Chat).
-func renderChatSystemPrompt(s *Server, folder, searchTools string) string {
+// ({{folder}} = Ordnername, {{tools}} = Such-Tool-Beschreibung,
+// {{python}} = Python-Tool-Anweisung, leer wenn Python inaktiv).
+func renderChatSystemPrompt(s *Server, folder, searchTools, pythonPrompt string) string {
 	prompt := s.cfg.Chat.systemPrompt
 	if prompt == "" {
 		prompt = chatSystemPromptBuiltin
 	}
 	prompt = strings.ReplaceAll(prompt, "{{folder}}", folder)
-	return strings.ReplaceAll(prompt, "{{tools}}", searchTools)
+	prompt = strings.ReplaceAll(prompt, "{{tools}}", searchTools)
+	return strings.ReplaceAll(prompt, "{{python}}", pythonPrompt)
 }
 
 // chatSystemPromptBlankBuiltin ist das Fallback-Template für den Blank-Chat
@@ -130,7 +142,7 @@ func renderChatSystemPrompt(s *Server, folder, searchTools string) string {
 // Verzeichnis des persönlichen Spaces). Es muss inhaltlich mit
 // chat_system_blank.txt im taka-prompts-Paket übereinstimmen.
 const chatSystemPromptBlankBuiltin = `Du bist ein kreativer Assistent, der Dateien für den User in seinem persönlichen Cloud-Arbeitsbereich „{{root}}“ erstellt.
-{{tools_write}}Regeln:
+{{tools_write}}{{python}}Regeln:
 • Bei großen Ordnern: erst mit Search (type="file" für Dateien, type="dir" für Verzeichnisse) suchen, statt alles aufzulisten.
 • Lege ZUERST ein Projektverzeichnis mit Mkdir an — der User soll seine Erzeugnisse in klar getrennten Ordner-Projekten finden (Name: kurz beschreibend, kleingeschrieben, Bindestriche, z. B. "url-kurzner" oder "notizen-2026-08").
 • Neue Dateien: mit Write erstellen (vollständiger Inhalt). Pro Antwort max. EINE neue Datei — mehr auf Anweisung.
@@ -149,14 +161,16 @@ Wenn du fertig bist, antworte kurz und strukturiert (was du wo erstellt hast).`
 
 // renderChatBlankSystemPrompt füllt die Platzhalter des Blank-Chat-
 // System-Prompt-Templates ({{root}} = Workspace-Verzeichnis,
-// {{tools_write}} = Write-Tool-Beschreibung, {{options_rule}} = leer).
-func renderChatBlankSystemPrompt(s *Server, root, writeTools string) string {
+// {{tools_write}} = Write-Tool-Beschreibung, {{python}} = Python-Tool-Anweisung,
+// {{options_rule}} = leer).
+func renderChatBlankSystemPrompt(s *Server, root, writeTools, pythonPrompt string) string {
 	prompt := s.cfg.Chat.blankSystemPrompt
 	if prompt == "" {
 		prompt = chatSystemPromptBlankBuiltin
 	}
 	prompt = strings.ReplaceAll(prompt, "{{root}}", root)
 	prompt = strings.ReplaceAll(prompt, "{{tools_write}}", writeTools)
+	prompt = strings.ReplaceAll(prompt, "{{python}}", pythonPrompt)
 	return strings.ReplaceAll(prompt, "{{options_rule}}", "")
 }
 
@@ -2251,7 +2265,7 @@ _allowed = set(%q)
 _orig_import = builtins.__import__
 def _safe_import(name, *a, **kw):
     if name.split('.')[0] not in _allowed:
-        raise ImportError("Module '%s' is not allowed" % name)
+        raise ImportError("Module " + name + " is not allowed")
     return _orig_import(name, *a, **kw)
 builtins.__import__ = _safe_import
 _safe_dir = '/tmp/taki-python/%s'
@@ -2260,7 +2274,7 @@ _orig_open = builtins.open
 def _safe_open(path, *a, **kw):
     p = os.path.normpath(os.path.join(_safe_dir, str(path)))
     if not p.startswith(_safe_dir):
-        raise PermissionError("Cannot open '%s'" % path)
+        raise PermissionError("Cannot open " + str(path))
     return _orig_open(p, *a, **kw)
 builtins.open = _safe_open
 `
@@ -2866,10 +2880,11 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	searchAvailable := u != nil && u.scopeID != ""
 
 	// System-Prompt (serverseitig, deterministisch)
+	pythonPrompt := s.pythonToolPrompt()
 	var sysPrompt string
 	if isBlankChat {
 		writeTools := "Du kannst Dateien in deinem Arbeitsbereich mit den Tools Mkdir (Verzeichnis anlegen), Write (Datei erstellen/überschreiben), Edit (kleine Änderungen per Unified-Diff) und Rmdir (leeres Verzeichnis entfernen) lesen und schreiben. "
-		sysPrompt = renderChatBlankSystemPrompt(s, "workspace", writeTools)
+		sysPrompt = renderChatBlankSystemPrompt(s, "workspace", writeTools, pythonPrompt)
 	} else {
 		folder := req.Context.FolderName
 		if folder == "" {
@@ -2889,7 +2904,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				"ohne Wildcard muss stimmen, mit Wildcard (*wert*) matcht er als Substring im " +
 				"gesamten Feldwert. Mehrwort-Begriffe in extra gehören in Anführungszeichen. "
 		}
-		sysPrompt = renderChatSystemPrompt(s, folder, searchTools)
+		sysPrompt = renderChatSystemPrompt(s, folder, searchTools, pythonPrompt)
 	}
 
 	messages := make([]chatToolMessage, 0, len(req.Messages)+4)

@@ -31,7 +31,7 @@ func TestRenderChatSystemPrompt(t *testing.T) {
 	// Folder-Chat: beide Platzhalter gefüllt
 	srv := &Server{cfg: Config{}}
 	srv.cfg.Chat.systemPrompt = chatSystemPromptBuiltin
-	got := renderChatSystemPrompt(srv, folder, searchTools)
+	got := renderChatSystemPrompt(srv, folder, searchTools, "")
 	if strings.Contains(got, "{{") {
 		t.Errorf("unresolved placeholder in rendered prompt")
 	}
@@ -44,7 +44,7 @@ func TestRenderChatSystemPrompt(t *testing.T) {
 
 	// File-Chat: tools leer → kein leerer Satzbruch
 	srv.cfg.Chat.systemPrompt = chatSystemPromptBuiltin
-	got = renderChatSystemPrompt(srv, folder, "")
+	got = renderChatSystemPrompt(srv, folder, "", "")
 	if strings.Contains(got, "{{") {
 		t.Errorf("unresolved placeholder in rendered prompt (file chat)")
 	}
@@ -54,7 +54,7 @@ func TestRenderChatSystemPrompt(t *testing.T) {
 
 	// Fallback: systemPrompt nicht geladen → Built-in
 	srv = &Server{cfg: Config{}}
-	got = renderChatSystemPrompt(srv, folder, searchTools)
+	got = renderChatSystemPrompt(srv, folder, searchTools, "")
 	if strings.Contains(got, "{{") {
 		t.Errorf("fallback render has unresolved placeholder")
 	}
@@ -77,7 +77,7 @@ func TestRenderChatBlankSystemPrompt(t *testing.T) {
 	// Blank-Chat: beide Platzhalter gefüllt
 	srv := &Server{cfg: Config{}}
 	srv.cfg.Chat.blankSystemPrompt = chatSystemPromptBlankBuiltin
-	got := renderChatBlankSystemPrompt(srv, root, writeTools)
+	got := renderChatBlankSystemPrompt(srv, root, writeTools, "")
 	if strings.Contains(got, "{{") {
 		t.Errorf("unresolved placeholder in rendered blank prompt")
 	}
@@ -90,7 +90,7 @@ func TestRenderChatBlankSystemPrompt(t *testing.T) {
 
 	// Fallback: blankSystemPrompt nicht geladen → Built-in
 	srv = &Server{cfg: Config{}}
-	got = renderChatBlankSystemPrompt(srv, root, writeTools)
+	got = renderChatBlankSystemPrompt(srv, root, writeTools, "")
 	if strings.Contains(got, "{{") {
 		t.Errorf("fallback render has unresolved placeholder")
 	}
