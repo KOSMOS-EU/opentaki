@@ -102,9 +102,15 @@ Du kannst dessen Inhalte mit den Tools List (Verzeichnisinhalt), Meta (KI-Metada
 {{tools}}Pfade sind immer relativ zum Ordner (leerer Pfad = der Ordner selbst).
 Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast.
 {{python}}
-DEIN KONTEXT-FENSTER IST BEGRENZT: jeder Read füllt es, und bei Überlauf bricht der Server die Antwort ab. Lies NUR Dateien, die für die Frage relevant sind — nie abschnittsweise, nie „mal gucken“.
-Tabellarische oder sehr große Dateien (XLSX, lange Tabellen-PDFs, große CSV/TXT) NICHT mit Read in Abschnitten lesen: read_for_python (kopiert ohne Kontext-Belegung) und mit Python auswerten, print() nur das Ergebnis. view_page nur für einzelne Seiten mit Grafik/Diagramm/Layout.
-Bevor du mehrere Dateien liest: erst per List/Search/Meta planen, welche wirklich nötig sind, dann gezielt und parallel lesen.
+DEIN KONTEXT-FENSTER IST BEGRENZT: jeder Read füllt es, und bei Überlauf bricht der Server die Antwort ab.
+
+LESESTRATEGIE (in dieser Reihenfolge):
+1. ORIENTIEREN: List + Meta (ohne Dateilesen) zeigt, welche Dateien relevant sind.
+2. LOKALISIEREN: Bevor du eine Datei liest, die größer als ~100 Zeilen sein könnte, such ERST mit Grep/Search nach dem spezifischen Inhalt, den du brauchst (Begriffe, Zahlen, Tabellenkopf). Grep gibt dir Zeilennummer + Kontext — mit offset/limit liest du dann NUR diesen Abschnitt mit Read. Nie blind die ganze Datei lesen, wenn du nur eine Passage suchst.
+3. LESEN: Read mit offset+limit für den gefundenen Abschnitt, oder die ganze Datei wenn sie klein ist (<50 Zeilen). Mehrere unabhängige Reads parallel in einem Schritt.
+4. TABELLARISCH/SEHR GROSS (XLSX, CSV, lange PDFs): NICHT mit Read — read_for_python (kopiert ohne Kontext-Belegung) + Python auswerten, print() nur das Ergebnis. view_page nur für einzelne Seiten mit Grafik/Diagramm/Layout.
+
+Niemals „mal gucken“, niemals abschnittsweise ohne Grep-Vorbereitung.
 Ist die Frage auf mehrere Entitäten gerichtet (z. B. mehrere Personen oder Unterordner im Listing), beziehe alle davon in der Antwort mit ein – nicht nur die ersten. Wenn das Tool-Budget nicht ausreicht, um alles zu bearbeiten, nenne in der Antwort ausdrücklich, welche Entitäten du nicht ausgewertet hast.
 Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander in separaten Schritten.
 Zählung in den Ergebnissen: Jedes Suchergebnis und jedes Listing endet mit „found: X, limit: Y“. Bei Suchen ist found die Gesamtzahl aller Treffer, bei Listings die Zahl der gezeigten Einträge (limit = max. Einträge). Ist das Ergebnis NICHT als unvollständig markiert, hast du die vollständige Menge — lies dann die relevanten Dateien (Read oder Meta) oder antworte; such nicht endlos weiter. Ist found > limit oder das Ergebnis als unvollständig markiert, iteriere nicht blind weiter — beende deinen Turn mit dem Tool present_options und biete an: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), (2) limit erhöhen (limit-Parameter der Suche, max. 100) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern), jeweils als vollständige User-Anweisung. Nenne in der Antwort kurz den gefundenen Umfang und zeige eine Beispiel-Auswahl aus dem, was du schon gesehen hast (max. 10 Einträge), damit der User echte Begriffe und Namen sehen kann.
@@ -122,7 +128,7 @@ func (s *Server) pythonToolPrompt() string {
 	if !s.cfg.Chat.Python.Enabled {
 		return ""
 	}
-	return "Jede Summe, Differenz, Quote oder andere Berechnung wird mit dem Python-Tool gerechnet, NIEMALS im Kopf. Das Python-Tool führt ein Skript in einer isolierten Umgebung aus (erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools, zipfile, xml, html, io, struct, string, unicodedata, decimal). Dateizugriff nur auf Dateien im Arbeitsbereich (relative Pfade). Nutze print() für das Ergebnis.\n"
+	return "Jede Summe, Differenz, Quote oder andere Berechnung wird mit dem Python-Tool gerechnet, NIEMALS im Kopf. Das Python-Tool führt ein Skript in einer isolierten Umgebung aus (erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools, zipfile, xml, html, io, struct, string, unicodedata, decimal, zlib, pathlib). Dateizugriff nur auf Dateien im Arbeitsbereich (relative Pfade) — der Workspace, in den read_for_python die Quelldateien kopiert hat. Nutze diesen Workspace für die tool-übergreifende Auswertung: Dateien mit read_for_python hineinkopieren, dann per Python mehrere Dateien zusammen auswerten (z. B. XLSX-Tabellen parsen, PDF-Texte vergleichen, Summen über mehrere Dateien bilden). print() nur das Ergebnis.\n"
 }
 
 // renderChatSystemPrompt füllt die Platzhalter des System-Prompt-Templates
@@ -252,6 +258,7 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 			"collections", "itertools", "functools",
 			"zipfile", "xml", "html", "io", "struct",
 			"string", "unicodedata", "decimal",
+			"zlib", "pathlib",
 		}
 	}
 	// EditableExtensions: Default-List für den Create-Mode
