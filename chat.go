@@ -2268,14 +2268,14 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 
 const pythonSandboxHeader = `
 import sys, builtins, os
-_allowed = set(%q)
+_allowed = set(%s)
 _orig_import = builtins.__import__
 def _safe_import(name, *a, **kw):
     if name.split('.')[0] not in _allowed:
         raise ImportError("Module " + name + " is not allowed")
     return _orig_import(name, *a, **kw)
 builtins.__import__ = _safe_import
-_safe_dir = '/tmp/taki-python/%s'
+_safe_dir = %q
 os.chdir(_safe_dir)
 _orig_open = builtins.open
 def _safe_open(path, *a, **kw):
@@ -2314,7 +2314,8 @@ func (s *Server) runPythonTool(code string, trace toolTrace, start time.Time) (s
 	defer os.RemoveAll(workDir)
 
 	// Sandbox-Header mit erlaubten Modulen + Workdir
-	header := fmt.Sprintf(pythonSandboxHeader, cfg.AllowedModules, workDir)
+	moduleList := "'" + strings.Join(cfg.AllowedModules, "', '") + "'"
+	header := fmt.Sprintf(pythonSandboxHeader, "["+moduleList+"]", workDir)
 	script := header + "\n" + code
 	scriptPath := filepath.Join(workDir, "script.py")
 	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
