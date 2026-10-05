@@ -2394,13 +2394,15 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 
 const pythonSandboxHeader = `
 import sys, builtins, os
-# C-Implementierungen, die standard Python-Module intern importieren:
-_builtin_extras = {'_io', '_csv', '_json', '_stat', '_collections', '_functools', '_string', '_struct', '_random', '_sre', '_locale', '_codecs', '_codecs_cn', '_codecs_hk', '_codecs_jp', '_codecs_kr', '_codecs_tw', '_heapq', '_bisect', '_datetime', '_decimal', '_hashlib', '_math', '_operator', '_pickle', '_posixsubprocess', '_pyio', '_scproxy', '_socket', '_sqlite3', '_ssl', '_statistics', '_symtable', '_thread', '_warnings', '_weakref', '_winapi', '_zoneinfo', '_bz2', '_lzma', '_zstd', 'pyexpat', '_elementtree', 'encodings', 'codecs', 'io', 'abc', 'builtins', 'binascii', 'contextlib', 'copyreg', 'enum', 'functools', 'itertools', 'keyword', 'linecache', 'locale', 'numbers', 'operator', 'reprlib', 'select', 'sys', 'time', 'traceback', 'types', 'warnings', 'weakref', 'winreg', 'zipimport'}
+# Alle erlaubten Module vorab importieren (lädt interne Abhängigkeiten
+# wie _io, binascii, enum etc. in sys.modules, bevor der Hook aktiv wird).
+# Danach braucht der Hook nur die eigentlichen Modulnamen zu prüfen.
+%s
 _allowed = set(%s)
 _orig_import = builtins.__import__
 def _safe_import(name, *a, **kw):
     top = name.split('.')[0]
-    if top not in _allowed and top not in _builtin_extras:
+    if top not in _allowed:
         raise ImportError("Module " + name + " is not allowed")
     return _orig_import(name, *a, **kw)
 builtins.__import__ = _safe_import
@@ -2435,7 +2437,9 @@ func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time
 
 	// Sandbox-Header mit erlaubten Modulen + Workdir
 	moduleList := "'" + strings.Join(cfg.AllowedModules, "', '") + "'"
-	header := fmt.Sprintf(pythonSandboxHeader, "["+moduleList+"]", workDir)
+	// Vorab-Imports für alle erlaubten Module (lädt interne Abhängigkeiten)
+	preloadImports := "import " + strings.Join(cfg.AllowedModules, ", ")
+	header := fmt.Sprintf(pythonSandboxHeader, "["+moduleList+"]", preloadImports, workDir)
 	script := header + "\n" + code
 	scriptPath := filepath.Join(workDir, "script.py")
 	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
