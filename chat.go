@@ -2293,6 +2293,11 @@ func (s *Server) runPythonTool(code string, trace toolTrace, start time.Time) (s
 	}
 
 	// Temporäres Arbeitsverzeichnis
+	if err := os.MkdirAll("/tmp/taki-python", 0700); err != nil {
+		trace.Error = err.Error()
+		trace.MS = time.Since(start).Milliseconds()
+		return "Fehler: konnte Basisverzeichnis anlegen: " + err.Error(), trace
+	}
 	workDir, err := os.MkdirTemp("/tmp/taki-python", "chat-")
 	if err != nil {
 		trace.Error = err.Error()
