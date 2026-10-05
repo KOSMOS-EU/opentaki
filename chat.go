@@ -2422,6 +2422,13 @@ def _safe_open(path, *a, **kw):
         raise PermissionError("Cannot open " + str(path))
     return _orig_open(p, *a, **kw)
 builtins.open = _safe_open
+# Alpine Python hat cp437-Codec nicht; zipfile-Patch erzwingt utf-8
+import zipfile
+_orig_zf_init = zipfile.ZipFile.__init__
+def _zf_init(self, *a, **kw):
+    kw.setdefault('metadata_encoding', 'utf-8')
+    _orig_zf_init(self, *a, **kw)
+zipfile.ZipFile.__init__ = _zf_init
 `
 
 func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time.Time) (string, toolTrace) {
