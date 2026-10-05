@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -30,7 +31,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -69,6 +72,7 @@ type ChatConfig struct {
 	Heartbeat         ChatHeartbeatConfig `yaml:"heartbeat"`
 	ChatToken         ChatTokenConfig     `yaml:"chat_token"`
 	Write             ChatWriteConfig     `yaml:"write"`
+	Python            ChatPythonConfig    `yaml:"python"`
 	// runtime: lowercase-Set aus EditableExtensions
 	editableSet map[string]bool
 }
@@ -79,6 +83,15 @@ type ChatConfig struct {
 type ChatWriteConfig struct {
 	MaxFileBytes int `yaml:"max_file_bytes"` // default 1 MB
 	MaxDepth     int `yaml:"max_depth"`      // default 3 (Verzeichnisebenen unter der Root)
+}
+
+// ChatPythonConfig steuert das Python-Tool (yaml: chat.python:).
+type ChatPythonConfig struct {
+	Enabled    bool   `yaml:"enabled"`      // default false
+	Timeout    int    `yaml:"timeout"`      // default 30 (Sekunden)
+	MaxCPUs    int    `yaml:"max_cpus"`     // default 1
+	MaxMemory  int    `yaml:"max_memory"`   // default 256 (MB)
+	AllowedModules []string `yaml:"allowed_modules"` // default: re,math,statistics,csv,json,collections,itertools,functools
 }
 
 // chatSystemPromptBuiltin ist das Fallback-Template für den Chat-System-Prompt,
@@ -208,6 +221,21 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 	}
 	if c.Write.MaxDepth < 1 {
 		c.Write.MaxDepth = 3
+	}
+	if c.Python.Timeout < 1 {
+		c.Python.Timeout = 30
+	}
+	if c.Python.MaxCPUs < 1 {
+		c.Python.MaxCPUs = 1
+	}
+	if c.Python.MaxMemory < 1 {
+		c.Python.MaxMemory = 256
+	}
+	if len(c.Python.AllowedModules) == 0 {
+		c.Python.AllowedModules = []string{
+			"re", "math", "statistics", "csv", "json",
+			"collections", "itertools", "functools",
+		}
 	}
 	// EditableExtensions: Default-List für den Create-Mode
 	if len(c.EditableExtensions) == 0 {
@@ -652,7 +680,7 @@ type toolFunction struct {
 }
 
 func (s *Server) chatTools() []toolDefinition {
-	return []toolDefinition{
+	tools := []toolDefinition{
 		{Type: "function", Function: toolFunction{
 			Name:        "List",
 			Description: "Listet den Inhalt eines Verzeichnisses im geteilten Ordner REKURSIV (begrenzt durch Tiefe und Eintragszahl, Kürzungen werden angegeben): Unterverzeichnisse (mit /) und Dateien, jeweils mit relativem Pfad (direkt als Read-Pfad nutzbar), Datum (JJJJ-MM-TT) und bei Dateien der Größe. Liefert KEINE Dateiinhalte. Leerer Pfad = der geteilte Ordner selbst.",
@@ -684,6 +712,14 @@ func (s *Server) chatTools() []toolDefinition {
 			Parameters: json.RawMessage(`{"type":"object","properties":{"options":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5,"description":"1-5 kurze Optionen, jede eine vollständige User-Anweisung, z. B. \"Nur Rechnungen aus 2025 auswerten\""}},"required":["options"]}`),
 		}},
 	}
+	if s.cfg.Chat.Python.Enabled {
+		tools = append(tools, toolDefinition{Type: "function", Function: toolFunction{
+			Name:        "Python",
+			Description: "Führt ein Python-Skript in einer isolierten Umgebung aus. Erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools. Dateizugriff nur auf die im Arbeitsbereich abgelegten Dateien (relative Pfade). stdout des Skripts wird als Ergebnis geliefert. Ideal zum Rechnen mit Zahlen aus Dokumenten (Summen, Differenzen, Durchschnitte), zum Transformieren von Tabellendaten oder zum Verarbeiten von strukturierten Inhalten. print() für das Ergebnis.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"code":{"type":"string","description":"Python-Code. Nutze open('pfad','r',encoding='utf-8') um Dateien im Arbeitsbereich zu lesen. print() für das Ergebnis."}},"required":["code"]}`),
+		}})
+	}
+	return tools
 }
 
 // chatWriteTools: die Write-Tools des Blank-Chats (Write, Mkdir, Rmdir, Edit).
@@ -1766,6 +1802,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 		Content string `json:"content"`
 		Type    string `json:"type"`
 		Patch   string `json:"patch"`
+		Code    string `json:"code"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
@@ -2197,11 +2234,138 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON strin
 			return "Verzeichnis erfolgreich entfernt: " + fullPath, trace
 		}
 		fallthrough
+	case "Python":
+		return s.runPythonTool(args.Code, trace, start)
 	default:
 		trace.Error = "unbekanntes Tool"
 		trace.MS = time.Since(start).Milliseconds()
 		return "Fehler: unbekanntes Tool: " + name, trace
 	}
+}
+
+// ── Python-Tool (Sandboxed exec) ─────────────────────────────
+
+const pythonSandboxHeader = `
+import sys, builtins, os
+_allowed = set(%q)
+_orig_import = builtins.__import__
+def _safe_import(name, *a, **kw):
+    if name.split('.')[0] not in _allowed:
+        raise ImportError("Module '%s' is not allowed" % name)
+    return _orig_import(name, *a, **kw)
+builtins.__import__ = _safe_import
+_safe_dir = '/tmp/taki-python/%s'
+os.chdir(_safe_dir)
+_orig_open = builtins.open
+def _safe_open(path, *a, **kw):
+    p = os.path.normpath(os.path.join(_safe_dir, str(path)))
+    if not p.startswith(_safe_dir):
+        raise PermissionError("Cannot open '%s'" % path)
+    return _orig_open(p, *a, **kw)
+builtins.open = _safe_open
+`
+
+func (s *Server) runPythonTool(code string, trace toolTrace, start time.Time) (string, toolTrace) {
+	cfg := s.cfg.Chat.Python
+	if !cfg.Enabled {
+		trace.Error = "nicht aktiviert"
+		trace.MS = time.Since(start).Milliseconds()
+		return "Fehler: das Python-Tool ist nicht aktiviert (chat.python.enabled=false).", trace
+	}
+	if strings.TrimSpace(code) == "" {
+		trace.Error = "leerer Code"
+		trace.MS = time.Since(start).Milliseconds()
+		return "Fehler: der Python-Code darf nicht leer sein.", trace
+	}
+
+	// Temporäres Arbeitsverzeichnis
+	workDir, err := os.MkdirTemp("/tmp/taki-python", "chat-")
+	if err != nil {
+		trace.Error = err.Error()
+		trace.MS = time.Since(start).Milliseconds()
+		return "Fehler: konnte Arbeitsverzeichnis anlegen: " + err.Error(), trace
+	}
+	defer os.RemoveAll(workDir)
+
+	// Sandbox-Header mit erlaubten Modulen + Workdir
+	header := fmt.Sprintf(pythonSandboxHeader, cfg.AllowedModules, workDir)
+	script := header + "\n" + code
+	scriptPath := filepath.Join(workDir, "script.py")
+	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
+		trace.Error = err.Error()
+		trace.MS = time.Since(start).Milliseconds()
+		return "Fehler: konnte Script schreiben: " + err.Error(), trace
+	}
+
+	// Timeout-Context
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
+	defer cancel()
+
+	// CPU-Limit via taskset (1. Core) + nice
+	var fullArgs []string
+	if cfg.MaxCPUs == 1 {
+		fullArgs = []string{"taskset", "-c", "0", "nice", "-n", "19", "python3", "-I", scriptPath}
+	} else {
+		cores := make([]string, cfg.MaxCPUs)
+		for i := range cores {
+			cores[i] = strconv.Itoa(i)
+		}
+		fullArgs = append([]string{"taskset", "-c", strings.Join(cores, ","), "python3", "-I"}, scriptPath)
+	}
+	cmd := exec.CommandContext(ctx, fullArgs[0], fullArgs[1:]...)
+	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(), "PYTHONDONTWRITEBYTECODE=1", "PYTHONNOUSERSITE=1")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+	elapsed := time.Since(start).Milliseconds()
+	trace.MS = elapsed
+	trace.Method = "python"
+	trace.Chars = stdout.Len()
+
+	stdoutStr := stdout.String()
+	stderrStr := stderr.String()
+
+	// Timeout?
+	if ctx.Err() == context.DeadlineExceeded {
+		trace.Error = "timeout"
+		trace.Truncated = true
+		result := fmt.Sprintf("Fehler: Python-Script überschritten die Zeitlimit von %ds.\nStdout so far:\n%s", cfg.Timeout, stdoutStr)
+		if stderrStr != "" {
+			result += "\nStderr:\n" + stderrStr
+		}
+		return result, trace
+	}
+
+	if runErr != nil {
+		trace.Error = runErr.Error()
+		result := "Fehler: Python-Skript fehlgeschlagen: " + runErr.Error()
+		if stderrStr != "" {
+			result += "\nStderr:\n" + stderrStr
+		}
+		if stdoutStr != "" {
+			result += "\nStdout:\n" + stdoutStr
+		}
+		return result, trace
+	}
+
+	// stdout-Limit (verhindert Kontext-Explosion)
+	const maxPythonOutput = 100000
+	if len(stdoutStr) > maxPythonOutput {
+		stdoutStr = stdoutStr[:maxPythonOutput] + "\n… (ausgegeben, mehr als " + strconv.Itoa(maxPythonOutput) + " Zeichen)"
+		trace.Truncated = true
+		trace.Chars = maxPythonOutput
+	}
+
+	if stdoutStr == "" && stderrStr != "" {
+		trace.Error = "nur Stderr"
+		return "Fehler: kein stdout, aber Stderr:\n" + stderrStr, trace
+	}
+
+	return stdoutStr, trace
 }
 
 // looksLikeImage: Magic-Bytes-Check für den Fall, dass Content-Type fehlt.
