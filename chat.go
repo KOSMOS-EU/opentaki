@@ -103,7 +103,7 @@ Du kannst dessen Inhalte mit den Tools List (Verzeichnisinhalt), Meta (KI-Metada
 Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast.
 {{python}}
 DEIN KONTEXT-FENSTER IST BEGRENZT: jeder Read füllt es, und bei Überlauf bricht der Server die Antwort ab. Lies NUR Dateien, die für die Frage relevant sind — nie abschnittsweise, nie „mal gucken“.
-Tabellarische oder sehr große Dateien (XLSX, lange Tabellen-PDFs, große CSV/TXT) NICHT mit Read in Abschnitten lesen: save_tmp (kopiert ohne Kontext-Belegung) und mit Python auswerten, print() nur das Ergebnis. view_page nur für einzelne Seiten mit Grafik/Diagramm/Layout.
+Tabellarische oder sehr große Dateien (XLSX, lange Tabellen-PDFs, große CSV/TXT) NICHT mit Read in Abschnitten lesen: read_for_python (kopiert ohne Kontext-Belegung) und mit Python auswerten, print() nur das Ergebnis. view_page nur für einzelne Seiten mit Grafik/Diagramm/Layout.
 Bevor du mehrere Dateien liest: erst per List/Search/Meta planen, welche wirklich nötig sind, dann gezielt und parallel lesen.
 Ist die Frage auf mehrere Entitäten gerichtet (z. B. mehrere Personen oder Unterordner im Listing), beziehe alle davon in der Antwort mit ein – nicht nur die ersten. Wenn das Tool-Budget nicht ausreicht, um alles zu bearbeiten, nenne in der Antwort ausdrücklich, welche Entitäten du nicht ausgewertet hast.
 Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander in separaten Schritten.
@@ -737,13 +737,13 @@ func (s *Server) chatTools() []toolDefinition {
 				Parameters:  json.RawMessage(`{"type":"object","properties":{"code":{"type":"string","description":"Python-Code. Nutze open('pfad','r',encoding='utf-8') um Dateien im Arbeitsbereich zu lesen. print() für das Ergebnis."}},"required":["code"]}`),
 			}},
 			toolDefinition{Type: "function", Function: toolFunction{
-				Name:        "save_tmp",
+				Name:        "read_for_python",
 				Description: "Speichert eine Datei aus dem geteilten Ordner in den Python-Arbeitsbereich, damit Python sie mit open() lesen kann. Lädt die Datei server-seitig (ohne Kontext-Fenster-Belegung). Nutze bei großen Dateien VOR dem Python-Call, statt den Inhalt in den Python-Code einzubetten. convert: \"auto\" (Default) — Textdateien unverändert, PDF/DOCX/XLSX/PPTX werden mit pdftotext -layout bzw. pandoc nach Text gewandelt; \"text\" — wie auto, aber Fehler wenn keine Extraktion möglich; \"none\" — rohe Bytes kopieren (nur für binäre Bibliotheks-Zugriffe).",
 				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner (wie bei Read)"},"convert":{"type":"string","enum":["auto","text","none"],"description":"auto (Default): Textdateien unverändert, Office/PDF nach Text. text: wie auto, aber Fehler wenn keine Extraktion. none: rohe Bytes, keine Wandlung."}},"required":["path"]}`),
 			}},
 			toolDefinition{Type: "function", Function: toolFunction{
 				Name:        "view_page",
-				Description: "Rendert eine einzelne Seite einer PDF aus dem geteilten Ordner und zeigt sie dir als Bild. Nutze es nur für Abbildungen, Diagramme, Tabellen mit Layout oder andere visuelle Inhalte, die im extrahierten Text nicht erkennbar sind. Für Text und Zahlen nimm save_tmp und Python. Eine Seite pro Aufruf; maximal 1500 Seiten insgesamt pro Antwort. Abgelesene Zahlen kennzeichnest du als abgelesen.",
+				Description: "Rendert eine einzelne Seite einer PDF aus dem geteilten Ordner und zeigt sie dir als Bild. Nutze es nur für Abbildungen, Diagramme, Tabellen mit Layout oder andere visuelle Inhalte, die im extrahierten Text nicht erkennbar sind. Für Text und Zahlen nimm read_for_python und Python. Eine Seite pro Aufruf; maximal 1500 Seiten insgesamt pro Antwort. Abgelesene Zahlen kennzeichnest du als abgelesen.",
 				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der PDF relativ zum geteilten Ordner (wie bei Read)"},"page":{"type":"integer","minimum":1,"description":"Seitennummer (1-basiert)"}},"required":["path","page"]}`),
 			}},
 		)
@@ -2272,7 +2272,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 			return "Verzeichnis erfolgreich entfernt: " + fullPath, trace
 		}
 		fallthrough
-	case "save_tmp":
+	case "read_for_python":
 		if pythonWorkDir == "" {
 			trace.Error = "Sandbox nicht verfügbar"
 			trace.MS = time.Since(start).Milliseconds()
@@ -2336,7 +2336,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: konnte Datei im Arbeitsbereich speichern: " + err.Error(), trace
 		}
-		trace.Method = "save_tmp"
+		trace.Method = "read_for_python"
 		trace.FileSize = int64(len(content))
 		trace.MS = time.Since(start).Milliseconds()
 		return fmt.Sprintf("Datei %s (%d Bytes, %s) in den Python-Arbeitsbereich gespeichert. Im Python-Code mit open('%s','r',encoding='utf-8') lesbar.", fileName, len(content), note, fileName), trace
@@ -3365,11 +3365,11 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		// Serverseitiger Abbruch: das Modell wiederholt sich und liefert
 		// kein neues Ergebnis. Statt blind weiterzulaufen (970 Iterationen
 		// im August-Fall) antworten mit Zwischenergebnis + Optionen.
-		// Python und save_tmp: höhere Toleranz, weil beim Daten-Scannen
+		// Python und read_for_python: höhere Toleranz, weil beim Daten-Scannen
 		// mehrere identische Python-Calls legitim sind (z. B. t.find() auf
 		// derselben Datei, die zufällig das selbe liefert).
 		dupLimit := 3
-		if lastRealTool == "Python" || lastRealTool == "save_tmp" {
+		if lastRealTool == "Python" || lastRealTool == "read_for_python" {
 			dupLimit = 5
 		}
 		if consecutiveDuplicates >= dupLimit {
