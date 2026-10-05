@@ -91,18 +91,20 @@ type ChatPythonConfig struct {
 	Timeout    int    `yaml:"timeout"`      // default 30 (Sekunden)
 	MaxCPUs    int    `yaml:"max_cpus"`     // default 1
 	MaxMemory  int    `yaml:"max_memory"`   // default 256 (MB)
-	AllowedModules []string `yaml:"allowed_modules"` // default: re,math,statistics,csv,json,collections,itertools,functools
+	AllowedModules []string `yaml:"allowed_modules"` // default: re,math,statistics,csv,json,collections,itertools,functools,zipfile,xml,html,io,struct,string,unicodedata,decimal
 }
 
 // chatSystemPromptBuiltin ist das Fallback-Template für den Chat-System-Prompt,
 // falls kein externes chat_system.txt geladen wurde. Es muss inhaltlich mit
 // der chat_system.txt im taka-prompts-Paket übereinstimmen.
 const chatSystemPromptBuiltin = `Du bist ein Assistent, der mit dem Inhalt des Cloud-Ordners „{{folder}}“ arbeitet.
-Du kannst dessen Inhalte mit den Tools List (Verzeichnisinhalt), Meta (KI-Metadaten ohne Dateilesen), Read (Dateitext, auch PDF/Office/SVG/Bilder) lesen.
+Du kannst dessen Inhalte mit den Tools List (Verzeichnisinhalt), Meta (KI-Metadaten ohne Dateilesen), Read (Dateitext, auch PDF/Office/SVG/Bilder) und Search/Grep (gezieltes Finden) lesen.
 {{tools}}Pfade sind immer relativ zum Ordner (leerer Pfad = der Ordner selbst).
 Beantworte auf Basis dessen, was du tatsächlich aus den Dateien erlesen hast.
 {{python}}
-Lies nur Dateien, die für die Frage relevant sind.
+DEIN KONTEXT-FENSTER IST BEGRENZT: jeder Read füllt es, und bei Überlauf bricht der Server die Antwort ab. Lies NUR Dateien, die für die Frage relevant sind — nie abschnittsweise, nie „mal gucken“.
+Tabellarische oder sehr große Dateien (XLSX, lange Tabellen-PDFs, große CSV/TXT) NICHT mit Read in Abschnitten lesen: save_tmp (kopiert ohne Kontext-Belegung) und mit Python auswerten, print() nur das Ergebnis. view_page nur für einzelne Seiten mit Grafik/Diagramm/Layout.
+Bevor du mehrere Dateien liest: erst per List/Search/Meta planen, welche wirklich nötig sind, dann gezielt und parallel lesen.
 Ist die Frage auf mehrere Entitäten gerichtet (z. B. mehrere Personen oder Unterordner im Listing), beziehe alle davon in der Antwort mit ein – nicht nur die ersten. Wenn das Tool-Budget nicht ausreicht, um alles zu bearbeiten, nenne in der Antwort ausdrücklich, welche Entitäten du nicht ausgewertet hast.
 Wenn du mehrere unabhängige Einträge (Listings, Dateien) brauchst, rufe die Tools in einem Schritt parallel auf (mehrere tool_calls pro Antwort), nicht nacheinander in separaten Schritten.
 Zählung in den Ergebnissen: Jedes Suchergebnis und jedes Listing endet mit „found: X, limit: Y“. Bei Suchen ist found die Gesamtzahl aller Treffer, bei Listings die Zahl der gezeigten Einträge (limit = max. Einträge). Ist das Ergebnis NICHT als unvollständig markiert, hast du die vollständige Menge — lies dann die relevanten Dateien (Read oder Meta) oder antworte; such nicht endlos weiter. Ist found > limit oder das Ergebnis als unvollständig markiert, iteriere nicht blind weiter — beende deinen Turn mit dem Tool present_options und biete an: (1) konkretisieren (präzisere Begriffe, Dokumenttyp, Zeitraum), (2) limit erhöhen (limit-Parameter der Suche, max. 100) oder (3) alles durchlaufen lassen (kann mehrere Minuten dauern), jeweils als vollständige User-Anweisung. Nenne in der Antwort kurz den gefundenen Umfang und zeige eine Beispiel-Auswahl aus dem, was du schon gesehen hast (max. 10 Einträge), damit der User echte Begriffe und Namen sehen kann.
@@ -112,8 +114,7 @@ Nach 3 Suchversuchen ohne Treffer frage den User ebenfalls, statt weiter zu rate
 Filter in der Frage (z. B. Jahr, Lieferant, Betrag) deckst du nur vollständig ab, wenn die passenden Metadaten (doc.date, doc.type, …) bei den Treffern gesetzt sind. Sind solche Metadaten-Suchen leer oder dünn (doc.date ist bei älteren Dateien oft nicht belegt), verenge stillschweigend nicht den Antwortumfang auf das, was du schon hast (z. B. einen Ordner, dessen Name den Filterbegriff trägt): such zusätzlich einfach nach dem Filterbegriff selbst (z. B. nach dem Jahr im Namen). Kannst du Vollständigkeit damit nicht sicherstellen, beziehe die Antwort ausdrücklich auf den Umfang, den du tatsächlich ausgewertet hast, und biete per present_options an, die übrigen Kandidaten durchlaufen zu lassen.
 Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort explizit, dass dieses Dokument nur teilweise ausgewertet wurde.
 Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.
-Wenn du denselben Tool-Call (Tool + Parameter) erneut aufrufst und ein identisches Ergebnis bekommst: ANTWORTEN mit dem, was du schon hast, oder present_options anbieten. Nicht den Call wiederholen — das führt zu einer Wiederholungsschleife, die der Server abbrechen wird.
-Wenn du in einem Turn mehrere Suchen/Reads machst: plane im Voraus, welche Dateien du brauchst, und rufe sie parallel auf (mehrere tool_calls pro Antwort). Lies nur Dateien, die für die Frage relevant sind — nicht den ganzen Ordner durchlesen.`
+Wenn du denselben Tool-Call (Tool + Parameter) erneut aufrufst und ein identisches Ergebnis bekommst: ANTWORTEN mit dem, was du schon hast, oder present_options anbieten. Nicht den Call wiederholen — das führt zu einer Wiederholungsschleife, die der Server abbrechen wird. Nach einem „Datei nicht gefunden“-Fehler: maximal EINMAL mit dem korrigierten Namen (aus List) erneut versuchen, dann weitermachen oder den User fragen — nicht dieselbe Datei immer wieder lesen.`
 
 // pythonToolPrompt liefert die System-Prompt-Zeile für das Python-Tool,
 // falls aktiviert. Leerer String wenn deaktiviert.
@@ -121,7 +122,7 @@ func (s *Server) pythonToolPrompt() string {
 	if !s.cfg.Chat.Python.Enabled {
 		return ""
 	}
-	return "Jede Summe, Differenz, Quote oder andere Berechnung wird mit dem Python-Tool gerechnet, NIEMALS im Kopf. Das Python-Tool führt ein Skript in einer isolierten Umgebung aus (erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools). Dateizugriff nur auf Dateien im Arbeitsbereich (relative Pfade). Nutze print() für das Ergebnis.\n"
+	return "Jede Summe, Differenz, Quote oder andere Berechnung wird mit dem Python-Tool gerechnet, NIEMALS im Kopf. Das Python-Tool führt ein Skript in einer isolierten Umgebung aus (erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools, zipfile, xml, html, io, struct, string, unicodedata, decimal). Dateizugriff nur auf Dateien im Arbeitsbereich (relative Pfade). Nutze print() für das Ergebnis.\n"
 }
 
 // renderChatSystemPrompt füllt die Platzhalter des System-Prompt-Templates
@@ -249,6 +250,8 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 		c.Python.AllowedModules = []string{
 			"re", "math", "statistics", "csv", "json",
 			"collections", "itertools", "functools",
+			"zipfile", "xml", "html", "io", "struct",
+			"string", "unicodedata", "decimal",
 		}
 	}
 	// EditableExtensions: Default-List für den Create-Mode
@@ -730,7 +733,7 @@ func (s *Server) chatTools() []toolDefinition {
 		tools = append(tools,
 			toolDefinition{Type: "function", Function: toolFunction{
 				Name:        "Python",
-				Description: "Führt ein Python-Skript in einer isolierten Umgebung aus. Erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools. Dateizugriff nur auf die im Arbeitsbereich abgelegten Dateien (relative Pfade). stdout des Skripts wird als Ergebnis geliefert. Ideal zum Rechnen mit Zahlen aus Dokumenten (Summen, Differenzen, Durchschnitte), zum Transformieren von Tabellendaten oder zum Verarbeiten von strukturierten Inhalten. print() für das Ergebnis.",
+				Description: "Führt ein Python-Skript in einer isolierten Umgebung aus. Erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools, zipfile, xml, html, io, struct, string, unicodedata, decimal. Dateizugriff nur auf die im Arbeitsbereich abgelegten Dateien (relative Pfade). stdout des Skripts wird als Ergebnis geliefert. Ideal zum Rechnen mit Zahlen aus Dokumenten (Summen, Differenzen, Durchschnitte), zum Transformieren von Tabellendaten oder zum Verarbeiten von strukturierten Inhalten. print() für das Ergebnis.",
 				Parameters:  json.RawMessage(`{"type":"object","properties":{"code":{"type":"string","description":"Python-Code. Nutze open('pfad','r',encoding='utf-8') um Dateien im Arbeitsbereich zu lesen. print() für das Ergebnis."}},"required":["code"]}`),
 			}},
 			toolDefinition{Type: "function", Function: toolFunction{
