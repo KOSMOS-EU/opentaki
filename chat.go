@@ -797,13 +797,20 @@ type chatToolsResponse struct {
 		FinishReason string          `json:"finish_reason"`
 		Message      chatToolMessage `json:"message"`
 	} `json:"choices"`
+	Usage *chatTokenUsage `json:"usage"`
+}
+
+type chatTokenUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 func strPtr(s string) *string { return &s }
 
 // llmChatTools führt einen Chat-Completion-Call mit Tools aus.
-// Liefert die Assistenten-Antwort (ggf. mit tool_calls) + FinishReason.
-func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessage, tools []toolDefinition) (*chatToolMessage, string, error) {
+// Liefert die Assistenten-Antwort (ggf. mit tool_calls) + FinishReason + Token-Usage.
+func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessage, tools []toolDefinition) (*chatToolMessage, string, *chatTokenUsage, error) {
 	s.llmSem <- struct{}{}        // acquire slot
 	defer func() { <-s.llmSem }() // release slot
 	t := s.llmTrackStart()
@@ -830,7 +837,7 @@ func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessag
 				time.Sleep(backoff[attempt])
 				continue
 			}
-			return nil, "", fmt.Errorf("LLM nicht erreichbar: %v", err)
+			return nil, "", nil, fmt.Errorf("LLM nicht erreichbar: %v", err)
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
@@ -844,7 +851,7 @@ func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessag
 				time.Sleep(backoff[attempt])
 				continue
 			}
-			return nil, "", fmt.Errorf("LLM-Antwort nicht lesbar (HTTP %d)", resp.StatusCode)
+			return nil, "", nil, fmt.Errorf("LLM-Antwort nicht lesbar (HTTP %d)", resp.StatusCode)
 		}
 
 		if len(chatResp.Choices) > 0 {
@@ -852,7 +859,7 @@ func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessag
 			if msg.Content != nil {
 				*msg.Content = stripThinkTags(*msg.Content)
 			}
-			return &msg, chatResp.Choices[0].FinishReason, nil
+			return &msg, chatResp.Choices[0].FinishReason, chatResp.Usage, nil
 		}
 
 		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
@@ -862,7 +869,7 @@ func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessag
 				time.Sleep(backoff[attempt])
 				continue
 			}
-			return nil, "", fmt.Errorf("LLM-Backend fehlerhaft (HTTP %d)", resp.StatusCode)
+			return nil, "", nil, fmt.Errorf("LLM-Backend fehlerhaft (HTTP %d)", resp.StatusCode)
 		}
 
 		log.Printf("chat LLM empty response [%s] (attempt %d/%d, model=%s, backend=%s, HTTP %d, raw: %.300s)",
@@ -871,9 +878,9 @@ func (s *Server) llmChatTools(sessionID, model string, messages []chatToolMessag
 			time.Sleep(backoff[attempt])
 			continue
 		}
-		return nil, "", fmt.Errorf("LLM-Antwort leer")
+		return nil, "", nil, fmt.Errorf("LLM-Antwort leer")
 	}
-	return nil, "", fmt.Errorf("LLM-Antwort leer")
+	return nil, "", nil, fmt.Errorf("LLM-Antwort leer")
 }
 
 // ── WebDAV-Client (ephemeraler Share) ────────────────────────
@@ -2363,6 +2370,7 @@ func (s *Server) runPythonTool(code string, trace toolTrace, start time.Time) (s
 		trace.Error = runErr.Error()
 		result := "Fehler: Python-Skript fehlgeschlagen: " + runErr.Error()
 		if stderrStr != "" {
+			trace.Error = stderrStr
 			result += "\nStderr:\n" + stderrStr
 		}
 		if stdoutStr != "" {
@@ -2508,6 +2516,7 @@ type chatAskResponse struct {
 	ToolTrace  []toolTrace `json:"tool_trace"`
 	Iterations int         `json:"iterations"`
 	Model      string      `json:"model"`
+	Usage      *chatTokenUsage `json:"usage,omitempty"`
 	// Vom Modell per present_options gereichte (bzw. beim Loop-Abbruch
 	// serverseitig gesetzte) Antwort-Optionen — klickbar in der Chat-UI.
 	Options []string `json:"options,omitempty"`
@@ -2944,6 +2953,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	consecutiveDuplicates := 0
 	lastRealTool := ""
 	lastRealResult := ""
+	var totalUsage *chatTokenUsage
 	// present_options beendet den Turn: das Modell reicht dem User
 	// konkrete, anklickbare Optionen (SSE-Event "options" + JSON-Feld
 	// "options"). Beim serverseitigen Loop-Abbruch liefert der Server
@@ -3009,7 +3019,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		msg, finishReason, err := s.llmChatTools(sessionID, model, messages, tools)
+		msg, finishReason, usage, err := s.llmChatTools(sessionID, model, messages, tools)
 		if err != nil {
 			if stream {
 				sse.event("error", map[string]string{"error": err.Error()})
@@ -3017,6 +3027,14 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			}
 			writeChatError(w, http.StatusBadGateway, err.Error())
 			return
+		}
+		if usage != nil {
+			if totalUsage == nil {
+				totalUsage = &chatTokenUsage{}
+			}
+			totalUsage.PromptTokens += usage.PromptTokens
+			totalUsage.CompletionTokens += usage.CompletionTokens
+			totalUsage.TotalTokens += usage.TotalTokens
 		}
 		messages = append(messages, *msg)
 
@@ -3192,6 +3210,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		ToolTrace:  toolTraces,
 		Iterations: iterations,
 		Model:      model,
+		Usage:      totalUsage,
 		Options:    loopOptions,
 	}
 	if stream {
