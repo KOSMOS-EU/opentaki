@@ -2394,10 +2394,13 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 
 const pythonSandboxHeader = `
 import sys, builtins, os
+# C-Implementierungen, die standard Python-Module intern importieren:
+_builtin_extras = {'_io', '_csv', '_json', '_stat', '_collections', '_functools', '_string', '_struct', '_random', '_sre', '_locale', '_codecs', '_codecs_cn', '_codecs_hk', '_codecs_jp', '_codecs_kr', '_codecs_tw', '_heapq', '_bisect', '_datetime', '_decimal', '_hashlib', '_json', '_math', '_operator', '_pickle', '_posixsubprocess', '_pyio', '_random', '_scproxy', '_socket', '_sqlite3', '_ssl', '_statistics', '_string', '_struct', '_symtable', '_thread', '_warnings', '_weakref', '_winapi', '_zoneinfo', '_bz2', '_lzma', '_bz2', '_zstd', 'pyexpat', '_elementtree', 'encodings', 'codecs', 'io', 'abc', 'contextlib', 'copyreg', 'enum', 'functools', 'itertools', 'keyword', 'linecache', 'locale', 'numbers', 'operator', 'reprlib', 'select', 'sys', 'time', 'traceback', 'types', 'warnings', 'weakref', 'winreg', 'zipimport'}
 _allowed = set(%s)
 _orig_import = builtins.__import__
 def _safe_import(name, *a, **kw):
-    if name.split('.')[0] not in _allowed:
+    top = name.split('.')[0]
+    if top not in _allowed and top not in _builtin_extras:
         raise ImportError("Module " + name + " is not allowed")
     return _orig_import(name, *a, **kw)
 builtins.__import__ = _safe_import
