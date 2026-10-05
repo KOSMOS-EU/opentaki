@@ -2320,16 +2320,12 @@ func (s *Server) runPythonTool(code string, trace toolTrace, start time.Time) (s
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
 	defer cancel()
 
-	// CPU-Limit via taskset (1. Core) + nice
+	// CPU-Limit via nice (taskset steht im Base-Image nicht zur Verfügung)
 	var fullArgs []string
 	if cfg.MaxCPUs == 1 {
-		fullArgs = []string{"taskset", "-c", "0", "nice", "-n", "19", "python3", "-I", scriptPath}
+		fullArgs = []string{"nice", "-n", "19", "python3", "-I", scriptPath}
 	} else {
-		cores := make([]string, cfg.MaxCPUs)
-		for i := range cores {
-			cores[i] = strconv.Itoa(i)
-		}
-		fullArgs = append([]string{"taskset", "-c", strings.Join(cores, ","), "python3", "-I"}, scriptPath)
+		fullArgs = []string{"python3", "-I", scriptPath}
 	}
 	cmd := exec.CommandContext(ctx, fullArgs[0], fullArgs[1:]...)
 	cmd.Dir = workDir
