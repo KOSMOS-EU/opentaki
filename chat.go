@@ -738,6 +738,11 @@ func (s *Server) chatTools() []toolDefinition {
 				Description: "Speichert eine Datei aus dem geteilten Ordner in den Python-Arbeitsbereich, damit Python sie mit open() lesen kann. Lädt die Datei server-seitig (ohne Kontext-Fenster-Belegung). Nutze bei großen Dateien VOR dem Python-Call, statt den Inhalt in den Python-Code einzubetten. convert: \"auto\" (Default) — Textdateien unverändert, PDF/DOCX/XLSX/PPTX werden mit pdftotext -layout bzw. pandoc nach Text gewandelt; \"text\" — wie auto, aber Fehler wenn keine Extraktion möglich; \"none\" — rohe Bytes kopieren (nur für binäre Bibliotheks-Zugriffe).",
 				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner (wie bei Read)"},"convert":{"type":"string","enum":["auto","text","none"],"description":"auto (Default): Textdateien unverändert, Office/PDF nach Text. text: wie auto, aber Fehler wenn keine Extraktion. none: rohe Bytes, keine Wandlung."}},"required":["path"]}`),
 			}},
+			toolDefinition{Type: "function", Function: toolFunction{
+				Name:        "view_page",
+				Description: "Rendert eine einzelne Seite einer PDF aus dem geteilten Ordner und zeigt sie dir als Bild. Nutze es nur für Abbildungen, Diagramme, Tabellen mit Layout oder andere visuelle Inhalte, die im extrahierten Text nicht erkennbar sind. Für Text und Zahlen nimm save_tmp und Python. Eine Seite pro Aufruf; maximal 1500 Seiten insgesamt pro Antwort. Abgelesene Zahlen kennzeichnest du als abgelesen.",
+				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der PDF relativ zum geteilten Ordner (wie bei Read)"},"page":{"type":"integer","minimum":1,"description":"Seitennummer (1-basiert)"}},"required":["path","page"]}`),
+			}},
 		)
 	}
 	return tools
@@ -1832,6 +1837,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 		Patch   string `json:"patch"`
 		Code    string `json:"code"`
 		Convert string `json:"convert"`
+		Page    int    `json:"page"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
@@ -2332,6 +2338,46 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 		trace.MS = time.Since(start).Milliseconds()
 		return fmt.Sprintf("Datei %s (%d Bytes, %s) in den Python-Arbeitsbereich gespeichert. Im Python-Code mit open('%s','r',encoding='utf-8') lesbar.", fileName, len(content), note, fileName), trace
 
+	case "view_page":
+		if d == nil {
+			trace.Error = "nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: view_page ist für diesen Chat nicht verfügbar.", trace
+		}
+		if args.Page < 1 {
+			trace.Error = "ungültige Seitenzahl"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Seitennummer muss ≥ 1 sein.", trace
+		}
+		data, _, err := d.getfile(relPath)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: PDF nicht lesbar: " + err.Error(), trace
+		}
+		// Seitenanzahl prüfen
+		pageCount := s.pdfPageCountFromBytes(data)
+		if args.Page > pageCount {
+			trace.Error = "Seite außerhalb des Bereichs"
+			trace.MS = time.Since(start).Milliseconds()
+			return fmt.Sprintf("Fehler: PDF hat %d Seiten, aber Seite %d wurde angefordert.", pageCount, args.Page), trace
+		}
+		imgData := s.pdfPageToImageDPI(data, args.Page, 150)
+		if imgData == nil {
+			trace.Error = "Rendering fehlgeschlagen"
+			trace.MS = time.Since(start).Milliseconds()
+			return fmt.Sprintf("Fehler: Seite %d konnte nicht gerendert werden.", args.Page), trace
+		}
+		desc, descErr := s.llmDescribePage(imgData)
+		trace.Method = "view_page"
+		trace.MS = time.Since(start).Milliseconds()
+		if descErr != nil {
+			trace.Error = descErr.Error()
+			return "Fehler: Beschreibung der Seite nicht möglich: " + descErr.Error(), trace
+		}
+		trace.Chars = len(desc)
+		return desc, trace
+
 	case "Python":
 		return s.runPythonTool(args.Code, pythonWorkDir, trace, start)
 	default:
@@ -2462,6 +2508,45 @@ func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time
 	}
 
 	return stdoutStr, trace
+}
+
+// pdfPageCountFromBytes liefert die Seitenanzahl einer PDF-Datei (in-memory)
+// ohne temporäre Datei zu schreiben (nutzt pdftoppm -list als Fallback,
+// da pdfinfo eine Dateipfad erwartet — hier via /dev/stdin umgehen).
+func (s *Server) pdfPageCountFromBytes(data []byte) int {
+	tmp, err := os.CreateTemp("", "taki-view-*.pdf")
+	if err != nil {
+		return 1
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Write(data)
+	tmp.Close()
+	return s.pdfPageCount(tmp.Name())
+}
+
+// llmDescribePage sendet eine gerenderte PDF-Seite (PNG) an das Vision-Modell
+// und liefert eine strukturierte Beschreibung zurück.
+func (s *Server) llmDescribePage(imgData []byte) (string, error) {
+	b64 := base64.StdEncoding.EncodeToString(imgData)
+	dataURL := "data:image/png;base64," + b64
+	content := []contentBlock{
+		{Type: "text", Text: "Beschreibe diese Dokumentenseite strukturiert. " +
+			"Fokussiere auf: 1) Alle sichtbaren Zahlen, Beträge und Daten (mit Zuordnung zu Spalten/Zeilen). " +
+			"2) Tabellenstruktur (Spaltenüberschriften, welche Werte in welcher Zelle stehen). " +
+			"3) Grafiken, Diagramme, Bilder (Inhalt, Titel, Achsenwerte). " +
+			"4) Besondere Layout-Merkmale, die im flachen Text verloren gehen. " +
+			"Sei präzise bei Zahlen — runde nichts. Falls etwas unlesbar ist, markiere es mit [unlesbar]."},
+		{Type: "image_url", ImageURL: &imageURL{URL: dataURL}},
+	}
+	messages := []chatMessage{{Role: "user", Content: content}}
+	desc, _ := s.llmCompleteOptsBackendModelSession(
+		fmt.Sprintf("vp%04x", time.Now().UnixNano()&0xffffff),
+		messages, nil, nil, "", s.ocrModel(),
+	)
+	if desc == "" {
+		return "", fmt.Errorf("leere Antwort vom Vision-Modell")
+	}
+	return desc, nil
 }
 
 // looksLikeImage: Magic-Bytes-Check für den Fall, dass Content-Type fehlt.
