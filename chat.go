@@ -2439,7 +2439,7 @@ func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time
 	moduleList := "'" + strings.Join(cfg.AllowedModules, "', '") + "'"
 	// Vorab-Imports für alle erlaubten Module (lädt interne Abhängigkeiten)
 	preloadImports := "import " + strings.Join(cfg.AllowedModules, ", ")
-	header := fmt.Sprintf(pythonSandboxHeader, "["+moduleList+"]", preloadImports, workDir)
+	header := fmt.Sprintf(pythonSandboxHeader, preloadImports, "["+moduleList+"]", workDir)
 	script := header + "\n" + code
 	scriptPath := filepath.Join(workDir, "script.py")
 	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
