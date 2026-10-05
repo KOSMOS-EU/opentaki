@@ -2395,7 +2395,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 const pythonSandboxHeader = `
 import sys, builtins, os
 # C-Implementierungen, die standard Python-Module intern importieren:
-_builtin_extras = {'_io', '_csv', '_json', '_stat', '_collections', '_functools', '_string', '_struct', '_random', '_sre', '_locale', '_codecs', '_codecs_cn', '_codecs_hk', '_codecs_jp', '_codecs_kr', '_codecs_tw', '_heapq', '_bisect', '_datetime', '_decimal', '_hashlib', '_json', '_math', '_operator', '_pickle', '_posixsubprocess', '_pyio', '_random', '_scproxy', '_socket', '_sqlite3', '_ssl', '_statistics', '_string', '_struct', '_symtable', '_thread', '_warnings', '_weakref', '_winapi', '_zoneinfo', '_bz2', '_lzma', '_bz2', '_zstd', 'pyexpat', '_elementtree', 'encodings', 'codecs', 'io', 'abc', 'contextlib', 'copyreg', 'enum', 'functools', 'itertools', 'keyword', 'linecache', 'locale', 'numbers', 'operator', 'reprlib', 'select', 'sys', 'time', 'traceback', 'types', 'warnings', 'weakref', 'winreg', 'zipimport'}
+_builtin_extras = {'_io', '_csv', '_json', '_stat', '_collections', '_functools', '_string', '_struct', '_random', '_sre', '_locale', '_codecs', '_codecs_cn', '_codecs_hk', '_codecs_jp', '_codecs_kr', '_codecs_tw', '_heapq', '_bisect', '_datetime', '_decimal', '_hashlib', '_math', '_operator', '_pickle', '_posixsubprocess', '_pyio', '_scproxy', '_socket', '_sqlite3', '_ssl', '_statistics', '_symtable', '_thread', '_warnings', '_weakref', '_winapi', '_zoneinfo', '_bz2', '_lzma', '_zstd', 'pyexpat', '_elementtree', 'encodings', 'codecs', 'io', 'abc', 'builtins', 'contextlib', 'copyreg', 'enum', 'functools', 'itertools', 'keyword', 'linecache', 'locale', 'numbers', 'operator', 'reprlib', 'select', 'sys', 'time', 'traceback', 'types', 'warnings', 'weakref', 'winreg', 'zipimport'}
 _allowed = set(%s)
 _orig_import = builtins.__import__
 def _safe_import(name, *a, **kw):
@@ -3361,7 +3361,14 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		// Serverseitiger Abbruch: das Modell wiederholt sich und liefert
 		// kein neues Ergebnis. Statt blind weiterzulaufen (970 Iterationen
 		// im August-Fall) antworten mit Zwischenergebnis + Optionen.
-		if consecutiveDuplicates >= 3 {
+		// Python und save_tmp: höhere Toleranz, weil beim Daten-Scannen
+		// mehrere identische Python-Calls legitim sind (z. B. t.find() auf
+		// derselben Datei, die zufällig das selbe liefert).
+		dupLimit := 3
+		if lastRealTool == "Python" || lastRealTool == "save_tmp" {
+			dupLimit = 5
+		}
+		if consecutiveDuplicates >= dupLimit {
 			log.Printf("chat/ask [%s]: loop-break nach %d aufeinanderfolgenden Duplikaten (iteration %d)", sessionID, consecutiveDuplicates, iterations)
 			answer = loopBreakAnswer("die gleiche Anfrage wiederholt lieferte kein neues Ergebnis (Wiederholungsschleife)", lastRealTool, lastRealResult, isBlankChat)
 			loopOptions = loopBreakOptions(isBlankChat)
