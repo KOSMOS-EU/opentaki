@@ -735,8 +735,8 @@ func (s *Server) chatTools() []toolDefinition {
 			}},
 			toolDefinition{Type: "function", Function: toolFunction{
 				Name:        "save_tmp",
-				Description: "Speichert eine Datei aus dem geteilten Ordner in den Python-Arbeitsbereich, damit Python sie mit open() lesen kann. Lädt die Datei server-seitig (ohne Kontext-Fenster-Belegung). Nutze bei großen Dateien VOR dem Python-Call, statt den Inhalt in den Python-Code einzubetten. Der Dateiinhalt wird als Text (UTF-8) gespeichert — binäre Dateien werden übersprungen.",
-				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner (wie bei Read)"}},"required":["path"]}`),
+				Description: "Speichert eine Datei aus dem geteilten Ordner in den Python-Arbeitsbereich, damit Python sie mit open() lesen kann. Lädt die Datei server-seitig (ohne Kontext-Fenster-Belegung). Nutze bei großen Dateien VOR dem Python-Call, statt den Inhalt in den Python-Code einzubetten. convert: \"auto\" (Default) — Textdateien unverändert, PDF/DOCX/XLSX/PPTX werden mit pdftotext -layout bzw. pandoc nach Text gewandelt; \"text\" — wie auto, aber Fehler wenn keine Extraktion möglich; \"none\" — rohe Bytes kopieren (nur für binäre Bibliotheks-Zugriffe).",
+				Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner (wie bei Read)"},"convert":{"type":"string","enum":["auto","text","none"],"description":"auto (Default): Textdateien unverändert, Office/PDF nach Text. text: wie auto, aber Fehler wenn keine Extraktion. none: rohe Bytes, keine Wandlung."}},"required":["path"]}`),
 			}},
 		)
 	}
@@ -1831,6 +1831,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 		Type    string `json:"type"`
 		Patch   string `json:"patch"`
 		Code    string `json:"code"`
+		Convert string `json:"convert"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
@@ -2268,34 +2269,68 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Python-Arbeitsbereich ist nicht verfügbar.", trace
 		}
-		data, _, err := d.getfile(relPath)
+		convertMode := args.Convert
+		if convertMode == "" {
+			convertMode = "auto"
+		}
+		data, ct, err := d.getfile(relPath)
 		if err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Datei nicht lesbar: " + err.Error(), trace
 		}
-		// binäre Dateien überspringen (null byte check)
-		for i, b := range data {
-			if b == 0 {
-				if i > 8192 {
-					break
+		fileName := filepath.Base(relPath)
+		var content []byte
+		var note string
+		if convertMode == "none" {
+			content = data
+			note = "rohe Bytes"
+		} else {
+			// Textdateien (text/*, json, csv, xml) unverändert kopieren
+			lowerCt := strings.ToLower(ct)
+			isPlain := strings.HasPrefix(lowerCt, "text/") ||
+				strings.Contains(lowerCt, "json") ||
+				strings.Contains(lowerCt, "csv") ||
+				strings.Contains(lowerCt, "xml") ||
+				strings.Contains(lowerCt, "yaml") ||
+				strings.Contains(lowerCt, "markdown")
+			if isPlain {
+				content = data
+				note = "unverändert"
+			} else {
+				// Wandeln mit s.extract (gleicher Pfad wie Read: pdftotext -layout, pandoc, …)
+				extracted, method := s.extract(data, ct)
+				if method == "error" || strings.HasPrefix(method, "error") || extracted == "" {
+					if convertMode == "text" {
+						trace.Error = "keine Extraktion möglich"
+						trace.MS = time.Since(start).Milliseconds()
+						return fmt.Sprintf("Fehler: %s konnte nicht nach Text gewandelt werden (Methode: %s). Nutze convert=\"none\" für die rohen Bytes.", fileName, method), trace
+					}
+					// auto: warnen, aber rohe Bytes ablegen
+					content = data
+					note = fmt.Sprintf("WARNUNG: Extraktion fehlgeschlagen (%s), rohe Bytes abgelegt. Die Datei ist evtl. gescannt oder binär.", method)
+				} else {
+					content = []byte(extracted)
+					note = fmt.Sprintf("gewandelt mit %s", method)
+					// PDF ohne Textebene: pdftotext liefert fast nichts
+					if method == "pdftotext" || method == "pdftotext_partial" {
+						if len(extracted) < 100 {
+							note = fmt.Sprintf("WARNUNG: %s enthält kaum Text (nur %d Zeichen, Methode: %s) — möglicherweise gescannte Seiten. Python findet nur diese Zeilen.", fileName, len(extracted), method)
+						}
+					}
 				}
-				trace.Error = "binäre Datei"
-				trace.MS = time.Since(start).Milliseconds()
-				return "Fehler: binäre Datei — wird nicht in den Arbeitsbereich kopiert. Lade den extrahierten Text mit Read und verarbeite ihn direkt in Python.", trace
 			}
 		}
-		fileName := filepath.Base(relPath)
 		dstPath := filepath.Join(pythonWorkDir, fileName)
-		if err := os.WriteFile(dstPath, data, 0600); err != nil {
+		if err := os.WriteFile(dstPath, content, 0600); err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: konnte Datei im Arbeitsbereich speichern: " + err.Error(), trace
 		}
 		trace.Method = "save_tmp"
-		trace.FileSize = int64(len(data))
+		trace.FileSize = int64(len(content))
 		trace.MS = time.Since(start).Milliseconds()
-		return fmt.Sprintf("Datei %s (%d Bytes) in den Python-Arbeitsbereich gespeichert. Im Python-Code mit open('%s','r',encoding='utf-8') lesbar.", fileName, len(data), fileName), trace
+		return fmt.Sprintf("Datei %s (%d Bytes, %s) in den Python-Arbeitsbereich gespeichert. Im Python-Code mit open('%s','r',encoding='utf-8') lesbar.", fileName, len(content), note, fileName), trace
 
 	case "Python":
 		return s.runPythonTool(args.Code, pythonWorkDir, trace, start)
