@@ -2386,6 +2386,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 		fileName := filepath.Base(relPath)
 		var content []byte
 		var note string
+		isExtracted := false
 		if convertMode == "none" {
 			content = data
 			note = "rohe Bytes"
@@ -2415,6 +2416,7 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 					note = fmt.Sprintf("WARNUNG: Extraktion fehlgeschlagen (%s), rohe Bytes abgelegt. Die Datei ist evtl. gescannt oder binär.", method)
 				} else {
 					content = []byte(extracted)
+					isExtracted = true
 					note = fmt.Sprintf("gewandelt mit %s", method)
 					// PDF ohne Textebene: pdftotext liefert fast nichts
 					if method == "pdftotext" || method == "pdftotext_partial" {
@@ -2424,6 +2426,11 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 					}
 				}
 			}
+		}
+		// Extrahierte Dateien bekommen .txt-Endung (Modelle stolpern nicht über falsche Typ-Endung)
+		if isExtracted {
+			base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+			fileName = base + ".txt"
 		}
 		dstPath := filepath.Join(pythonWorkDir, fileName)
 		if err := os.WriteFile(dstPath, content, 0600); err != nil {
