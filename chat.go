@@ -3426,6 +3426,9 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	lastDupHash := ""
 	lastRealTool := ""
 	lastRealResult := ""
+	// Python-Low-Output-Counter: 5+ consecutive Python-Calls mit ≤2 chars
+	// Output deuten auf eine Blind-Loop (z.B. find()=-1 + Offset-Iteration).
+	consecutiveLowOutput := 0
 	var totalUsage *chatTokenUsage
 	// Session-weite Python-Sandbox: überlebt zwischen Tool-Calls,
 	// damit das Modell temporäre Dateien erzeugen und in späteren
@@ -3640,6 +3643,26 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					lastRealTool = tc.Function.Name
 					lastRealResult = truncateChars(result, 1500)
 				}
+			}
+			// Python-Low-Output-Loop-Erkennung: 5+ consecutive Python-Calls
+			// mit ≤2 chars stdout deuten auf eine Blind-Iteration (z.B.
+			// find()=-1 + Offset-Schleife). Warnung ins Ergebnis injizieren.
+			if tc.Function.Name == "Python" {
+				if len(result) <= 2 || strings.HasPrefix(result, "Kein Output") {
+					consecutiveLowOutput++
+				} else {
+					consecutiveLowOutput = 0
+				}
+				if consecutiveLowOutput >= 5 {
+					result += "\n\n[LOOP-WARNUNG: " + strconv.Itoa(consecutiveLowOutput) + " aufeinanderfolgende Python-Calls haben ≤2 Zeichen ausgegeben. " +
+						"Du iterierst offensichtlich blind durch eine Datei ohne Treffer. " +
+						"Stopp diese Iteration. Prüfe ZUERST ob die Suchbedingung existiert " +
+						"(z.B. print(repr(t[:200])) um das Format zu sehen, oder print(len(t)) für die Länge). " +
+						"Nutze regex.search() statt find() und prüfe den Rückgabewert (if m: ...).]"
+					log.Printf("chat/ask [%s]: python-low-output-loop nach %d Calls (iteration %d)", sessionID, consecutiveLowOutput, iterations)
+				}
+			} else {
+				consecutiveLowOutput = 0
 			}
 			// args = die exakte Anfrage (auch bei Duplikaten, die runChatTool
 			// nie erreichen und daher leere trace-Felder haben).
