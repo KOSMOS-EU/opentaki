@@ -2247,13 +2247,15 @@ func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav
 			text += fmt.Sprintf("\n\n[Hinweis: Die Datei ist länger als %d Zeichen — der Rest ist NICHT enthalten. "+
 				"Wenn die Frage den fehlenden Teil betreffen könnte, erwähne das in der Antwort, statt zu raten.]", max)
 		}
-		// Warnung bei großen extrahierten Dokumenten: Modell soll read_for_python + llm/Python nutzen
+		// Große Dokumente: Read blockieren, read_for_python + llm/Python vorschlagen
 		if len(text) > 10000 {
 			lineCount := strings.Count(text, "\n")
-			if lineCount > 100 {
-				text += fmt.Sprintf("\n\n[Hinweis: %d Zeilen in diesem Abschnitt. Für die vollständige Auswertung großer Dokumente (>200 Zeilen) "+
-					"nutze read_for_python + Python (Zahlen) oder llm (Inhalt) statt Read-Abschnitten.]", lineCount)
-			}
+			text = fmt.Sprintf("[WARNUNG: Diese Datei hat %d Zeichen / %d Zeilen — zu groß für Read.\n"+
+				"Read lädt den gesamten Text in DEIN Kontext-Fenster, und dieser Text wird bei JEDEM weiteren Tool-Call erneut geladen.\n"+
+				"Stattdessen: read_for_python (kopiert ohne Kontext-Belegung) + llm (inhaltliche Auswertung, liefert nur das verdichtete Ergebnis)\n"+
+				"oder read_for_python + Python (Zahlen/Berechnungen, print nur das Endergebnis).\n"+
+				"Beispiel: read_for_python(path=\"%s\") → llm(path=\"<Dateiname>\", instruction=\"Was soll extrahiert werden?\")]",
+				len(text), lineCount, relPath)
 		}
 		trace.Method = method
 		trace.Chars = len(text)
