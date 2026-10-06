@@ -267,7 +267,7 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 			"collections", "itertools", "functools",
 			"zipfile", "xml", "html", "io", "struct",
 			"string", "unicodedata", "decimal",
-			"zlib", "pathlib", "xlrd",
+			"zlib", "pathlib", "xlrd", "os",
 		}
 	}
 	// EditableExtensions: Default-List für den Create-Mode
@@ -2441,7 +2441,17 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 		trace.Method = "read_for_python"
 		trace.FileSize = int64(len(content))
 		trace.MS = time.Since(start).Milliseconds()
-		return fmt.Sprintf("Datei %s (%d Bytes, %s) in den Workspace gespeichert. Im Python-Code mit open('%s','r',encoding='utf-8') lesbar.", fileName, len(content), note, fileName), trace
+		// Bestehende Workspace-Dateien auflisten, damit das Modell sieht was da ist
+		var existing []string
+		if entries, err := os.ReadDir(pythonWorkDir); err == nil {
+			for _, e := range entries {
+				if e.Name() != "script.py" {
+					existing = append(existing, e.Name())
+				}
+			}
+		}
+		return fmt.Sprintf("Datei %s (%d Bytes, %s) in den Workspace gespeichert. Im Python-Code mit open('%s','r',encoding='utf-8') lesbar. Workspace-Inhalt: %v",
+			fileName, len(content), note, fileName, existing), trace
 
 	case "view_page":
 		if d == nil {
@@ -2513,7 +2523,7 @@ _orig_import = builtins.__import__
 def _safe_import(name, *a, **kw):
     top = name.split('.')[0]
     if top not in _allowed:
-        raise ImportError("Module " + name + " is not allowed")
+        raise ImportError("Module " + name + " is not allowed. Verfuegbar: " + ", ".join(sorted(_allowed)))
     return _orig_import(name, *a, **kw)
 builtins.__import__ = _safe_import
 _safe_dir = %q
