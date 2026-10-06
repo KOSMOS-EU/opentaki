@@ -113,9 +113,10 @@ LESESTRATEGIE (in dieser Reihenfolge):
 
 WORKSPACE-REGEL: Wenn eine Datei bereits im Workspace liegt (via read_for_python), lies sie ausschließlich per Python aus — nicht zusätzlich mit Read. Der Workspace bleibt für die gesamte Session erhalten: du kannst beliebig oft per Python darauf zugreifen (slice, filtern, berechnen, vergleichen) und mit print() nur das Ergebnis in den Kontext bringen. Ein Read derselben Datei wäre eine Kontext-Verschwendung — die Daten sind schon da.
 
-GROßE DOKUMENTE (>500 Zeilen): Nie abschnittsweise per Read lesen. Stattdessen:
-- Zahlen/Berechnungen → read_for_python + Python (print nur Ergebnis)
-- Inhaltliche Auswertung (Klauseln, Anmerkungen, Zusammenfassungen) → read_for_python + llm (instruction: was extrahieren)
+GROßE DOKUMENTE (>200 Zeilen): HARTE REGEL — NIEMALS mit Read abschnittsweise lesen (auch nicht mit offset/limit in mehreren Runden). Das sprengt das Kontext-Fenster. Stattdessen IMMER:
+- Zahlen/Berechnungen → read_for_python + Python (print nur das Ergebnis, nie den Rohtext)
+- Inhaltliche Auswertung (Klauseln, Anmerkungen, Zusammenfassungen, Tabellen) → read_for_python + llm (instruction: was extrahieren)
+- NIEMALS mit Python print() den gesamten oder großen Teile des Dokument-Texts in den Kontext ausgeben — das ist dasselbe Kontext-Problem wie Read.
 Der Workspace ist dein Zwischenspeicher: read_for_python legt Dateien dort ab, Python und llm greifen darauf zu. Die Daten bleiben zwischen allen Calls erhalten.
 
 Niemals „mal gucken“, niemals abschnittsweise ohne Grep-Vorbereitung.
@@ -763,7 +764,7 @@ func (s *Server) chatTools() []toolDefinition {
 			}},
 		toolDefinition{Type: "function", Function: toolFunction{
 			Name:        "llm",
-			Description: "Gibt eine Datei aus dem Workspace an eine KI zur inhaltlichen Auswertung weiter (ohne den Inhalt in DEIN Kontext-Fenster zu laden). Die KI liest das Dokument vollständig und liefert nur das verdichtete Ergebnis zurück. Nutze für große Dateien (>500 Zeilen) die du vollständig auswerten musst, statt sie in Abschnitten per Read zu lesen. Die Datei muss zuvor mit read_for_python in den Workspace kopiert sein.",
+			Description: "Gibt eine Datei aus dem Workspace an eine KI zur inhaltlichen Auswertung weiter (ohne den Inhalt in DEIN Kontext-Fenster zu laden). Die KI liest das Dokument vollständig und liefert nur das verdichtete Ergebnis zurück. PFLICHT für alle Dateien >200 Zeilen: statt sie mit Read oder Python-Print abschnittsweise in den Kontext zu laden, HIER auslesen lassen. Die Datei muss zuvor mit read_for_python in den Workspace kopiert sein.",
 			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Dateiname im Workspace (wie von read_for_python kopiert)"},"instruction":{"type":"string","description":"Was die KI aus dem Dokument extrahieren soll. Spezifisch: \"Alle Haushaltspositionen mit Betrag, Kapitel-Nummer und Art als Tabelle\" oder \"Alle Anmerkungen, Klauseln und Außerplanmäßigen mit Beträgen\""}},"required":["path","instruction"]}`),
 		}},
 	)
@@ -2227,6 +2228,14 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 			trace.Truncated = true
 			text += fmt.Sprintf("\n\n[Hinweis: Die Datei ist länger als %d Zeichen — der Rest ist NICHT enthalten. "+
 				"Wenn die Frage den fehlenden Teil betreffen könnte, erwähne das in der Antwort, statt zu raten.]", max)
+		}
+		// Warnung bei großen extrahierten Dokumenten: Modell soll read_for_python + llm/Python nutzen
+		if len(text) > 10000 {
+			lineCount := strings.Count(text, "\n")
+			if lineCount > 100 {
+				text += fmt.Sprintf("\n\n[Hinweis: %d Zeilen in diesem Abschnitt. Für die vollständige Auswertung großer Dokumente (>200 Zeilen) "+
+					"nutze read_for_python + Python (Zahlen) oder llm (Inhalt) statt Read-Abschnitten.]", lineCount)
+			}
 		}
 		trace.Method = method
 		trace.Chars = len(text)

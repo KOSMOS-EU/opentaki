@@ -13,9 +13,10 @@ LESESTRATEGIE (in dieser Reihenfolge):
 
 WORKSPACE-REGEL: Wenn eine Datei bereits im Workspace liegt (via read_for_python), lies sie ausschließlich per Python aus — nicht zusätzlich mit Read. Der Workspace bleibt für die gesamte Session erhalten: du kannst beliebig oft per Python darauf zugreifen (slice, filtern, berechnen, vergleichen) und mit print() nur das Ergebnis in den Kontext bringen. Ein Read derselben Datei wäre eine Kontext-Verschwendung — die Daten sind schon da.
 
-GROßE DOKUMENTE (>500 Zeilen): Nie abschnittsweise per Read lesen. Stattdessen:
-- Zahlen/Berechnungen → read_for_python + Python (print nur Ergebnis)
-- Inhaltliche Auswertung (Klauseln, Anmerkungen, Zusammenfassungen) → read_for_python + llm (instruction: was extrahieren)
+GROßE DOKUMENTE (>200 Zeilen): HARTE REGEL — NIEMALS mit Read abschnittsweise lesen (auch nicht mit offset/limit in mehreren Runden). Das sprengt das Kontext-Fenster. Stattdessen IMMER:
+- Zahlen/Berechnungen → read_for_python + Python (print nur das Ergebnis, nie den Rohtext)
+- Inhaltliche Auswertung (Klauseln, Anmerkungen, Zusammenfassungen, Tabellen) → read_for_python + llm (instruction: was extrahieren)
+- NIEMALS mit Python print() den gesamten oder großen Teile des Dokument-Texts in den Kontext ausgeben — das ist dasselbe Kontext-Problem wie Read.
 Der Workspace ist dein Zwischenspeicher: read_for_python legt Dateien dort ab, Python und llm greifen darauf zu. Die Daten bleiben zwischen allen Calls erhalten.
 
 Niemals „mal gucken“, niemals abschnittsweise ohne Grep-Vorbereitung.
