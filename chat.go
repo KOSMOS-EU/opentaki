@@ -2432,7 +2432,15 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 			base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 			fileName = base + ".txt"
 		}
+		// Name-Collision: Wenn die Datei schon existiert, Parent-Ordner als Präfix
 		dstPath := filepath.Join(pythonWorkDir, fileName)
+		if _, statErr := os.Stat(dstPath); statErr == nil {
+			if dir := filepath.Base(filepath.Dir(relPath)); dir != "." && dir != "" {
+				safeDir := strings.ReplaceAll(dir, " ", "_")
+				fileName = safeDir + "_" + fileName
+				dstPath = filepath.Join(pythonWorkDir, fileName)
+			}
+		}
 		if err := os.WriteFile(dstPath, content, 0600); err != nil {
 			trace.Error = err.Error()
 			trace.MS = time.Since(start).Milliseconds()
