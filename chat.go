@@ -2729,6 +2729,12 @@ func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time
 		return "Kein Output. Das Skript lief, hat aber nichts mit print() ausgegeben — die Filter-/Suchbedingungen haben nichts gefunden. Ändere den Code (z.B. print() ohne Filter, oder prüfe die tatsächliche Struktur der Daten).", trace
 	}
 
+	// Kontext-Warnung bei großem Output
+	const warnPythonOutput = 5000
+	if len(stdoutStr) > warnPythonOutput {
+		stdoutStr = fmt.Sprintf("[WARNUNG: %d Zeichen ausgegeben — jeder weitere Tool-Call lädt das erneut in den Kontext.\nNutze print() nur für das Endergebnis (Zahlen, KPIs, extrahierte Zeilen), nicht für rohe Datei-Ausgabe.\nFür große Inhalte: in eine Datei schreiben und nur die relevanten Zeilen drucken, oder das llm-Tool verwenden.]\n\n%s", len(stdoutStr), stdoutStr)
+	}
+
 	return stdoutStr, trace
 }
 
