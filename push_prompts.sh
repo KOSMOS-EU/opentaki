@@ -29,6 +29,8 @@ PROMPT_FILES=(
     aktenplan.txt
     chat_system.txt
     chat_system_blank.txt
+    python_tool.txt
+    llm_subtool.txt
 )
 
 # Create ZIP

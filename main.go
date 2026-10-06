@@ -549,6 +549,26 @@ func (cfg *Config) loadChatSystemPrompt(configDir string) {
 		log.Printf("  Chat blank system prompt: using built-in default (%s not found)", cfg.Chat.BlankSystemPromptFile)
 		cfg.Chat.blankSystemPrompt = chatSystemPromptBlankBuiltin
 	}
+	// Python-Tool-Prompt ({{modules}} wird zur Laufzeit gefüllt)
+	if cfg.Chat.PythonToolPromptFile == "" {
+		cfg.Chat.PythonToolPromptFile = filepath.Join(configDir, "prompts", "python_tool.txt")
+	}
+	if data, err := os.ReadFile(cfg.Chat.PythonToolPromptFile); err == nil {
+		cfg.Chat.pythonToolPrompt = strings.TrimSpace(string(data))
+		log.Printf("  Python tool prompt: %s (%d chars)", cfg.Chat.PythonToolPromptFile, len(cfg.Chat.pythonToolPrompt))
+	} else {
+		log.Printf("  Python tool prompt: using built-in default (%s not found)", cfg.Chat.PythonToolPromptFile)
+	}
+	// LLM-Sub-Tool-Prompt
+	if cfg.Chat.LLMSubToolPromptFile == "" {
+		cfg.Chat.LLMSubToolPromptFile = filepath.Join(configDir, "prompts", "llm_subtool.txt")
+	}
+	if data, err := os.ReadFile(cfg.Chat.LLMSubToolPromptFile); err == nil {
+		cfg.Chat.llmSubToolPrompt = strings.TrimSpace(string(data))
+		log.Printf("  LLM sub-tool prompt: %s (%d chars)", cfg.Chat.LLMSubToolPromptFile, len(cfg.Chat.llmSubToolPrompt))
+	} else {
+		log.Printf("  LLM sub-tool prompt: using built-in default (%s not found)", cfg.Chat.LLMSubToolPromptFile)
+	}
 }
 
 // Built-in defaults (used when external files are not found)
