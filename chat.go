@@ -2500,10 +2500,9 @@ func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav
 				}
 			}
 		}
-		// Extrahierte Dateien bekommen .txt-Endung (Modelle stolpern nicht über falsche Typ-Endung)
+		// Extrahierte Dateien bekommen .txt-Suffix (Original-Endung bleibt erhalten)
 		if isExtracted {
-			base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-			fileName = base + ".txt"
+			fileName = fileName + ".txt"
 		}
 		// Name-Collision: Wenn die Datei schon existiert, Parent-Ordner als Präfix
 		dstPath := filepath.Join(pythonWorkDir, fileName)
@@ -2609,6 +2608,17 @@ def _safe_import(name, *a, **kw):
 builtins.__import__ = _safe_import
 _safe_dir = %q
 os.chdir(_safe_dir)
+# os granular freigeben: nur listdir, path, getcwd — kein remove, system, rename, etc.
+_os_listdir = os.listdir
+_os_path = os.path
+_os_getcwd = os.getcwd
+class _SafeOS:
+    listdir = staticmethod(_os_listdir)
+    path = _os_path
+    getcwd = staticmethod(_os_getcwd)
+    def __getattr__(self, name):
+        raise AttributeError("os." + name + " ist nicht erlaubt. Verfuegbar: listdir, path, getcwd")
+sys.modules['os'] = _SafeOS()
 _orig_open = builtins.open
 def _safe_open(path, *a, **kw):
     p = os.path.normpath(os.path.join(_safe_dir, str(path)))
