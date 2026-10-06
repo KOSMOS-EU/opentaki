@@ -73,6 +73,7 @@ type ChatConfig struct {
 	ChatToken         ChatTokenConfig     `yaml:"chat_token"`
 	Write             ChatWriteConfig     `yaml:"write"`
 	Python            ChatPythonConfig    `yaml:"python"`
+	LLMChunkSize      int                 `yaml:"llm_chunk_size"` // max. chars pro Sub-LLM-Call, default 100000
 	// runtime: lowercase-Set aus EditableExtensions
 	editableSet map[string]bool
 }
@@ -2634,7 +2635,10 @@ func (s *Server) runLLMTool(path, instruction, workDir, sessionID string, trace 
 	content := string(data)
 
 	// Chunking: >60k chars → in 50k-Stücke zerlegen
-	const maxChunk = 100000
+	maxChunk := s.cfg.Chat.LLMChunkSize
+	if maxChunk < 10000 {
+		maxChunk = 100000
+	}
 	var chunks []string
 	if len(content) <= maxChunk {
 		chunks = []string{content}
