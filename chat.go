@@ -129,6 +129,7 @@ Nach 3 Suchversuchen ohne Treffer frage den User ebenfalls, statt weiter zu rate
 Filter in der Frage (z. B. Jahr, Lieferant, Betrag) deckst du nur vollständig ab, wenn die passenden Metadaten (doc.date, doc.type, …) bei den Treffern gesetzt sind. Sind solche Metadaten-Suchen leer oder dünn (doc.date ist bei älteren Dateien oft nicht belegt), verenge stillschweigend nicht den Antwortumfang auf das, was du schon hast (z. B. einen Ordner, dessen Name den Filterbegriff trägt): such zusätzlich einfach nach dem Filterbegriff selbst (z. B. nach dem Jahr im Namen). Kannst du Vollständigkeit damit nicht sicherstellen, beziehe die Antwort ausdrücklich auf den Umfang, den du tatsächlich ausgewertet hast, und biete per present_options an, die übrigen Kandidaten durchlaufen zu lassen.
 Wenn eine Datei gekürzt wurde (Kürzungs-Hinweis im Tool-Ergebnis), erwähne in der Antwort explizit, dass dieses Dokument nur teilweise ausgewertet wurde.
 Wenn du alle nötigen Informationen hast, antworte direkt und strukturiert.
+Wenn du ein fertiges Dokument erstellt hast (Bericht, Analyse, Vorbericht, Auswertung), speichere es mit dem Tool Output im Output-Ordner (Personal Space/Results). Das ist dein PERSISTENTER Ablagebereich — NICHT der temporäre Workspace. Nenne die Datei beschreibend (kleingeschrieben, Bindestriche, Endung .md). Lege zuerst das Verzeichnis mit OutputMkdir an, dann die Datei mit Output.
 Wenn du denselben Tool-Call (Tool + Parameter) erneut aufrufst und ein identisches Ergebnis bekommst: ANTWORTEN mit dem, was du schon hast, oder present_options anbieten. Nicht den Call wiederholen — das führt zu einer Wiederholungsschleife, die der Server abbrechen wird. Nach einem „Datei nicht gefunden“-Fehler: maximal EINMAL mit dem korrigierten Namen (aus List) erneut versuchen, dann weitermachen oder den User fragen — nicht dieselbe Datei immer wieder lesen.`
 
 // pythonToolPrompt liefert die System-Prompt-Zeile für das Python-Tool,
@@ -796,6 +797,23 @@ func chatWriteTools() []toolDefinition {
 			Name:        "Edit",
 			Description: "Wendet einen Unified-Diff-Patch auf eine Datei im Workspace an. Effizienter als Write für kleine Änderungen. Format: Standard Unified Diff mit --- /+++ Header und @@-Hunk-Header. Nutze Read vorher, um den genauen Zeilenkontext zu sehen.",
 			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zur Workspace-Root"},"patch":{"type":"string","description":"Unified-Diff-Patch (mit --- /+++ und @@ Hunk-Headern)"}},"required":["path","patch"]}`),
+		}},
+	}
+}
+
+// chatOutputTools definiert die Output-Tools für den Folder-Chat
+// (persönlicher Space /Results, persistent).
+func chatOutputTools() []toolDefinition {
+	return []toolDefinition{
+		{Type: "function", Function: toolFunction{
+			Name:        "Output",
+			Description: "Speichert ein fertiges Dokument als Datei im Output-Ordner (Personal Space/Results, PERSISTENT). Nutze für Berichte, Analysen, Vorberichte. Der Output-Ordner bleibt erhalten — im Gegensatz zum temporären Workspace. Lege das Verzeichnis vorher mit OutputMkdir an, wenn es neu ist.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Dateipfad relativ zum Output-Ordner, z.B. \"vorbericht-2026/Vorbericht_2026_2027.md\""},"content":{"type":"string","description":"Vollständiger Dateiinhalt (Markdown)"}},"required":["path","content"]}`),
+		}},
+		{Type: "function", Function: toolFunction{
+			Name:        "OutputMkdir",
+			Description: "Legt ein Verzeichnis im Output-Ordner (Personal Space/Results) an. Existiert es bereits, ist der Call ein no-op.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad des Verzeichnisses relativ zum Output-Ordner, z.B. \"vorbericht-2026\""}},"required":["path"]}`),
 		}},
 	}
 }
@@ -1891,7 +1909,7 @@ type toolTrace struct {
 // runChatTool führt einen Tool-Call aus und liefert (tool-Result, Trace).
 // u (userWebDav) darf fehlen, wenn der Request kein User-JWT mitschickt —
 // die Such-Tools melden dann "Suche nicht verfügbar".
-func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pythonWorkDir, sessionID string) (string, toolTrace) {
+func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav, name, argsJSON, pythonWorkDir, sessionID string) (string, toolTrace) {
 	start := time.Now()
 	trace := toolTrace{Tool: name}
 
@@ -2367,6 +2385,61 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 			return "Verzeichnis erfolgreich entfernt: " + fullPath, trace
 		}
 		fallthrough
+	case "Output":
+		if dOutput == nil {
+			trace.Error = "Output nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Output-Ordner ist nicht verfügbar.", trace
+		}
+		if len(args.Content) == 0 {
+			trace.Error = "leerer Content"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Content ist leer.", trace
+		}
+		fullPath, err := safeWritePath("", relPath, s.cfg.Chat.Write.MaxDepth)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		// Parent-Verzeichnis auto-MKCOL (no-op wenn vorhanden)
+		if dir := filepath.Dir(relPath); dir != "." && dir != "" {
+			_ = dOutput.shareMkdir(dir)
+		}
+		if err := dOutput.sharePutFile(relPath, args.Content); err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		trace.Method = "output"
+		trace.Path = fullPath
+		trace.Chars = len(args.Content)
+		trace.FileSize = int64(len(args.Content))
+		trace.MS = time.Since(start).Milliseconds()
+		return fmt.Sprintf("Datei gespeichert: %s (%d Bytes) im Output-Ordner.", relPath, len(args.Content)), trace
+
+	case "OutputMkdir":
+		if dOutput == nil {
+			trace.Error = "Output nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Output-Ordner ist nicht verfügbar.", trace
+		}
+		fullPath, err := safeWritePath("", relPath, s.cfg.Chat.Write.MaxDepth)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		if err := dOutput.shareMkdir(relPath); err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		trace.Method = "output-mkcol"
+		trace.Path = fullPath
+		trace.MS = time.Since(start).Milliseconds()
+		return "Verzeichnis angelegt: " + relPath + "/", trace
+
 	case "read_for_python":
 		if pythonWorkDir == "" {
 			trace.Error = "Sandbox nicht verfügbar"
@@ -2875,6 +2948,12 @@ type chatAskRequest struct {
 		Write struct {
 			Share chatAskShare `json:"share"`
 		} `json:"write"`
+		// Output: Folder-Chat — fertige Dokumente in Personal Space/Results.
+		// Die Extension erzeugt einen Public-Link-Share auf /Results und
+		// schickt token+password. Leer = kein Output-Tool.
+		Output struct {
+			Share chatAskShare `json:"share"`
+		} `json:"output"`
 	} `json:"context"`
 	// Stream: live Fortschritt per Server-Sent-Events
 	// (start/phase/tool/error/done). Default false = finale JSON-Antwort.
@@ -3302,10 +3381,15 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var d *shareWebDav
+	var dOutput *shareWebDav
 	if isBlankChat {
 		d = newShareWebDav(s, req.Context.Write.Share.Token, req.Context.Write.Share.Password)
 	} else {
 		d = newShareWebDav(s, req.Context.Share.Token, req.Context.Share.Password)
+		if req.Context.Output.Share.Token != "" {
+			dOutput = newShareWebDav(s, req.Context.Output.Share.Token, req.Context.Output.Share.Password)
+			tools = append(tools, chatOutputTools()...)
+		}
 	}
 	toolTraces := make([]toolTrace, 0, 8)
 	answer := ""
@@ -3489,7 +3573,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			}
 			var result string
 			var trace toolTrace
-			result, trace = s.runChatTool(d, u, tc.Function.Name, tc.Function.Arguments, pythonWorkDir, sessionID)
+			result, trace = s.runChatTool(d, dOutput, u, tc.Function.Name, tc.Function.Arguments, pythonWorkDir, sessionID)
 			// Duplikat-Hash über ALLE relevanten Daten: Tool-Name,
 			// normalisierte Parameter und das Ergebnis-Content. SHA-256.
 			// Gleicher Hash wie zuvor = exakt derselbe Call mit exakt dem
