@@ -130,7 +130,7 @@ func (s *Server) pythonToolPrompt() string {
 	if !s.cfg.Chat.Python.Enabled {
 		return ""
 	}
-	return "Jede Summe, Differenz, Quote oder andere Berechnung wird mit dem Python-Tool gerechnet, NIEMALS im Kopf. Das Python-Tool führt ein Skript in einer isolierten Umgebung aus (erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools, zipfile, xml, html, io, struct, string, unicodedata, decimal, zlib, pathlib). Dateizugriff nur auf Dateien im Arbeitsbereich (relative Pfade) — der Workspace, in den read_for_python die Quelldateien kopiert hat. Nutze diesen Workspace für die tool-übergreifende Auswertung: Dateien mit read_for_python hineinkopieren, dann per Python mehrere Dateien zusammen auswerten (z. B. XLSX-Tabellen parsen, PDF-Texte vergleichen, Summen über mehrere Dateien bilden). print() nur das Ergebnis.\n"
+	return "Jede Summe, Differenz, Quote oder andere Berechnung wird mit dem Python-Tool gerechnet, NIEMALS im Kopf. Das Python-Tool führt ein Skript in einer isolierten Umgebung aus (erlaubte Module: re, math, statistics, csv, json, collections, itertools, functools, zipfile, xml, html, io, struct, string, unicodedata, decimal, zlib, pathlib, xlrd). Dateizugriff nur auf Dateien im Arbeitsbereich (relative Pfade) — der Workspace, in den read_for_python die Quelldateien kopiert hat. Nutze diesen Workspace für die tool-übergreifende Auswertung: Dateien mit read_for_python hineinkopieren, dann per Python mehrere Dateien zusammen auswerten (z. B. XLSX-Tabellen parsen, XLS-Dateien mit xlrd lesen, PDF-Texte vergleichen, Summen über mehrere Dateien bilden). print() nur das Ergebnis.\n"
 }
 
 // renderChatSystemPrompt füllt die Platzhalter des System-Prompt-Templates
@@ -260,7 +260,7 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 			"collections", "itertools", "functools",
 			"zipfile", "xml", "html", "io", "struct",
 			"string", "unicodedata", "decimal",
-			"zlib", "pathlib",
+			"zlib", "pathlib", "xlrd",
 		}
 	}
 	// EditableExtensions: Default-List für den Create-Mode
