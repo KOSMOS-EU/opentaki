@@ -2633,6 +2633,9 @@ func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time
 		trace.Error = "nur Stderr"
 		return "Fehler: kein stdout, aber Stderr:\n" + stderrStr, trace
 	}
+	if stdoutStr == "" {
+		return "Kein Output. Das Skript lief, hat aber nichts mit print() ausgegeben — die Filter-/Suchbedingungen haben nichts gefunden. Ändere den Code (z.B. print() ohne Filter, oder prüfe die tatsächliche Struktur der Daten).", trace
+	}
 
 	return stdoutStr, trace
 }
