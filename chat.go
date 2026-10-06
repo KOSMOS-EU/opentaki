@@ -2564,8 +2564,9 @@ func (s *Server) runPythonTool(code, workDir string, trace toolTrace, start time
 
 	// Sandbox-Header mit erlaubten Modulen + Workdir
 	moduleList := "'" + strings.Join(cfg.AllowedModules, "', '") + "'"
-	// Vorab-Imports für alle erlaubten Module (lädt interne Abhängigkeiten)
-	preloadImports := "import " + strings.Join(cfg.AllowedModules, ", ")
+	// Vorab-Imports für alle erlaubten Module + Submodule (lädt interne
+	// Abhängigkeiten wie _io in sys.modules, bevor der Hook aktiv wird)
+	preloadImports := "import " + strings.Join(cfg.AllowedModules, ", ") + "\nimport xml.etree.ElementTree"
 	header := fmt.Sprintf(pythonSandboxHeader, preloadImports, "["+moduleList+"]", workDir)
 	script := header + "\n" + code
 	scriptPath := filepath.Join(workDir, "script.py")
