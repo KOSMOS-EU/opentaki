@@ -2634,7 +2634,7 @@ func (s *Server) runLLMTool(path, instruction, workDir, sessionID string, trace 
 	content := string(data)
 
 	// Chunking: >60k chars → in 50k-Stücke zerlegen
-	const maxChunk = 50000
+	const maxChunk = 100000
 	var chunks []string
 	if len(content) <= maxChunk {
 		chunks = []string{content}
