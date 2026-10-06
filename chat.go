@@ -715,7 +715,7 @@ func (s *Server) chatTools() []toolDefinition {
 		{Type: "function", Function: toolFunction{
 			Name:        "Read",
 			Description: "Liest eine Datei im geteilten Ordner. Editierbare Typen (code, html, md, txt, …) liefern raw Content; andere Typen (pdf, office, …) den extrahierten Text. Bilder liefern eine VLM-Beschreibung. Große Dateien werden auf 500 Zeilen gekürzt — der Abschluss-Hinweis nennt die exakte Fortsetzungs-Zeile, mit der du die Datei vollständig in Abschnitten liest. Pfade relativ zum geteilten Ordner.",
-			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"},"offset":{"type":"integer","description":"Optional: erste Zeile (1-basiert). Nur bei editierbaren Texttypen. Default 1."},"limit":{"type":"integer","description":"Optional: Anzahl der Zeilen. Nur bei editierbaren Texttypen. Default 500."}},"required":["path"]}`),
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad der Datei relativ zum geteilten Ordner"},"offset":{"type":"integer","description":"Optional: erste Zeile (1-basiert). Default 1."},"limit":{"type":"integer","description":"Optional: Anzahl der Zeilen. Default 500."}},"required":["path"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
 			Name:        "Meta",
@@ -2143,6 +2143,26 @@ func (s *Server) runChatTool(d *shareWebDav, u *userWebDav, name, argsJSON, pyth
 			trace.Error = "Inhalt konnte nicht extrahiert werden"
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Inhalt der Datei konnte nicht extrahiert werden", trace
+		}
+		// offset/limit auf extrahierte Zeilen anwenden (analog readSegment)
+		if args.Offset > 1 || args.Limit > 0 {
+			lines := strings.Split(text, "\n")
+			start := args.Offset - 1
+			if start < 0 {
+				start = 0
+			}
+			if start >= len(lines) {
+				text = ""
+			} else {
+				end := len(lines)
+				if args.Limit > 0 && start+args.Limit < end {
+					end = start + args.Limit
+				}
+				text = strings.Join(lines[start:end], "\n")
+				if start > 0 || end < len(lines) {
+					text = fmt.Sprintf("[Abschnitt: Zeilen %d–%d von %d]\n", start+1, end, len(lines)) + text
+				}
+			}
 		}
 		max := s.cfg.Chat.MaxFileChars
 		if len(text) > max {
