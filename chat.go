@@ -825,7 +825,7 @@ type chatToolsRequest struct {
 	MaxTokens int               `json:"max_tokens"`
 	Temp      float64           `json:"temperature"`
 	Messages  []chatToolMessage `json:"messages"`
-	Tools     []toolDefinition  `json:"tools"`
+	Tools     []toolDefinition  `json:"tools,omitempty"`
 }
 
 type chatToolsResponse struct {
