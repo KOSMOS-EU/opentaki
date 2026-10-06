@@ -3668,16 +3668,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 		// Serverseitiger Abbruch: das Modell wiederholt sich und liefert
 		// kein neues Ergebnis. Statt blind weiterzulaufen (970 Iterationen
 		// im August-Fall) antworten mit Zwischenergebnis + Optionen.
-		// Python und read_for_python: höhere Toleranz, weil beim Daten-Scannen
-		// mehrere identische Python-Calls legitim sind (z. B. t.find() auf
-		// derselben Datei, die zufällig das selbe liefert).
 		// WICHTIG: consecutiveDuplicates zählt nur WIEDERHOLUNGEN desselben
 		// contentHash (Tool+Args+Result). Verschiedene Dateien in einer
 		// parallelen Antwort zählen NICHT als consecutive dups.
 		dupLimit := 3
-		if lastRealTool == "Python" || lastRealTool == "read_for_python" {
-			dupLimit = 5
-		}
 		if consecutiveDuplicates >= dupLimit {
 			log.Printf("chat/ask [%s]: loop-break nach %d aufeinanderfolgenden Duplikaten (iteration %d)", sessionID, consecutiveDuplicates, iterations)
 			answer = loopBreakAnswer("die gleiche Anfrage wiederholt lieferte kein neues Ergebnis (Wiederholungsschleife)", lastRealTool, lastRealResult, isBlankChat)
