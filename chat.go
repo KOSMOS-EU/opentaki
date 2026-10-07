@@ -3989,6 +3989,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	// §2 Identische Tool-Calls: Hash über Tool + Parameter (ohne Ergebnis).
 	// 2. identischer Call → [SERVER] Hinweis, 3. → Tool für Turn entziehen.
 	identicalCalls := map[string]int{}
+	blockedTools := map[string]bool{} // Tool-Name → für den Turn aus der Tool-Liste entfernt
 	workspaceFiles := map[string]string{} // relPath → workspaceName
 	searchMissCount := 0                  // §7: aufeinanderfolgende Suchen ohne Treffer
 	questionNudgeSent := false            // §8: Rückfrage-Hint schon gesendet?
@@ -4086,7 +4087,17 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			toolChoice = "none"
 			log.Printf("chat/ask [%s]: step-budget limit, forcing tool_choice=none (iteration %d)", sessionID, i)
 		}
-		msg, finishReason, usage, err := s.llmChatTools(sessionID, model, messages, tools, toolChoice)
+		// §2: Entzogene Tools aus der Tool-Liste entfernen.
+		activeTools := tools
+		if len(blockedTools) > 0 {
+			activeTools = make([]toolDefinition, 0, len(tools))
+			for _, t := range tools {
+				if !blockedTools[t.Function.Name] {
+					activeTools = append(activeTools, t)
+				}
+			}
+		}
+		msg, finishReason, usage, err := s.llmChatTools(sessionID, model, messages, activeTools, toolChoice)
 		if err != nil {
 			if stream {
 				sse.event("error", map[string]string{"error": err.Error()})
@@ -4208,6 +4219,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			// 2. identischer Call: [SERVER]-Hinweis statt Ergebnis erneut liefern.
 			// 3. identischer Call: Tool für den Turn entziehen.
 			if identicalCalls[callHash] >= 3 {
+				if !blockedTools[tc.Function.Name] {
+					blockedTools[tc.Function.Name] = true
+					log.Printf("chat/ask [%s]: tool entzogen: %s (3. identischer Call)", sessionID, tc.Function.Name)
+				}
 				result := fmt.Sprintf("[SERVER] Identischer Call wie in Schritt 1 und 2 (tool=%s). Ergebnis unverändert. Nimm einen anderen Weg: andere Parameter, anderes Tool, oder antworte mit dem Vorhandenen.", tc.Function.Name)
 				trace := toolTrace{Tool: tc.Function.Name, Method: "identical-blocked"}
 				log.Printf("chat/ask [%s]: identical-blocked: 3rd identical call (tool=%s, iteration %d)", sessionID, tc.Function.Name, iterations)
@@ -4307,7 +4322,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					log.Printf("chat/ask [%s]: py-loop-warn code=%s (iteration %d, loop=%d, serie=%d)", sessionID, pyCodeFP, iterations, pyLoop.loopCount[pyCodeFP], pyLoop.codeCount[pyCodeFP])
 				}
 				if pyLoop.pythonDisabled {
-					log.Printf("chat/ask [%s]: python-tool deaktiviert (4+ Loop-Treffer) (iteration %d)", sessionID, iterations)
+					if !blockedTools["Python"] {
+						blockedTools["Python"] = true
+						log.Printf("chat/ask [%s]: python-tool deaktiviert (4+ Loop-Treffer) (iteration %d)", sessionID, iterations)
+					}
 				}
 			} else if tc.Function.Name != "Python" {
 				// Nicht-Python-Tool: Leere-Ausgabe-Counter zurücksetzen.
