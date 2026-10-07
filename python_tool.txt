@@ -6,10 +6,16 @@ Umgebung
 - Zugriff nur auf Dateien im Workspace, mit relativen Pfaden. read_for_python kopiert Quelldateien dorthin.
 - Extrahierter Text liegt mit dem Suffix .txt daneben (aus „daten.xlsx“ wird „daten.xlsx.txt“) und ist direkt lesbar.
 
-Formate
+Formate (Lesen)
 - .xlsx: openpyxl.load_workbook(f, data_only=True)
 - .xls: xlrd.open_workbook(f)
 - .docx: zipfile, darin word/document.xml
+
+Formate (Erzeugen)
+- .md: open() + write() (Markdown, Tabellen per tabulate)
+- .xlsx: openpyxl.Workbook() → wb.save(f)
+- .docx: docx.Document() → doc.save(f)
+- .odt/.ods: odfpy (opendocument)
 
 Ausgabe
 - Gib mit print() nur das Ergebnis aus (Zahlen, einzelne Zeilen), nie den Rohtext oder große Teile davon. Jede Ausgabe bleibt im Kontext.

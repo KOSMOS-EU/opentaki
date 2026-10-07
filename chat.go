@@ -40,6 +40,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dustin/go-humanize"
 )
 
 // ── Config ───────────────────────────────────────────────────
@@ -174,10 +176,11 @@ Muss der User etwas entscheiden (unklare Vorgabe, mehrere Wege, unklarer Umfang)
 - Jeder Satz über eine Zahl passt zur Zahl. „Steigt“ schreibst du nur, wenn der Wert steigt.
 
 # Dokumente erstellen
-Ein fertiges Dokument (Bericht, Analyse, Auswertung) speicherst du im Output-Ordner (Personal Space/Results). Das ist die dauerhafte Ablage, der Workspace ist nur temporär.
-- Zuerst das Verzeichnis mit OutputMkdir anlegen, dann die Datei mit Output speichern.
-- Dateiname beschreibend, kleingeschrieben, mit Bindestrichen, Endung .md.
-- Der Output-Ordner ist über einen öffentlichen Link erreichbar. Namen, Adressen, Kontonummern und Steuernummern lässt du weg oder ersetzt sie durch eine allgemeine Bezeichnung (Funktion statt Name).
+Ein fertiges Dokument speicherst du im Output-Ordner (Personal Space/Results). Das ist die dauerhafte Ablage.
+- Mit Zahlen, Tabellen oder Berechnungen: Python erzeugt die Datei im Workspace, dann output_file.
+- Kurzer Text ohne Zahlen: output_text.
+- Dateiname beschreibend, kleingeschrieben, mit Bindestrichen.
+- Der Output-Ordner ist öffentlich verlinkt. Namen, Adressen, Kontonummern und Steuernummern lässt du weg oder ersetzt sie durch eine allgemeine Bezeichnung.
 - Ein Dokument mit Zahlen endet mit einem Abschnitt „Prüfprotokoll“: welche Summen gegen welchen Quellwert geprüft wurden (OK oder nicht prüfbar), welche Werte fehlen, welche Annahmen du getroffen hast.
 
 # Antwort
@@ -208,10 +211,16 @@ Umgebung
 - Zugriff nur auf Dateien im Workspace, mit relativen Pfaden. read_for_python kopiert Quelldateien dorthin.
 - Extrahierter Text liegt mit dem Suffix .txt daneben (aus „daten.xlsx“ wird „daten.xlsx.txt“) und ist direkt lesbar.
 
-Formate
+Formate (Lesen)
 - .xlsx: openpyxl.load_workbook(f, data_only=True)
 - .xls: xlrd.open_workbook(f)
 - .docx: zipfile, darin word/document.xml
+
+Formate (Erzeugen)
+- .md: open() + write() (Markdown, Tabellen per tabulate)
+- .xlsx: openpyxl.Workbook() → wb.save(f)
+- .docx: docx.Document() → doc.save(f)
+- .odt/.ods: odfpy (opendocument)
 
 Ausgabe
 - Gib mit print() nur das Ergebnis aus (Zahlen, einzelne Zeilen), nie den Rohtext oder große Teile davon. Jede Ausgabe bleibt im Kontext.
@@ -362,6 +371,7 @@ func (c *ChatConfig) applyDefaults(cfg *Config) {
 			"zipfile", "xml", "html", "io", "struct",
 			"string", "unicodedata", "decimal",
 			"zlib", "pathlib", "xlrd", "os",
+			"openpyxl", "docx", "odfpy", "tabulate", "jinja2", "babel",
 		}
 	}
 	// EditableExtensions: Default-List für den Create-Mode
@@ -899,14 +909,14 @@ func chatWriteTools() []toolDefinition {
 func chatOutputTools() []toolDefinition {
 	return []toolDefinition{
 		{Type: "function", Function: toolFunction{
-			Name:        "Output",
-			Description: "Speichert ein fertiges Dokument als Datei im Output-Ordner (Personal Space/Results, PERSISTENT). Nutze für Berichte, Analysen, Vorberichte. Der Output-Ordner bleibt erhalten — im Gegensatz zum temporären Workspace. Lege das Verzeichnis vorher mit OutputMkdir an, wenn es neu ist.",
-			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Dateipfad relativ zum Output-Ordner, z.B. \"vorbericht-2026/Vorbericht_2026_2027.md\""},"content":{"type":"string","description":"Vollständiger Dateiinhalt (Markdown)"}},"required":["path","content"]}`),
+			Name:        "output_file",
+			Description: "Speichert eine im Workspace von Python erzeugte Datei im Output-Ordner (Personal Space/Results, PERSISTENT). Nimm den Dateipfad relativ zum Workspace. Formate: .md, .xlsx, .docx, .odt, .ods, .html, .txt. Verzeichnisse werden automatisch angelegt.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Dateipfad relativ zum Workspace, z.B. 'bericht.md' oder 'vorbericht/tabelle.xlsx'"}},"required":["name"]}`),
 		}},
 		{Type: "function", Function: toolFunction{
-			Name:        "OutputMkdir",
-			Description: "Legt ein Verzeichnis im Output-Ordner (Personal Space/Results) an. Existiert es bereits, ist der Call ein no-op.",
-			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Pfad des Verzeichnisses relativ zum Output-Ordner, z.B. \"vorbericht-2026\""}},"required":["path"]}`),
+			Name:        "output_text",
+			Description: "Speichert einen Text ohne Zahlenwerte als Datei im Output-Ordner (Personal Space/Results). NUR für Dokumente ohne Beträge, Prozentwerte oder Tabellen. Für Dokumente mit Zahlen: Python erzeugt die Datei, dann output_file.",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Dateipfad relativ zum Output-Ordner, z.B. 'zusammenfassung.md'"},"content":{"type":"string","description":"Vollständiger Textinhalt (Markdown)"}},"required":["path","content"]}`),
 		}},
 	}
 }
@@ -1820,6 +1830,33 @@ func normalizeOutputFilename(pth string) string {
 	return dir + "/" + name
 }
 
+// normalizeOutputFilenamePreserveExt ist wie normalizeOutputFilename,
+// behält aber die Original-Endung bei (für output_file mit xlsx, docx etc.).
+func normalizeOutputFilenamePreserveExt(name string) string {
+	name = filepath.Base(name)
+	name = strings.ToLower(name)
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.ReplaceAll(name, "_", "-")
+	if filepath.Ext(name) == "" {
+		name += ".md"
+	}
+	return name
+}
+
+func isTextFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".md", ".txt", ".html", ".csv", ".json", ".xml":
+		return true
+	}
+	return false
+}
+
+var reFinancialNumbers = regexp.MustCompile(`(?i)(\d+[\.,]\d{2}\s*(?:€|EUR|euro)|\d+(?:\.\d+)?\s*(?:%|Prozent)|\d{1,3}(?:[.\s]\d{3}){1,3},\d{2})`)
+
+func hasFinancialNumbers(content string) bool {
+	return reFinancialNumbers.MatchString(content)
+}
+
 // spaceURL baut den vollständigen WebDAV-Pfad für ein Resource im
 // persönlichen Space (root + relPath → /dav/spaces/<spaceID>/<root>/<rel>).
 func (u *userWebDav) spaceURL(spaceID, root, relPath string) string {
@@ -2217,6 +2254,7 @@ func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav
 		Convert     string `json:"convert"`
 		Page        int    `json:"page"`
 		Instruction string `json:"instruction"`
+		Name        string `json:"name"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		trace.Error = "ungültige Argumente: " + err.Error()
@@ -2224,8 +2262,9 @@ func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav
 		return "Fehler: ungültige Tool-Argumente: " + err.Error(), trace
 	}
 	isSearch := name == "Search"
+	isOutputFile := name == "output_file"
 	relPath := ""
-	if !isSearch {
+	if !isSearch && !isOutputFile {
 		cleanPath, err := safeRelPath(args.Path)
 		if err != nil {
 			trace.Error = err.Error()
@@ -2681,7 +2720,90 @@ func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav
 			return "Verzeichnis erfolgreich entfernt: " + fullPath, trace
 		}
 		fallthrough
-	case "Output":
+	case "output_file":
+		if dOutput == nil {
+			trace.Error = "Output nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Output-Ordner ist nicht verfügbar.", trace
+		}
+		if pythonWorkDir == "" {
+			trace.Error = "Workspace nicht verfügbar"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Workspace ist nicht verfügbar. Lies zuerst eine Datei mit read_for_python oder führe Python aus.", trace
+		}
+		wsName := filepath.Clean(args.Name)
+		if wsName == "." || strings.HasPrefix(wsName, "..") {
+			trace.Error = "ungültiger Pfad"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: ungültiger Dateipfad.", trace
+		}
+		wsPath := filepath.Join(pythonWorkDir, wsName)
+		wsStat, err := os.Stat(wsPath)
+		if err != nil {
+			trace.Error = "Datei nicht gefunden"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Datei im Workspace nicht gefunden: " + args.Name, trace
+		}
+		if wsStat.IsDir() {
+			trace.Error = "ist ein Verzeichnis"
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: Pfad ist ein Verzeichnis, keine Datei.", trace
+		}
+		fileData, err := os.ReadFile(wsPath)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		// §9 PII-Scan (nur Text-Dateien)
+		pruefHinweis := ""
+		if isTextFile(args.Name) {
+			textContent := string(fileData)
+			if piiLabel, lineNo := piiScan(textContent); piiLabel != "" {
+				trace.Error = "PII gefunden"
+				trace.MS = time.Since(start).Milliseconds()
+				log.Printf("chat/ask [%s]: PII blocked: %s in Zeile %d (tool=output_file)", sessionID, piiLabel, lineNo)
+				return fmt.Sprintf("[SERVER] Enthält %s in Zeile %d. Entferne oder verallgemeinere die Daten und versuche erneut. Der Output-Ordner ist öffentlich verlinkt.", piiLabel, lineNo), trace
+			}
+			// §9 Prüfprotokoll-Prüfung (nicht blockieren)
+			if strings.Contains(textContent, "|") && strings.Contains(textContent, "---") &&
+				!strings.Contains(textContent, "Prüfprotokoll") && !strings.Contains(textContent, "Pruefprotokoll") {
+				pruefHinweis = "\n[SERVER] Dokument enthält Tabellen, aber keinen Abschnitt „Prüfprotokoll“. Bitte ergänze vor der nächsten Ausgabe."
+			}
+		}
+		// §9 Dateiname normalisieren (Endung beibehalten, nicht auf .md zwingen)
+		destPath := normalizeOutputFilenamePreserveExt(filepath.Base(args.Name))
+		fullPath, err := safeWritePath("", destPath, s.cfg.Chat.Write.MaxDepth)
+		if err != nil {
+			trace.Error = err.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + err.Error(), trace
+		}
+		// Parent-Verzeichnis auto-MKCOL (no-op wenn vorhanden)
+		if dir := filepath.Dir(destPath); dir != "." && dir != "" {
+			_ = dOutput.shareMkdir(dir)
+		}
+		// Upload: Binary für xlsx/docx/odt/ods, Text sonst
+		var putErr error
+		switch strings.ToLower(filepath.Ext(args.Name)) {
+		case ".xlsx", ".docx", ".odt", ".ods":
+			putErr = dOutput.sharePutBinary(destPath, fileData)
+		default:
+			putErr = dOutput.sharePutFile(destPath, string(fileData))
+		}
+		if putErr != nil {
+			trace.Error = putErr.Error()
+			trace.MS = time.Since(start).Milliseconds()
+			return "Fehler: " + putErr.Error(), trace
+		}
+		trace.Method = "output"
+		trace.Path = fullPath
+		trace.FileSize = wsStat.Size()
+		trace.Chars = int(wsStat.Size())
+		trace.MS = time.Since(start).Milliseconds()
+		return fmt.Sprintf("Datei gespeichert: %s (%s) im Output-Ordner.%s", destPath, humanize.Bytes(uint64(wsStat.Size())), pruefHinweis), trace
+
+	case "output_text":
 		if dOutput == nil {
 			trace.Error = "Output nicht verfügbar"
 			trace.MS = time.Since(start).Milliseconds()
@@ -2692,17 +2814,22 @@ func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav
 			trace.MS = time.Since(start).Milliseconds()
 			return "Fehler: Content ist leer.", trace
 		}
+		// Zahlen-Prüfung: output_text ist nur für Dokumente OHNE Zahlen.
+		if hasFinancialNumbers(args.Content) {
+			trace.Error = "Zahlen in output_text"
+			trace.MS = time.Since(start).Milliseconds()
+			return "[SERVER] Dokument enthält Zahlenwerte. Für Dokumente mit Berechnungen: Python erzeugt die Datei im Workspace, dann output_file.", trace
+		}
 		// §9 PII-Scan: Ordner ist öffentlich verlinkt.
 		if piiLabel, lineNo := piiScan(args.Content); piiLabel != "" {
 			trace.Error = "PII gefunden"
 			trace.MS = time.Since(start).Milliseconds()
-			log.Printf("chat/ask [%s]: PII blocked: %s in Zeile %d (tool=Output)", sessionID, piiLabel, lineNo)
+			log.Printf("chat/ask [%s]: PII blocked: %s in Zeile %d (tool=output_text)", sessionID, piiLabel, lineNo)
 			return fmt.Sprintf("[SERVER] Enthält %s in Zeile %d. Entferne oder verallgemeinere die Daten und versuche erneut. Der Output-Ordner ist öffentlich verlinkt.", piiLabel, lineNo), trace
 		}
 		// §9 Dateiname normalisieren
 		relPath = normalizeOutputFilename(relPath)
-		// §9 Prüfprotokoll-Prüfung: Dokument mit Tabellen braucht einen
-		// "Prüfprotokoll"-Abschnitt. Einmalig nachfordern (nicht blockieren).
+		// §9 Prüfprotokoll-Prüfung (nicht blockieren)
 		pruefHinweis := ""
 		if strings.Contains(args.Content, "|") && strings.Contains(args.Content, "---") &&
 			!strings.Contains(args.Content, "Prüfprotokoll") && !strings.Contains(args.Content, "Pruefprotokoll") {
@@ -2729,28 +2856,6 @@ func (s *Server) runChatTool(d *shareWebDav, dOutput *shareWebDav, u *userWebDav
 		trace.FileSize = int64(len(args.Content))
 		trace.MS = time.Since(start).Milliseconds()
 		return fmt.Sprintf("Datei gespeichert: %s (%d Bytes) im Output-Ordner.%s", relPath, len(args.Content), pruefHinweis), trace
-
-	case "OutputMkdir":
-		if dOutput == nil {
-			trace.Error = "Output nicht verfügbar"
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: Output-Ordner ist nicht verfügbar.", trace
-		}
-		fullPath, err := safeWritePath("", relPath, s.cfg.Chat.Write.MaxDepth)
-		if err != nil {
-			trace.Error = err.Error()
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: " + err.Error(), trace
-		}
-		if err := dOutput.shareMkdir(relPath); err != nil {
-			trace.Error = err.Error()
-			trace.MS = time.Since(start).Milliseconds()
-			return "Fehler: " + err.Error(), trace
-		}
-		trace.Method = "output-mkcol"
-		trace.Path = fullPath
-		trace.MS = time.Since(start).Milliseconds()
-		return "Verzeichnis angelegt: " + relPath + "/", trace
 
 	case "read_for_python":
 		if pythonWorkDir == "" {
