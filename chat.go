@@ -1016,6 +1016,7 @@ type shareWebDav struct {
 func newShareWebDav(s *Server, token, password string) *shareWebDav {
 	basePath := "/dav/public-files/" + url.PathEscape(token)
 	base := strings.TrimRight(s.cfg.OpenCloud.URL, "/") + basePath
+	log.Printf("shareWebDav: base=%s token=%s passwd_len=%d", base, token, len(password))
 	return &shareWebDav{
 		client:   &http.Client{Timeout: 10 * time.Minute},
 		base:     base,
@@ -1122,16 +1123,20 @@ func (d *shareWebDav) propfind(relPath string) ([]listingEntry, error) {
   </d:prop>
 </d:propfind>`)
 
-	resp, err := d.do("PROPFIND", d.urlFor(relPath), 1, body)
+	u := d.urlFor(relPath)
+	resp, err := d.do("PROPFIND", u, 1, body)
 	if err != nil {
+		log.Printf("propfind: %s → error: %v", u, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if msg, ok := shareAuthError(resp); ok {
+		log.Printf("propfind: %s → HTTP %d: %s", u, resp.StatusCode, msg)
 		return nil, fmt.Errorf("%s", msg)
 	}
 	if resp.StatusCode != 207 {
+		log.Printf("propfind: %s → HTTP %d", u, resp.StatusCode)
 		return nil, fmt.Errorf("PROPFIND: unerwarteter HTTP %d", resp.StatusCode)
 	}
 
@@ -1451,16 +1456,20 @@ func pathMatches(href, target string) bool {
 
 // getfile lädt eine Datei (max. maxShareBytes) und liefert Bytes + Content-Type.
 func (d *shareWebDav) getfile(relPath string) ([]byte, string, error) {
-	resp, err := d.do("GET", d.urlFor(relPath), -1, nil)
+	u := d.urlFor(relPath)
+	resp, err := d.do("GET", u, -1, nil)
 	if err != nil {
+		log.Printf("getfile: GET %s → error: %v", u, err)
 		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	if msg, ok := shareAuthError(resp); ok {
+		log.Printf("getfile: GET %s → HTTP %d: %s", u, resp.StatusCode, msg)
 		return nil, "", fmt.Errorf("%s", msg)
 	}
 	if resp.StatusCode != 200 {
+		log.Printf("getfile: GET %s → HTTP %d", u, resp.StatusCode)
 		return nil, "", fmt.Errorf("GET: unerwarteter HTTP %d", resp.StatusCode)
 	}
 
