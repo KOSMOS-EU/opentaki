@@ -4,15 +4,17 @@ Grundsatz: Was der Server erzwingen kann, steht nicht als Bitte im Prompt. Der S
 
 Reihenfolge nach Wirkung: Abschnitte 1 bis 3 beheben die Loops, 4 und 5 den Kontextüberlauf, der Rest ist Absicherung.
 
-## 1. Loop-Schutz für Python
+## 1. Loop-Schutz für Python (korrigiert 2026-10-07)
 
 - **Fingerabdruck je Skript:** Code normalisieren (Leerraum, Kommentare, String-Literale wie Dateinamen, Zahlen wie Offsets und Zeilennummern durch Platzhalter ersetzen) und hashen. So fällt auch „gleicher Code, anderer Dateiname" und „gleicher Code, anderer Offset" auf.
 - **Fingerabdruck je Fehler:** Fehlertyp plus letzte Traceback-Zeile ohne variable Teile.
-- **Stufen pro Turn:**
-  1. Zweiter Treffer (gleicher Code-Fingerabdruck oder gleicher Fehler): Ergebnis normal liefern, davor `[SERVER] Gleiches Skript / gleicher Fehler wie in Schritt N. Dieser Ansatz führt nicht weiter. Nimm einen anderen Weg oder antworte mit dem Vorhandenen.`
-  2. Dritter Treffer: Skript nicht ausführen. Nur `[SERVER] Ansatz gesperrt.` plus die zwei erlaubten Auswege (anderes Tool, Antwort oder present_options).
-  3. Vierter Treffer: Python-Tool für den Rest des Turns aus der Tool-Liste nehmen.
-- **Leere Ausgabe:** Wenn ein Skript nichts druckt, `[SERVER] Keine Ausgabe. Das Skript hat nichts gedruckt oder nichts gefunden.` statt eines leeren Ergebnisses. Zwei leere Ausgaben in Folge zählen wie ein wiederholter Fehler.
+- **Loop vs. Serie:**
+  - **Loop:** gleicher Code-Fingerabdruck UND (Fehler | leere Ausgabe | identische Ausgabe wie zuvor). Nur dann greifen die Stufen:
+    1. Zweiter Loop-Treffer: Ergebnis liefern + `[SERVER] Gleiches Skript mit gleichem Ergebnis wie zuvor. Dieser Ansatz führt nicht weiter. Nimm einen anderen Weg oder antworte mit dem Vorhandenen.`
+    2. Dritter Loop-Treffer: Skript nicht ausführen. `[SERVER] Ansatz gesperrt.` plus zwei Auswege.
+    3. Vierter Loop-Treffer: Python-Tool für den Rest des Turns aus der Tool-Liste nehmen.
+  - **Serie:** gleicher Code-Fingerabdruck, aber jeweils NEUE Ausgabe. Kein Block. Ab 5 Calls: `[SERVER] 5 gleichartige Skripte in Folge. Fass die übrigen Abfragen in einem Skript zusammen oder werte die Datei mit llm aus.`
+- **Leere Ausgabe:** Wenn ein Skript nichts druckt, `[SERVER] Keine Ausgabe. Das Skript hat nichts gedruckt oder nichts gefunden.` statt eines leeren Ergebnisses. Leere Ausgabe zählt als Loop (nicht als Serie).
 
 ## 2. Identische Tool-Calls allgemein
 
