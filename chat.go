@@ -2092,13 +2092,12 @@ var (
 	pyCodeNumberRE     = regexp.MustCompile(`\b\d+\.?\d*\b`)
 )
 
-// normalizePythonCode ersetzt Leerraum, Kommentare, String-Literale und
-// Zahlen durch Platzhalter und liefert eine normalisierte Form, die als
-// Basis für den Code-Fingerabdruck dient. So fällt auch „gleicher Code,
-// anderer Dateiname" und „gleicher Code, anderer Offset" auf.
+// normalizePythonCode ersetzt Leerraum, Kommentare und Zahlen durch
+// Platzhalter und liefert eine normalisierte Form, die als Basis für
+// den Code-Fingerabdruck dient. Strings werden NICHT ersetzt:
+// t.find('A') und t.find('B') sind unterschiedliche Ansätze.
 func normalizePythonCode(code string) string {
 	s := pyCodeCommentRE.ReplaceAllString(code, " ")
-	s = pyCodeStringRE.ReplaceAllString(s, " _S_ ")
 	s = pyCodeNumberRE.ReplaceAllString(s, " _N_ ")
 	s = pyCodeWhitespaceRE.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
