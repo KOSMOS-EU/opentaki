@@ -218,6 +218,9 @@ Ausgabe
 - Große Zwischenergebnisse schreibst du in eine Datei im Workspace und gibst nur die Zeilen aus, die du für den nächsten Schritt brauchst.
 - Für die inhaltliche Auswertung großer Dokumente nimmst du das llm-Tool statt print().
 
+Mehrere Stellen desselben Dokuments
+Brauchst du mehrere Abschnitte oder Stellen aus demselben Dokument, holst du sie mit EINEM einzigen Skript: eine Liste der Suchbegriffe (z. B. section_names = ["Allgemeines", "Wirtschaft", "Personen"]), für jeden Begriff die Fundstelle im Text extrahieren, Ergebnis in eine Workspace-Datei schreiben und pro Begriff nur Titel + Zeichenlänge ausgeben. Die inhaltliche Auswertung macht danach ein llm-Aufruf auf diese Datei. Nie ein eigenes Skript pro Abschnitt.
+
 Tabellen erkunden
 Verschaff dir zuerst mit einem einzigen Skript den Überblick: alle Sheets (wb.sheetnames), je Sheet max_row und max_column und die ersten nicht leeren Zeilen. Erst danach greifst du gezielt auf Zeilen und Spalten zu. Triffst du auf leere Zeilen, such nicht Zeile für Zeile weiter, sondern geh zurück zum Überblick: Die Daten liegen dann in einem anderen Bereich oder einem anderen Sheet.
 
@@ -2094,63 +2097,87 @@ func errorFingerprint(stderr string) string {
 }
 
 // pyLoopState: Server-seitiger Loop-Schutz für Python-Tool-Calls.
-// Pro Turn (handleChatAsk). Stufen:
-//   1. Treffer: normal (Basis)
-//   2. Treffer: Ergebnis liefern + [SERVER]-Warnung
-//   3. Treffer: Skript NICHT ausführen, [SERVER] Ansatz gesperrt
-//   4. Treffer: Python-Tool für Rest des Turns aus Tool-Liste nehmen
+// Pro Turn (handleChatAsk).
+//
+// Loop: gleicher Code-Fingerabdruck UND (Fehler | leere Ausgabe | dieselbe
+// Ausgabe wie zuvor). Nur dann greifen die Stufen (warn → block → disable).
+// Serie: gleicher Code-Fingerabdruck, aber jeweils NEUE Ausgabe. Hier wird
+// nicht gesperrt; nach N Calls ein Hinweis, die Abfragen zusammenzufassen.
 type pyLoopState struct {
-	codeFingerprints map[string]int // fp → Trefferzahl
-	errorFingerprints map[string]int // fp → Trefferzahl
-	emptyCount       int
-	pythonDisabled   bool
+	codeCount   map[string]int      // codeFP → Trefferzahl (ALLE, Loop + Serie)
+	loopCount   map[string]int      // codeFP → Trefferzahl (nur echte Loops: Fehler/leer/same-output)
+	errCount    map[string]int      // errFP → Trefferzahl
+	lastOutput  map[string]string   // codeFP → SHA-256 der letzten Ausgabe
+	emptyCount  int
+	pythonDisabled bool
 }
+
+const pyLoopWarnThreshold = 5 // Serie: nach N Calls Hinweis
 
 func newPyLoopState() *pyLoopState {
 	return &pyLoopState{
-		codeFingerprints:  map[string]int{},
-		errorFingerprints: map[string]int{},
+		codeCount:  map[string]int{},
+		loopCount:  map[string]int{},
+		errCount:   map[string]int{},
+		lastOutput: map[string]string{},
 	}
 }
 
 // ── Python Loop-Schutz ──────────────────────────────────────
 
-// checkPyLoop prüft vor der Ausführung ob der Ansatz gesperrt ist
-// (Treffer 3+) und liefert den [SERVER]-Blocktext.
+// outputHash: kurzer Hash der Python-Ausgabe (für Loop-Erkennung).
+func outputHash(result string) string {
+	h := sha256.Sum256([]byte(strings.TrimSpace(result)))
+	return hex.EncodeToString(h[:8])
+}
+
+// checkBlocked prüft VOR der Ausführung: ist der Ansatz gesperrt?
+// Nur echte Loops (gleicher Code + Fehler/leer/gleiche Ausgabe) zählen.
 func (s *pyLoopState) checkBlocked(codeFP, errFP string) (bool, string) {
-	if s.codeFingerprints[codeFP] >= 3 {
-		return true, "[SERVER] Ansatz gesperrt. Dieser Code wurde bereits dreimal ausgeführt mit demselben Muster. Nimm einen anderen Weg: anderes Tool, andere Datei, oder antworte mit dem Vorhandenen. Alternativ: present_options."
+	if s.loopCount[codeFP] >= 3 {
+		return true, "[SERVER] Ansatz gesperrt. Dieser Code wurde bereits dreimal mit gleichem Ergebnis (Fehler oder keine neue Ausgabe) ausgeführt. Nimm einen anderen Weg: anderes Tool, andere Datei, oder antworte mit dem Vorhandenen. Alternativ: present_options."
 	}
-	if errFP != "" && s.errorFingerprints[errFP] >= 3 {
+	if errFP != "" && s.errCount[errFP] >= 3 {
 		return true, "[SERVER] Ansatz gesperrt. Derselbe Fehler ist bereits dreimal aufgetreten. Nimm einen anderen Weg: anderes Tool, andere Datei, oder antworte mit dem Vorhandenen. Alternativ: present_options."
 	}
 	return false, ""
 }
 
-// checkWarn liefert die [SERVER]-Warnung bei zweitem Treffer.
-func (s *pyLoopState) checkWarn(codeFP, errFP string) string {
-	if s.codeFingerprints[codeFP] == 2 {
-		return "[SERVER] Gleiches Skript wie in Schritt 1 (normalisierter Code-Fingerabdruck identisch). Dieser Ansatz führt nicht weiter. Nimm einen anderen Weg oder antworte mit dem Vorhandenen."
+// checkWarn liefert die [SERVER]-Warnung bei zweitem LOOP-Treffer
+// (nicht bei Serie). Zusätzlich: Serie-Hinweis ab pyLoopWarnThreshold.
+func (s *pyLoopState) checkWarn(codeFP string) string {
+	if s.loopCount[codeFP] == 2 {
+		return "[SERVER] Gleiches Skript mit gleichem Ergebnis wie zuvor. Dieser Ansatz führt nicht weiter. Nimm einen anderen Weg oder antworte mit dem Vorhandenen."
 	}
-	if errFP != "" && s.errorFingerprints[errFP] == 2 {
-		return "[SERVER] Gleicher Fehler wie zuvor (Fehlertyp + letzte Traceback-Zeile identisch). Dieser Ansatz führt nicht weiter. Nimm einen anderen Weg oder antworte mit dem Vorhandenen."
+	if s.codeCount[codeFP] == pyLoopWarnThreshold {
+		return fmt.Sprintf("[SERVER] %d gleichartige Skripte in Folge. Fass die übrigen Abfragen in einem Skript zusammen oder werte die Datei mit llm aus.", pyLoopWarnThreshold)
 	}
 	return ""
 }
 
-// register wird NACH erfolgreicher Ausführung aufgerufen: erhöht die
-// Trefferzähler und leere-Ausgabe-Counter.
-func (s *pyLoopState) register(codeFP, errFP string, isEmpty bool) {
-	s.codeFingerprints[codeFP]++
+// register wird NACH erfolgreicher Ausführung aufgerufen.
+// isLoop: true wenn Fehler, leere Ausgabe oder identische Ausgabe wie zuvor.
+// istLoop = false → Serie (neue Ausgabe), wird nur im codeCount gezählt.
+func (s *pyLoopState) register(codeFP, errFP, outHash string, isError, isEmpty bool) {
+	s.codeCount[codeFP]++
+
+	isLoop := isError || isEmpty || (outHash != "" && s.lastOutput[codeFP] == outHash)
+	if isLoop {
+		s.loopCount[codeFP]++
+	}
+
 	if errFP != "" {
-		s.errorFingerprints[errFP]++
+		s.errCount[errFP]++
 	}
 	if isEmpty {
 		s.emptyCount++
 	} else {
 		s.emptyCount = 0
 	}
-	if s.codeFingerprints[codeFP] >= 4 {
+	if outHash != "" {
+		s.lastOutput[codeFP] = outHash
+	}
+	if s.loopCount[codeFP] >= 4 {
 		s.pythonDisabled = true
 	}
 }
@@ -2932,18 +2959,42 @@ func (s *Server) buildWorkspaceManifest(fileName, origPath string, content []byt
 	}
 
 	lineCount := strings.Count(text, "\n") + 1
+
+	// Struktur erkennen: Markdown-Headings, nummerierte Abschnitte (z.B. "1. Einleitung"),
+	// oder kurze Zeilen die wie Überschriften aussehen (<60 chars, kein Satz-Ende,
+	// von Leerzeile oder Dokumentanfang gefolgt).
 	var headings []string
-	for _, line := range strings.Split(text, "\n") {
+	lines := strings.Split(text, "\n")
+	prevBlank := true
+	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if len(headings) >= 5 {
+		if len(headings) >= 8 {
 			break
 		}
-		// Markdown-Headings (#, ##, …) oder kurze Zeilen (<60 chars, nicht leer, kein Punkt am Ende)
+		if trimmed == "" {
+			prevBlank = true
+			continue
+		}
+		isHeading := false
 		if strings.HasPrefix(trimmed, "#") {
-			headings = append(headings, trimmed)
-		} else if len(trimmed) > 0 && len(trimmed) < 60 && !strings.HasSuffix(trimmed, ".") {
+			isHeading = true
+		} else if len(trimmed) > 0 && len(trimmed) < 60 &&
+			!strings.HasSuffix(trimmed, ".") && !strings.HasSuffix(trimmed, ",") &&
+			strings.Count(trimmed, " ") <= 8 {
+			// Kurze Zeile, kein Satz-Ende, max 8 Wörter → wahrscheinlich Überschrift.
+			// Muss am Dokumentanfang oder nach einer Leerzeile stehen.
+			if prevBlank || len(headings) == 0 {
+				// Zusätzlich: keine Zeile die wie normaler Fließtext wirkt (kein Bindestrich, kein Doppelpunkt)
+				if !strings.HasPrefix(trimmed, "-") && !strings.HasPrefix(trimmed, "*") &&
+					!strings.Contains(trimmed, ":") {
+					isHeading = true
+				}
+			}
+		}
+		if isHeading {
 			headings = append(headings, trimmed)
 		}
+		prevBlank = false
 	}
 
 	var b strings.Builder
@@ -4132,24 +4183,26 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			// §1 Python Loop-Schutz: Fingerabdrücke registrieren, Warnungen
-			// liefern, Tool bei 4+ Treffern deaktivieren.
+			// liefern, Tool bei 4+ Loop-Treffern deaktivieren.
 			if tc.Function.Name == "Python" && !pyLoop.pythonDisabled {
 				var codeArg struct{ Code string `json:"code"` }
 				json.Unmarshal([]byte(tc.Function.Arguments), &codeArg)
 				pyCodeFP := pythonCodeFingerprint(codeArg.Code)
 				isEmpty := strings.TrimSpace(result) == "" || strings.HasPrefix(result, "[SERVER] Keine Ausgabe")
-				pyLoop.register(pyCodeFP, "", isEmpty)
+				isErr := strings.HasPrefix(result, "Fehler:") || trace.Error != ""
+				outHash := outputHash(result)
+				pyLoop.register(pyCodeFP, "", outHash, isErr, isEmpty)
 				// [SERVER] Keine Ausgabe: leeres stdout bekommt eine klare Meldung.
 				if strings.HasPrefix(result, "Kein Output") {
 					result = "[SERVER] Keine Ausgabe. Das Skript hat nichts gedruckt oder nichts gefunden. Ändere die Suchstrategie oder antworte mit dem Vorhandenen."
 				}
-				// [SERVER]-Warnung bei zweitem Treffer (Code- oder Fehler-FP).
-				if warnMsg := pyLoop.checkWarn(pyCodeFP, ""); warnMsg != "" {
+				// [SERVER]-Warnung: echter Loop (2. gleicher Fehler/leer) oder Serie (5+ neue Ausgaben).
+				if warnMsg := pyLoop.checkWarn(pyCodeFP); warnMsg != "" {
 					result = warnMsg + "\n\n" + result
-					log.Printf("chat/ask [%s]: py-loop-warn code=%s (iteration %d)", sessionID, pyCodeFP, iterations)
+					log.Printf("chat/ask [%s]: py-loop-warn code=%s (iteration %d, loop=%d, serie=%d)", sessionID, pyCodeFP, iterations, pyLoop.loopCount[pyCodeFP], pyLoop.codeCount[pyCodeFP])
 				}
 				if pyLoop.pythonDisabled {
-					log.Printf("chat/ask [%s]: python-tool deaktiviert (4+ gleiche Fingerabdrücke) (iteration %d)", sessionID, iterations)
+					log.Printf("chat/ask [%s]: python-tool deaktiviert (4+ Loop-Treffer) (iteration %d)", sessionID, iterations)
 				}
 			} else if tc.Function.Name != "Python" {
 				// Nicht-Python-Tool: Leere-Ausgabe-Counter zurücksetzen.
