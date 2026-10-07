@@ -1,4 +1,4 @@
-module codeberg.org/kosmos-eu/open_taki
+module github.com/KOSMOS-EU/opentaki
 
 go 1.25.0
 

@@ -48,8 +48,8 @@ func TestRenderChatSystemPrompt(t *testing.T) {
 	if strings.Contains(got, "{{") {
 		t.Errorf("unresolved placeholder in rendered prompt (file chat)")
 	}
-	if !strings.Contains(strings.Join(strings.Fields(got), " "), "lesen. Pfade sind immer relativ") {
-		t.Errorf("file-chat render does not flow from tools-slot to next sentence")
+	if !strings.Contains(got, "Pfade sind immer relativ") {
+		t.Errorf("file-chat render missing path rule")
 	}
 
 	// Fallback: systemPrompt nicht geladen → Built-in

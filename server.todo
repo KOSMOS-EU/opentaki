@@ -1,0 +1,152 @@
+# Taki: Server-Vorkehrungen
+
+Grundsatz: Was der Server erzwingen kann, steht nicht als Bitte im Prompt. Der Server reagiert im Tool-Ergebnis, also an der Stelle, auf die das Modell beim nächsten Schritt schaut. Servermeldungen beginnen einheitlich mit `[SERVER]`. Der Prompt v2 erklärt diesen Marker für verbindlich.
+
+Reihenfolge nach Wirkung: Abschnitte 1 bis 3 beheben die Loops, 4 und 5 den Kontextüberlauf, der Rest ist Absicherung.
+
+## 1. Loop-Schutz für Python
+
+- **Fingerabdruck je Skript:** Code normalisieren (Leerraum, Kommentare, String-Literale wie Dateinamen, Zahlen wie Offsets und Zeilennummern durch Platzhalter ersetzen) und hashen. So fällt auch „gleicher Code, anderer Dateiname" und „gleicher Code, anderer Offset" auf.
+- **Fingerabdruck je Fehler:** Fehlertyp plus letzte Traceback-Zeile ohne variable Teile.
+- **Stufen pro Turn:**
+  1. Zweiter Treffer (gleicher Code-Fingerabdruck oder gleicher Fehler): Ergebnis normal liefern, davor `[SERVER] Gleiches Skript / gleicher Fehler wie in Schritt N. Dieser Ansatz führt nicht weiter. Nimm einen anderen Weg oder antworte mit dem Vorhandenen.`
+  2. Dritter Treffer: Skript nicht ausführen. Nur `[SERVER] Ansatz gesperrt.` plus die zwei erlaubten Auswege (anderes Tool, Antwort oder present_options).
+  3. Vierter Treffer: Python-Tool für den Rest des Turns aus der Tool-Liste nehmen.
+- **Leere Ausgabe:** Wenn ein Skript nichts druckt, `[SERVER] Keine Ausgabe. Das Skript hat nichts gedruckt oder nichts gefunden.` statt eines leeren Ergebnisses. Zwei leere Ausgaben in Folge zählen wie ein wiederholter Fehler.
+
+## 2. Identische Tool-Calls allgemein
+
+- Hash über Tool plus Parameter. Beim zweiten identischen Call nicht das Ergebnis erneut liefern (füllt nur den Kontext), sondern `[SERVER] Identischer Call wie in Schritt N, Ergebnis unverändert.`
+- Beim dritten identischen Call wie Stufe 3 oben: Tool für den Turn entziehen.
+- Zweites read_for_python derselben Datei: `[SERVER] Liegt bereits im Workspace als <name>.`
+- Read auf eine Datei, die schon im Workspace liegt: Hinweis statt Inhalt, mit Verweis auf Python und llm.
+
+## 3. Fehlermeldungen, die den nächsten Schritt nennen
+
+- **Python-Traceback kürzen:** Fehlertyp, Meldung, Zeilennummer im Skript. Kein kompletter Stack.
+- **Datei nicht gefunden:** die ähnlichsten vorhandenen Namen mitliefern (aus dem Workspace bzw. dem Ordner). Dann entfällt der Umweg über List.
+- **Modul nicht erlaubt:** Liste der erlaubten Module in der Meldung.
+- **Read über 10.000 Zeichen** (besteht schon): in der Meldung gleich den Folgeaufruf nennen (read_for_python mit diesem Pfad).
+
+## 4. Kontextschutz
+
+- **Python-Ausgabe hart begrenzen:** konfigurierbare Obergrenze. Was darüber liegt, schreibt der Server in eine Workspace-Datei und liefert Anfang, Ende und `[SERVER] Ausgabe gekürzt, vollständig in <datei>.`
+- **Alte Tool-Ergebnisse verdichten:** Ergebnisse, die mehrere Schritte zurückliegen, durch eine Kurzfassung oder einen Platzhalter ersetzen (Tool, Parameter, Größe, „Inhalt entfernt, bei Bedarf erneut abrufen"). Das Modell muss sein Kontextbudget dann nicht mehr selbst verwalten.
+- **Füllstand melden:** Ab einer Schwelle `[SERVER] Kontext zu X % belegt. Jetzt antworten oder Zwischenergebnisse in den Workspace schreiben.` statt Abbruch ohne Vorwarnung.
+
+## 5. Workspace-Manifest
+
+read_for_python liefert als Ergebnis eine kompakte Beschreibung statt nur „kopiert":
+
+- Dateiname im Workspace, Größe, Name der .txt-Fassung
+- bei Tabellen: alle Sheets mit Zeilen- und Spaltenzahl, erste nicht leere Zeile, Kopfzeile
+- bei Textdokumenten: Zeichenzahl, erkannte Überschriften
+
+Damit entfällt das blinde Erkunden von Sheets und Zeilen, das die meisten Python-Loops auslöst. Der Abschnitt „Tabellen erkunden" im Python-Prompt kann danach auf einen Satz schrumpfen.
+
+## 6. Schrittbudget und sauberer Abschluss
+
+- Festes Schrittbudget pro Turn.
+- Kurz vor dem Ende: `[SERVER] Noch N Schritte. Schließ ab und antworte.`
+- Am Limit: letzten Modellaufruf ohne Tools erzwingen (tool_choice none), damit eine Antwort mit dem Vorhandenen entsteht statt eines Abbruchs.
+
+## 7. Suchen und Vollständigkeit
+
+- Bei found > limit den Hinweis auf Unvollständigkeit als `[SERVER]`-Zeile ins Ergebnis setzen, mit den drei Auswegen (konkretisieren, limit erhöhen, alles durchlaufen).
+- Folgeseiten einer unvollständigen Suche erst nach ausdrücklicher Freigabe durch den User ausliefern (Freigabe als Zustand im Server, gesetzt durch die gewählte present_options-Option).
+- Nach drei Suchen ohne Treffer: `[SERVER] Drei Suchen ohne Treffer. Frag den User mit present_options.`
+
+## 8. Rückfragen
+
+- Endet eine Antwort mit einer Frage, ohne dass present_options aufgerufen wurde: einmal zurückgeben mit `[SERVER] Rückfragen nur über present_options.`
+- present_options validieren: 1 bis 5 Optionen, keine leeren, keine doppelten.
+
+## 9. Output-Ordner
+
+- **Verzeichnis selbst anlegen:** Output legt fehlende Verzeichnisse an. Dann entfällt OutputMkdir samt Regel im Prompt.
+- **Dateiname normalisieren:** Kleinschreibung, Bindestriche, Endung .md serverseitig herstellen.
+- **Muster-Scan vor dem Speichern:** IBAN, Steuernummer, E-Mail-Adresse, Telefonnummer. Bei Treffer nicht speichern, sondern `[SERVER] Enthält <Art> in Zeile N. Entfernen oder verallgemeinern.` Der Ordner ist öffentlich verlinkt, eine Bitte im Prompt reicht dafür nicht.
+- **Prüfprotokoll:** Bei Dokumenten mit Tabellen prüfen, ob der Abschnitt vorhanden ist, sonst einmal nachfordern.
+
+## 10. Abgrenzung von Dateiinhalten
+
+- Dateiinhalte in Tool-Ergebnissen eindeutig rahmen (Beginn- und Ende-Marke mit Dateiname).
+- Die Zeichenfolge `[SERVER]` und die Rahmenmarken in Dateiinhalten maskieren. Sonst kann eine Datei im Ordner eine Servermeldung vortäuschen.
+- Gleiches für Ergebnisse des llm-Tools, da sie aus Dateiinhalten entstehen.
+
+## 11. Protokoll
+
+- Jede ausgelöste Vorkehrung mit Session, Schritt, Tool und Stufe protokollieren.
+- Daraus ergibt sich, welche Regeln im Prompt noch gebraucht werden und welche gestrichen werden können.
+
+---
+
+# Implementierungs-Checkliste
+
+## Prompt v2 (deployed 2026-10-07)
+- [x] better_prompts/taki_chat.new → chat_system.txt übernehmen
+- [x] better_prompts/taki_python.new → python_tool.txt übernehmen
+- [x] Prompt-Package pushen + deployen — `taka-prompts:pkg-20261007-1747`
+
+## §1 Loop-Schutz für Python
+- [ ] Code-Fingerabdruck: Skript normalisieren (Leerraum, Kommentare, String-Literale, Zahlen → Platzhalter) und hashen
+- [ ] Fehler-Fingerabdruck: Fehlertyp + letzte Traceback-Zeile (variable Teile raus)
+- [ ] Stufen pro Turn:
+  - [ ] 2. Treffer: Ergebnis liefern + `[SERVER] Gleiches Skript / gleicher Fehler wie in Schritt N. ...`
+  - [ ] 3. Treffer: Skript NICHT ausführen. `[SERVER] Ansatz gesperrt.` + zwei Auswege
+  - [ ] 4. Treffer: Python-Tool für Rest des Turns aus Tool-Liste nehmen
+- [ ] Leere Ausgabe: `[SERVER] Keine Ausgabe. ...` statt leer. 2x leer zählt wie wiederholter Fehler
+
+## §2 Identische Tool-Calls allgemein
+- [ ] Hash über Tool + Parameter. 2. identischer Call: `[SERVER] Identischer Call wie in Schritt N, Ergebnis unverändert.`
+- [ ] 3. identischer Call: Tool für den Turn entziehen
+- [ ] 2. read_for_python derselben Datei: `[SERVER] Liegt bereits im Workspace als <name>.`
+- [ ] Read auf Workspace-Datei: Hinweis statt Inhalt
+
+## §3 Fehlermeldungen
+- [ ] Python-Traceback kürzen: Typ, Meldung, Zeilennummer. Kein Stack.
+- [ ] Datei nicht gefunden: ähnlichste Namen in der Meldung
+- [ ] Modul nicht erlaubt: Liste der erlaubten Module in der Meldung
+- [ ] Read > 10.000: Folgeaufruf (read_for_python) in der Meldung nennen
+
+## §4 Kontextschutz
+- [ ] Python-Ausgabe hart begrenzen (konfigurierbar). Darüber: Workspace-Datei + `[SERVER] Ausgabe gekürzt, vollständig in <datei>.`
+- [ ] Alte Tool-Ergebnisse verdichten (Kurzfassung/Platzhalter)
+- [ ] Füllstand melden: `[SERVER] Kontext zu X % belegt. ...`
+
+## §5 Workspace-Manifest
+- [x] read_for_python liefert: Dateiname, Größe, .txt-Name, Sheets/Zeilen/Spalten, Kopfzeile, Überschriften
+- [ ] Danach: Python-Prompt "Tabellen erkunden" auf einen Satz schrumpfen
+
+## §6 Schrittbudget
+- [x] Festes Schrittbudget pro Turn (konfigurierbar) — `chat.max_iterations`
+- [x] `[SERVER] Noch N Schritte. Schließ ab und antworte.`
+- [x] Am Limit: tool_choice none
+
+## §7 Suchen und Vollständigkeit
+- [x] found > limit: `[SERVER]`-Zeile + drei Auswege
+- [ ] Folgeseiten erst nach User-Freigabe (Zustand im Server)
+- [x] 3 Suchen ohne Treffer: `[SERVER] ... Frag den User mit present_options.`
+
+## §8 Rückfragen
+- [x] Frage ohne present_options: 1x `[SERVER] Rückfragen nur über present_options.`
+- [x] present_options validieren: 1-5 Optionen, keine leeren, keine doppelten
+
+## §9 Output-Ordner
+- [x] Output legt Verzeichnisse selbst an (entfällt OutputMkdir)
+- [x] Dateiname normalisieren (klein, Bindestriche, .md)
+- [x] Muster-Scan (IBAN, Steuernummer, E-Mail, Telefon): bei Treffer NICHT speichern
+- [x] Prüfprotokoll-Prüfung bei Dokumenten mit Tabellen
+
+## §10 Abgrenzung von Dateiinhalten
+- [x] Beginn-/Ende-Marke mit Dateiname in Tool-Ergebnissen
+- [x] `[SERVER]` und Rahmenmarken in Dateiinhalten maskieren
+- [x] Gleiches für llm-Tool-Ergebnisse
+
+## §11 Protokoll
+- [x] Loggen: Session, Schritt, Tool, Stufe
+- [ ] Daraus ableiten: welche Prompt-Regeln überflüssig sind
+
+## Nachverfolgung
+- [ ] Slice-Loop in Produktion beobachten (Hauptauslöser für §1)
+- [ ] WebDAV 404: Root Cause offen (Debug-Log 20261007-1415 deployed)
