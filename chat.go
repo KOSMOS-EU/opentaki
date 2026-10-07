@@ -3780,7 +3780,8 @@ func truncateChars(s string, n int) string {
 // bisher gesehen wurde, der User entscheidet, wie es weitergeht.
 func loopBreakAnswer(reason, lastTool, lastResult string, isBlank bool) string {
 	s := "Ich komme mit der aktuellen Vorgabe nicht weiter: " + reason + ".\n"
-	if lastResult != "" {
+	// lastResult nur anzeigen wenn es kein reiner Zahlen-/Zeilenauszug ist
+	if lastResult != "" && !isRawNumberOutput(lastResult) {
 		toolNote := ""
 		if lastTool != "" {
 			toolNote = " (" + lastTool + ")"
@@ -3799,6 +3800,46 @@ func loopBreakAnswer(reason, lastTool, lastResult string, isBlank bool) string {
 			"3) Durchlaufen lassen: ich bewerte den Ordner komplett — das kann mehrere Minuten dauern."
 	}
 	return s
+}
+
+// isRawNumberOutput: true wenn der Text hauptsächlich aus Zahlen und
+// Zahlenlisten besteht (Python-Output mit reinen Werten, kein Prosa-Content).
+func isRawNumberOutput(s string) bool {
+	words := 0
+	numberWords := 0
+	for _, w := range strings.Fields(s) {
+		words++
+		// Strippe Zeilennummern (z.B. "32", "34") und rechte Klammer
+		clean := strings.TrimRight(w, "]->')")
+		if clean == "" {
+			continue
+		}
+		// Zahl mit Punkten/Kommas (deutsches Format) oder reine Zahl
+		if isNumberLike(clean) {
+			numberWords++
+		}
+	}
+	if words == 0 {
+		return false
+	}
+	return float64(numberWords)/float64(words) > 0.6
+}
+
+func isNumberLike(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Entferne führende/folgende Punkte und Kommas
+	t := strings.Trim(s, ".,")
+	if t == "" {
+		return false
+	}
+	for _, c := range t {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // loopBreakOptions: die Standard-Optionen des serverseitigen Loop-Abbruchs
@@ -3985,9 +4026,10 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	// §1 Loop-Schutz: Code- und Fehler-Fingerabdrücke pro Turn.
 	pyLoop := newPyLoopState()
 	// §2 Identische Tool-Calls: Hash über Tool + Parameter (ohne Ergebnis).
-	// 2. identischer Call → [SERVER] Hinweis, 3. → Tool für Turn entziehen.
+	// 2. identischer Call → Tool für den Rest des Turns aus der Liste nehmen
+	// + [SERVER]-Hinweis + User-Message "Wechsle den Weg oder antworte".
 	identicalCalls := map[string]int{}
-	identicalBlockCount := 0 // aufeinanderfolgende Blockierungen (für Loop-Break)
+	blockedTools := map[string]bool{} // Tool-Namen die für den Turn entfernt wurden
 	workspaceFiles := map[string]string{} // relPath → workspaceName
 	searchMissCount := 0                  // §7: aufeinanderfolgende Suchen ohne Treffer
 	questionNudgeSent := false            // §8: Rückfrage-Hint schon gesendet?
@@ -4085,7 +4127,19 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			toolChoice = "none"
 			log.Printf("chat/ask [%s]: step-budget limit, forcing tool_choice=none (iteration %d)", sessionID, i)
 		}
-		msg, finishReason, usage, err := s.llmChatTools(sessionID, model, messages, tools, toolChoice)
+		// Blockierte Tools aus der Liste entfernen (identische Calls).
+		activeTools := tools
+		if len(blockedTools) > 0 {
+			activeTools = make([]toolDefinition, 0, len(tools))
+			for _, t := range tools {
+				if !blockedTools[t.Function.Name] {
+					activeTools = append(activeTools, t)
+				}
+			}
+		}
+		msg, finishReason, usage, err := s.llmChatTools(sessionID, model, messages, activeTools, toolChoice)
+		// Tool-Entzug gilt nur für diese Anfrage. Nächste Iteration: alle Tools wieder da.
+		blockedTools = map[string]bool{}
 		if err != nil {
 			if stream {
 				sse.event("error", map[string]string{"error": err.Error()})
@@ -4204,26 +4258,23 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			// 2. identischer Call: [SERVER]-Hinweis statt Ergebnis erneut liefern.
-			// 3. identischer Call: Tool für den Turn entziehen.
-			if identicalCalls[callHash] >= 3 {
-				identicalBlockCount++
-				result := fmt.Sprintf("[SERVER] Identischer Call wie in Schritt 1 und 2 (tool=%s). Ergebnis unverändert. Nimm einen anderen Weg: andere Parameter, anderes Tool, oder antworte mit dem Vorhandenen.", tc.Function.Name)
+			// 2. identischer Call: Tool für den Rest des Turns entfernen +
+			// [SERVER]-Hinweis + User-Message "Wechsle den Weg oder antworte".
+			if identicalCalls[callHash] >= 2 {
+				if !blockedTools[tc.Function.Name] {
+					blockedTools[tc.Function.Name] = true
+					log.Printf("chat/ask [%s]: tool entzogen: %s (2. identischer Call, iteration %d)", sessionID, tc.Function.Name, iterations)
+				}
+				result := fmt.Sprintf("[SERVER] Identischer Call wie zuvor (tool=%s). Ergebnis unverändert. Das Tool ist für diesen Turn nicht mehr verfügbar. Nimm einen anderen Weg: andere Parameter, anderes Tool, oder antworte mit dem Vorhandenen.", tc.Function.Name)
 				trace := toolTrace{Tool: tc.Function.Name, Method: "identical-blocked"}
-				log.Printf("chat/ask [%s]: identical-blocked: 3rd identical call (tool=%s, iteration %d, blockCount %d)", sessionID, tc.Function.Name, iterations, identicalBlockCount)
 				toolTraces = append(toolTraces, trace)
 				if stream {
 					sse.event("tool", map[string]interface{}{"index": len(toolTraces), "tool": tc.Function.Name, "method": "identical-blocked", "ms": 0})
 				}
 				messages = append(messages, chatToolMessage{Role: "tool", Content: strPtr(result), ToolCallID: tc.ID})
-				// Nach 3 aufeinanderfolgenden Blockierungen: Loop beenden,
-				// Modell muss ohne Tools antworten.
-				if identicalBlockCount >= 3 {
-					log.Printf("chat/ask [%s]: loop-break nach %d identischen Blockierungen (iteration %d)", sessionID, identicalBlockCount, iterations)
-					loopOptions = loopBreakOptions(isBlankChat)
-					optionsDone = true
-					break
-				}
+				// User-Message: kleine Modelle gewichten die letzte User-Nachricht
+				// stärker als ein Tool-Ergebnis.
+				messages = append(messages, chatToolMessage{Role: "user", Content: strPtr("Du wiederholst denselben Call. Das Tool ist jetzt gesperrt. Wechsle den Ansatz oder antworte mit dem, was du hast.")})
 				continue
 			}
 			// Python §1 Loop-Schutz
@@ -4233,12 +4284,21 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				pyCodeFP := pythonCodeFingerprint(codeArg.Code)
 				if blocked, blockMsg := pyLoop.checkBlocked(pyCodeFP, ""); blocked {
 					result := blockMsg
+					// Python aus der Tool-Liste entfernen (temporal, wie blockedTools).
+					// Sonst ruft das Modell Python 73× auf und wird jedes Mal blockiert.
+					if !blockedTools["Python"] {
+						blockedTools["Python"] = true
+						log.Printf("chat/ask [%s]: python entzogen (loop-blocked, iteration %d)", sessionID, iterations)
+					}
 					trace := toolTrace{Tool: "Python", Method: "loop-blocked"}
 					toolTraces = append(toolTraces, trace)
 					if stream {
 						sse.event("tool", map[string]interface{}{"index": len(toolTraces), "tool": "Python", "method": "loop-blocked", "ms": 0})
 					}
 					messages = append(messages, chatToolMessage{Role: "tool", Content: strPtr(result), ToolCallID: tc.ID})
+					// User-Message: kleine Modelle gewichten die letzte User-Nachricht
+					// stärker als ein Tool-Ergebnis.
+					messages = append(messages, chatToolMessage{Role: "user", Content: strPtr("Python ist für diesen Turn gesperrt. Wechsle den Ansatz oder antworte mit dem, was du hast.")})
 					continue
 				}
 			}
@@ -4288,7 +4348,6 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 				trace = toolTrace{Tool: tc.Function.Name, Method: "duplicate", Chars: len(result)}
 			} else {
 				consecutiveDuplicates = 0
-				identicalBlockCount = 0
 				lastDupHash = ""
 				seenToolResults[contentHash] = result
 				if result != "" {
