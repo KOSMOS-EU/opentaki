@@ -3665,21 +3665,24 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 					lastRealResult = truncateChars(result, 1500)
 				}
 			}
-			// Python-Low-Output-Loop-Erkennung: 5+ consecutive Python-Calls
-			// mit ≤2 chars stdout deuten auf eine Blind-Iteration (z.B.
-			// find()=-1 + Offset-Schleife). Warnung ins Ergebnis injizieren.
+			// Python-Low-Output-Loop-Erkennung: 3+ consecutive Python-Calls
+			// mit ≤5 chars (Trimmed) stdout deuten auf eine Blind-Iteration
+			// (z.B. find()=-1 + Offset-Schleife, oder Slice am Dokumentende).
+			// Schwelle 5 statt 2: print(len(x)) mit 1-stelliger Zahl = 2-3 chars,
+			// das Modell variiert leicht und würde bei ≤2 die Detection umgehen.
 			if tc.Function.Name == "Python" {
-				if len(result) <= 2 || strings.HasPrefix(result, "Kein Output") {
+				if len(strings.TrimSpace(result)) <= 5 || strings.HasPrefix(result, "Kein Output") {
 					consecutiveLowOutput++
 				} else {
 					consecutiveLowOutput = 0
 				}
-				if consecutiveLowOutput >= 5 {
-					result += "\n\n[LOOP-WARNUNG: " + strconv.Itoa(consecutiveLowOutput) + " aufeinanderfolgende Python-Calls haben ≤2 Zeichen ausgegeben. " +
-						"Du iterierst offensichtlich blind durch eine Datei ohne Treffer. " +
-						"Stopp diese Iteration. Prüfe ZUERST ob die Suchbedingung existiert " +
-						"(z.B. print(repr(t[:200])) um das Format zu sehen, oder print(len(t)) für die Länge). " +
-						"Nutze regex.search() statt find() und prüfe den Rückgabewert (if m: ...).]"
+				if consecutiveLowOutput >= 3 {
+					result += "\n\n[LOOP-WARNUNG: " + strconv.Itoa(consecutiveLowOutput) + " aufeinanderfolgende Python-Calls haben kaum Output (≤5 Zeichen). " +
+						"Du iterierst offensichtlich blind — entweder die Suchbedingung existiert nicht, " +
+						"oder der Slice liegt am Ende der Datei. " +
+						"Stopp diese Iteration. Prüfe: print(len(t), i) — ist i + offset > len(t)? " +
+						"Dann ist die Sektion am Dokumentende, die vorhandenen Daten sind ALLES, was es gibt. " +
+						"Auswerten statt weiter iterieren.]"
 					log.Printf("chat/ask [%s]: python-low-output-loop nach %d Calls (iteration %d)", sessionID, consecutiveLowOutput, iterations)
 				}
 			} else {
