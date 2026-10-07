@@ -3447,9 +3447,13 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 	lastDupHash := ""
 	lastRealTool := ""
 	lastRealResult := ""
-	// Python-Low-Output-Counter: 5+ consecutive Python-Calls mit ≤2 chars
+	// Python-Low-Output-Counter: 3+ consecutive Python-Calls mit ≤5 chars
 	// Output deuten auf eine Blind-Loop (z.B. find()=-1 + Offset-Iteration).
 	consecutiveLowOutput := 0
+	// Content-Loop-Detection: 3+ consecutive Python-Calls mit identischem
+	// stdout deuten auf eine Blind-Iteration mit nur variierendem Dateinamen.
+	lastPyResultHash := ""
+	consecutiveSameContent := 0
 	var totalUsage *chatTokenUsage
 	// Session-weite Python-Sandbox: überlebt zwischen Tool-Calls,
 	// damit das Modell temporäre Dateien erzeugen und in späteren
@@ -3671,6 +3675,7 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 			// Schwelle 5 statt 2: print(len(x)) mit 1-stelliger Zahl = 2-3 chars,
 			// das Modell variiert leicht und würde bei ≤2 die Detection umgehen.
 			if tc.Function.Name == "Python" {
+				// Low-Output: ≤5 chars (Trimmed) → Blind-Iteration
 				if len(strings.TrimSpace(result)) <= 5 || strings.HasPrefix(result, "Kein Output") {
 					consecutiveLowOutput++
 				} else {
@@ -3685,8 +3690,26 @@ func (s *Server) handleChatAsk(w http.ResponseWriter, r *http.Request) {
 						"Auswerten statt weiter iterieren.]"
 					log.Printf("chat/ask [%s]: python-low-output-loop nach %d Calls (iteration %d)", sessionID, consecutiveLowOutput, iterations)
 				}
+				// Content-Loop: 3+ consecutive Python-Calls mit identischem stdout
+				// (nur Dateiname variiert). SHA-256 des Trimmed-Results.
+				resultHash := sha256.Sum256([]byte(strings.TrimSpace(result)))
+				hashStr := fmt.Sprintf("%x", resultHash[:8])
+				if hashStr == lastPyResultHash && len(strings.TrimSpace(result)) > 5 {
+					consecutiveSameContent++
+				} else {
+					consecutiveSameContent = 0
+				}
+				lastPyResultHash = hashStr
+				if consecutiveSameContent >= 3 {
+					result += "\n\n[LOOP-WARNUNG: " + strconv.Itoa(consecutiveSameContent+1) + " aufeinanderfolgende Python-Calls haben IDENTISCHEN Output geliefert (nur Dateiname variiert). " +
+						"Du wiederholst dieselbe Logik ohne neuen Erkenntnisgewinn. " +
+						"Stopp: nimm das Ergebnis aus dem ersten Call und weiterarbeiten — nicht mit neuem Zielpfad dieselbe Logik ausführen.]"
+					log.Printf("chat/ask [%s]: python-content-loop nach %d Calls (iteration %d)", sessionID, consecutiveSameContent+1, iterations)
+				}
 			} else {
 				consecutiveLowOutput = 0
+				consecutiveSameContent = 0
+				lastPyResultHash = ""
 			}
 			// args = die exakte Anfrage (auch bei Duplikaten, die runChatTool
 			// nie erreichen und daher leere trace-Felder haben).
